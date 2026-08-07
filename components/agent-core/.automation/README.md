@@ -1,8 +1,13 @@
-# Agent Core scaffold
+# Agent Core automation
 
-This directory is owned by the shared Agent Core component.
+This directory contains the language-independent Task lifecycle, publication,
+and integration layer shared by every Agent-ready template.
 
-Issue #5 only establishes deterministic component composition. The executable
-Agent Core lifecycle, OpenCode agents, permissions, and publication scripts are
-implemented by follow-up issues. Keep language- and toolchain-specific behavior
-out of this component.
+Public operations are exposed through the top-level Just modules rather than by
+calling these scripts directly. Project-specific build, lint, test, and toolchain
+behavior belongs under `just/project/` in the selected Project Adapter.
+
+The current implementation provides guarded Task-local commit/push/PR operations,
+integration head-SHA checkpoints, disposable Task State templates, and common
+safety policy. Repository-local OpenCode agents and permissions are added by the
+separate OpenCode configuration work.

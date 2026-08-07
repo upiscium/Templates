@@ -1,0 +1,9 @@
+set minimum-version := "1.52.0"
+
+mod agent '.automation/just/agent.just'
+mod integrate '.automation/just/integrate.just'
+mod project 'just/project/mod.just'
+mod? local 'just/local.just'
+
+default:
+    @just --list
