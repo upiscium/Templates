@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: cachix/install-nix-action@v31
-      - name: Instantiate template
+      - name: Instantiate and bootstrap template
         shell: bash
         run: |
           set -euo pipefail
@@ -39,7 +39,13 @@ jobs:
           mkdir -p "$target"
           cd "$target"
           nix flake init -t "path:$GITHUB_WORKSPACE#${{ matrix.template }}"
-          python3 "$GITHUB_WORKSPACE/tools/prepare_smoke_template.py" "$target"
+          nix develop --command just project::bootstrap smoke-project
+          if grep -R --fixed-strings '@@PROJECT_NAME@@' . \
+            --exclude-dir=.git \
+            --exclude=project_bootstrap.py; then
+            echo 'unresolved project-name placeholder remains after bootstrap' >&2
+            exit 1
+          fi
           git init -b main
           git config user.name "Template CI"
           git config user.email "template-ci@example.invalid"
@@ -47,6 +53,16 @@ jobs:
           git commit -m initial
           git update-ref refs/remotes/origin/main HEAD
           git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+      - name: Bootstrap idempotency
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="$RUNNER_TEMP/${{ matrix.template }}"
+          cd "$target"
+          before="$(git status --porcelain)"
+          nix develop --command just project::bootstrap smoke-project
+          after="$(git status --porcelain)"
+          test "$before" = "$after"
       - name: Agent initialization smoke
         shell: bash
         run: |

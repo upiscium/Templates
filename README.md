@@ -23,6 +23,20 @@ rust   -> agent-rust
 
 Every Agent-ready repository contains the shared Agent Core plus exactly one Project Adapter. Adapter-less repositories are not supported; unknown projects use `base` as the minimum contract.
 
+After instantiating a generated language/toolchain template, run the one-time project bootstrap before the first validation or development session:
+
+```sh
+nix develop --command just project::bootstrap
+```
+
+The optional explicit project name can be supplied when the directory name is not the desired project name:
+
+```sh
+nix develop --command just project::bootstrap my-project
+```
+
+`project::bootstrap` is the explicit state-changing setup step. It resolves generated project-name placeholders and is idempotent. It does not commit, push, or merge. After bootstrap, initialize Git as needed and use `/init` or the corresponding Just checks for normal read-only session validation.
+
 ## Repository layers
 
 ```text
@@ -43,9 +57,17 @@ Generated files under `templates/<name>/` are artifacts. Edit `components/agent-
 
 ## Initialization
 
+Bootstrap and initialization are intentionally separate:
+
+```text
+nix flake init ...
+  -> just project::bootstrap   # one-time, state-changing project setup
+  -> /init                     # every-session, read-only validation
+```
+
 `/init` is read-only. It validates Agent Core version, Adapter identity, branch/worktree/Task State, tools, project doctor, HEAD, and Git status. It never bootstraps, repairs, installs packages, changes Task State, or rewrites `AGENTS.md`.
 
-Bootstrap/adoption and Agent Core upgrade are separate mutating workflows.
+Existing-repository adoption and Agent Core upgrade are separate mutating workflows from generated-project bootstrap.
 
 ## Existing repositories
 
@@ -94,9 +116,10 @@ Raw Git/GitHub writes are denied. Stable Just APIs provide the guarded write pat
 
 ## Project Adapter API
 
-All Adapters expose:
+Generated language/toolchain Adapters expose the one-time bootstrap API plus the stable validation/build API:
 
 ```text
+just project::bootstrap [name]
 just project::doctor
 just project::format-check
 just project::lint
