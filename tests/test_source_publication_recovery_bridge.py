@@ -300,7 +300,9 @@ None yet.
              mock.patch.object(bridge, "_target_git", return_value=""):
             result = bridge._publication_recover(self.modules, self.target, "13")
         self.assertEqual(result["pullRequest"], repaired)
-        self.agent.pr_edit.assert_called_once_with(self.target, "13")
+        self.agent.pr_edit.assert_called_once_with(
+            self.target, "13", expected_pr_number=29
+        )
         self.agent.pr_create.assert_not_called()
         self.assertEqual(
             self.agent.pr_for_branch.call_args_list,
@@ -321,7 +323,9 @@ None yet.
              mock.patch.object(bridge, "_target_git", return_value=""):
             result = bridge._publication_recover(self.modules, self.target, "131")
         self.assertEqual(result["pullRequest"]["number"], 23)
-        self.agent.pr_edit.assert_called_once_with(self.target, "131")
+        self.agent.pr_edit.assert_called_once_with(
+            self.target, "131", expected_pr_number=23
+        )
         self.agent.pr_create.assert_not_called()
 
     def test_canonical_operations_use_captured_current_head_verification(self) -> None:
@@ -399,6 +403,46 @@ None yet.
                         candidate, branch=self.branch, base="main", head=self.head
                     )
 
+        for number in (True, False):
+            with self.subTest(number=number):
+                candidate = {**good, "number": number}
+                with self.assertRaises(canonical_agent_core.AutomationError):
+                    canonical_agent_core._validate_edit_target(
+                        candidate, branch=self.branch, base="main", head=self.head
+                    )
+
+    def test_pr_replacement_is_rejected_before_canonical_edit_mutation(self) -> None:
+        captured = {"number": 29}
+        replacement = {
+            "number": 30, "headRefName": self.branch, "baseRefName": "main",
+            "headRefOid": self.head, "isDraft": True,
+            "isCrossRepository": False, "state": "OPEN",
+        }
+        context = {
+            "record": self.record, "status": "publication-ready",
+            "repository": self.repository,
+        }
+        before = {"head": self.head, "branch": self.branch, "repository": self.repository,
+                  "record": self.record, "work_units": b"u", "verification": b"v", "contract": b"c",
+                  "state": b"- Status: publication-ready\n"}
+
+        def git(*args: str, **_: object) -> str:
+            return self.head if args[0] == "rev-parse" else ""
+
+        replacement_modules = {**self.modules, "agent_core": canonical_agent_core}
+        with mock.patch.object(bridge, "_publication_snapshot", return_value=before), \
+             mock.patch.object(bridge, "_target_git", side_effect=git), \
+             mock.patch.object(bridge, "_state_bytes", return_value=b"v"), \
+             mock.patch.object(canonical_agent_core, "pr_prepare"), \
+             mock.patch.object(canonical_agent_core, "_publication_context", return_value=(self.branch, context, self.head)), \
+             mock.patch.object(canonical_agent_core, "pr_for_branch", side_effect=[captured, replacement]), \
+             mock.patch.object(canonical_agent_core, "gh") as gh, \
+             mock.patch.object(canonical_agent_core.lifecycle, "mark_task_publication_state") as transition, \
+             self.assertRaisesRegex(canonical_agent_core.AutomationError, "identity changed before mutation"):
+            bridge._publication_recover(replacement_modules, self.target, "131")
+        gh.assert_not_called()
+        transition.assert_not_called()
+
     def test_edit_success_then_lifecycle_interruption_retry_converges_on_same_pr(self) -> None:
         before = {"head": self.head, "branch": self.branch, "repository": self.repository,
                   "record": self.record, "work_units": b"u", "verification": b"v", "contract": b"c",
@@ -406,7 +450,8 @@ None yet.
         after = {**before, "state": b"- Status: draft-pr-created\n"}
         existing = {"number": 29}
         edits = 0
-        def edit(_target: Path, _task: str) -> None:
+        def edit(_target: Path, _task: str, *, expected_pr_number: int) -> None:
+            self.assertEqual(expected_pr_number, 29)
             nonlocal edits
             edits += 1
             if edits == 1:

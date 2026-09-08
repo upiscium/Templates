@@ -725,7 +725,11 @@ def _publication_recover(modules: dict, target: Path, task: str) -> dict:
                 ):
                     raise BridgeError("existing Draft PR has an invalid or ambiguous number")
                 existing_number = existing["number"]
-                agent_core.pr_edit(target, task)
+                agent_core.pr_edit(
+                    target,
+                    task,
+                    expected_pr_number=existing_number,
+                )
                 pr = agent_core.pr_for_branch(target, before["branch"], before["repository"])
                 if not pr or pr.get("number") != existing_number:
                     raise BridgeError("existing Draft PR identity changed after canonical repair")

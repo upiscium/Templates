@@ -781,7 +781,8 @@ Canonical `pr_create` remains strict and reconciles only an already-canonical
 existing Draft. The bridge does not broaden it: after preparation, absence of a
 PR selects `pr_create`, while presence selects canonical `pr_edit`. That edit
 authority requires the exact OPEN same-repository Draft for the captured
-branch, base, and current head before changing only canonical title/body, then
+branch, base, and current head, and requires its internal lookup to equal the
+bridge-captured PR number before changing only canonical title/body. It then
 re-reads and validates the same PR identity. If GitHub editing succeeds before
 the lifecycle transition is interrupted, a retry selects that same PR and
 converges idempotently. Wrong PR state is never edited or adopted. This surface

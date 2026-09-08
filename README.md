@@ -234,8 +234,9 @@ Unit, verification, and contract evidence remain byte-identical; only ignored
 publication metadata and the guarded `publication-ready -> draft-pr-created`
 transition may change. Existing-PR repair delegates the mutation boundary to
 canonical `pr_edit`, which requires the exact same-repository OPEN Draft at the
-captured branch, base, and current head before replacing stale title/body, then
-re-reads and validates the same PR number. A retry after an edit succeeds but
+captured branch, base, and current head and binds its internal lookup to the
+bridge-captured PR number before replacing stale title/body, then re-reads and
+validates the same PR number. A retry after an edit succeeds but
 the lifecycle transition is interrupted converges on that same PR. Mismatching
 PRs are neither edited nor adopted, strict `pr_create` reconciliation remains
 unchanged, and the bridge never marks a PR Ready. AgentKnowledgeVault Task #13

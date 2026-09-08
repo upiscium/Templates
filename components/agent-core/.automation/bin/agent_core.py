@@ -422,7 +422,11 @@ def _validate_edit_target(pr: dict, *, branch: str, base: str, head: str) -> Non
         "isDraft": True, "isCrossRepository": False, "state": "OPEN",
     }
     mismatches = [name for name, value in expected.items() if pr.get(name) != value]
-    if mismatches or not isinstance(pr.get("number"), int):
+    if (
+        mismatches
+        or not isinstance(pr.get("number"), int)
+        or isinstance(pr.get("number"), bool)
+    ):
         raise AutomationError("pull request repair target identity is invalid: " + ", ".join(mismatches or ["number"]))
 
 
@@ -484,15 +488,29 @@ def pr_create(root: Path, task: str) -> dict:
     return pr
 
 
-def pr_edit(root: Path, task: str) -> None:
+def pr_edit(root: Path, task: str, expected_pr_number: int | None = None) -> None:
     verify(root, task)
     branch, context, head = _publication_context(root, task)
     if context["status"] not in {"publication-ready", "draft-pr-created"}:
         raise AutomationError(f"pr-edit requires publication-ready or draft-pr-created; found {context['status']}")
     repository = context["repository"]
+    if expected_pr_number is not None and (
+        not isinstance(expected_pr_number, int)
+        or isinstance(expected_pr_number, bool)
+        or expected_pr_number < 1
+    ):
+        raise AutomationError("expected pull request number is invalid")
     pr = pr_for_branch(root, branch, repository)
     if not pr:
         raise AutomationError(f"no pull request for {branch}")
+    if expected_pr_number is not None:
+        actual_pr_number = pr.get("number")
+        if (
+            not isinstance(actual_pr_number, int)
+            or isinstance(actual_pr_number, bool)
+            or actual_pr_number != expected_pr_number
+        ):
+            raise AutomationError("pull request repair target identity changed before mutation")
     _validate_edit_target(pr, branch=branch, base=default_branch(root), head=head)
     title, body, body_text = _validated_local_metadata(root, task, head)
     gh("pr", "edit", str(pr["number"]), "--repo", repository, "--title", title, "--body-file", str(body), cwd=root)
