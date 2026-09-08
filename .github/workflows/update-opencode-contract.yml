@@ -1,4 +1,4 @@
-name: Update OpenCodePolicy
+name: Update OpencodeContract
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: update-opencode-policy
+  group: update-opencode-contract
   cancel-in-progress: false
 
 jobs:
@@ -32,7 +32,7 @@ jobs:
           DISPATCH_REF: ${{ github.ref }}
         run: |
           if [[ "$DISPATCH_REF" != "refs/heads/main" ]]; then
-            echo "Update OpenCodePolicy must be dispatched from refs/heads/main; got $DISPATCH_REF" >&2
+            echo "Update OpencodeContract must be dispatched from refs/heads/main; got $DISPATCH_REF" >&2
             exit 1
           fi
 
@@ -46,9 +46,9 @@ jobs:
       - uses: cachix/install-nix-action@v31
 
       - name: Test lock hygiene checker
-        run: python3 -m unittest discover -s tests -p 'test_opencode_policy_lock_update.py' -v
+        run: python3 -m unittest discover -s tests -p 'test_opencode_contract_lock_update.py' -v
 
-      - name: Record and update OpenCodePolicy revision
+      - name: Record and update OpencodeContract revision
         id: revisions
         shell: bash
         run: |
@@ -63,31 +63,31 @@ jobs:
 
           with open(sys.argv[1], encoding="utf-8") as handle:
               lock = json.load(handle)
-          locked = lock["nodes"]["opencodePolicy"]["locked"]
+          locked = lock["nodes"]["opencodeContract"]["locked"]
           expected = {
               "owner": "upiscium",
-              "repo": "OpenCodePolicy",
+              "repo": "OpencodeContract",
               "type": "github",
           }
           for field, value in expected.items():
               if locked.get(field) != value:
-                  raise SystemExit(f"unexpected OpenCodePolicy {field}: {locked.get(field)!r}")
+                  raise SystemExit(f"unexpected OpencodeContract {field}: {locked.get(field)!r}")
           revision = locked.get("rev", "")
           if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
-              raise SystemExit(f"invalid OpenCodePolicy revision: {revision!r}")
+              raise SystemExit(f"invalid OpencodeContract revision: {revision!r}")
           print(revision)
           PY
           }
 
           OLD_REV="$(read_revision "$RUNNER_TEMP/flake.lock.before")"
-          nix flake update opencodePolicy
+          nix flake update opencodeContract
           NEW_REV="$(read_revision flake.lock)"
 
           if cmp -s "$RUNNER_TEMP/flake.lock.before" flake.lock; then
             CHANGED=false
           else
             if [[ "$OLD_REV" == "$NEW_REV" ]]; then
-              echo "flake.lock changed without an OpenCodePolicy revision change" >&2
+              echo "flake.lock changed without an OpencodeContract revision change" >&2
               exit 1
             fi
             CHANGED=true
@@ -105,9 +105,9 @@ jobs:
           NEW_REV: ${{ steps.revisions.outputs.new_rev }}
         run: |
           {
-            echo "### OpenCodePolicy update"
+            echo "### OpencodeContract update"
             echo
-            echo "OpenCodePolicy is already up to date."
+            echo "OpencodeContract is already up to date."
             echo
             printf "Old: \`%s\`\n" "$OLD_REV"
             printf "Current: \`%s\`\n" "$NEW_REV"
@@ -125,7 +125,7 @@ jobs:
       - name: Validate lock hygiene
         if: steps.revisions.outputs.changed == 'true'
         run: |
-          python3 tools/check_opencode_policy_lock_update.py \
+          python3 tools/check_opencode_contract_lock_update.py \
             "$RUNNER_TEMP/flake.lock.before" \
             flake.lock
 
@@ -141,13 +141,13 @@ jobs:
         if: steps.revisions.outputs.changed == 'true'
         run: nix flake check --all-systems --no-build --no-update-lock-file
 
-      - name: Build explicit policy check
+      - name: Build explicit contract check
         if: steps.revisions.outputs.changed == 'true'
-        run: nix build .#checks.x86_64-linux.opencode-policy --no-link --no-update-lock-file
+        run: nix build .#checks.x86_64-linux.opencode-contract --no-link --no-update-lock-file
 
-      - name: Validate policy contract
+      - name: Validate contract
         if: steps.revisions.outputs.changed == 'true'
-        run: nix develop --no-update-lock-file .#checks.x86_64-linux.opencode-policy --command opencode-policy validate
+        run: nix develop --no-update-lock-file .#checks.x86_64-linux.opencode-contract --command opencode-contract validate
 
       - name: Audit Agent Core consumer strictly
         if: steps.revisions.outputs.changed == 'true'
@@ -155,12 +155,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          nix develop --no-update-lock-file .#checks.x86_64-linux.opencode-policy --command \
-            opencode-policy audit-consumer \
+          nix develop --no-update-lock-file .#checks.x86_64-linux.opencode-contract --command \
+            opencode-contract audit-consumer \
               --profile agent-core \
               --consumer . \
-              --strict | tee "$RUNNER_TEMP/policy-audit.log"
-          SUMMARY="$(grep '^SUMMARY ' "$RUNNER_TEMP/policy-audit.log")"
+              --strict | tee "$RUNNER_TEMP/contract-audit.log"
+          SUMMARY="$(grep '^SUMMARY ' "$RUNNER_TEMP/contract-audit.log")"
           [[ "$SUMMARY" == *"DIFF=0"* ]]
           [[ "$SUMMARY" == *"MISSING=0"* ]]
           echo "summary=$SUMMARY" >> "$GITHUB_OUTPUT"
@@ -231,7 +231,7 @@ jobs:
               raise SystemExit("validated candidate checksum mismatch")
           Path(os.environ["RUNNER_TEMP"], "flake.lock.candidate").write_bytes(content)
           PY
-          python3 tools/check_opencode_policy_lock_update.py \
+          python3 tools/check_opencode_contract_lock_update.py \
             flake.lock \
             "$RUNNER_TEMP/flake.lock.candidate"
           python3 - <<'PY'
@@ -240,14 +240,14 @@ jobs:
           from pathlib import Path
 
           def revision(path: Path) -> str:
-              return json.loads(path.read_text(encoding="utf-8"))["nodes"]["opencodePolicy"]["locked"]["rev"]
+            return json.loads(path.read_text(encoding="utf-8"))["nodes"]["opencodeContract"]["locked"]["rev"]
 
           old_revision = revision(Path("flake.lock"))
           new_revision = revision(Path(os.environ["RUNNER_TEMP"], "flake.lock.candidate"))
           if old_revision != os.environ["OLD_REV"]:
-              raise SystemExit("trusted main OpenCodePolicy revision changed after validation")
+              raise SystemExit("trusted main OpencodeContract revision changed after validation")
           if new_revision != os.environ["NEW_REV"]:
-              raise SystemExit("candidate OpenCodePolicy revision changed after validation")
+              raise SystemExit("candidate OpencodeContract revision changed after validation")
           Path("flake.lock").write_bytes(
               Path(os.environ["RUNNER_TEMP"], "flake.lock.candidate").read_bytes()
           )
@@ -265,7 +265,7 @@ jobs:
         run: |
           set -euo pipefail
           SHORT_REV="${NEW_REV:0:12}"
-          BRANCH="chore/opencode-policy-${SHORT_REV}"
+          BRANCH="chore/opencode-contract-${SHORT_REV}"
           PR_JSON="$(
             gh pr list \
               --repo "$GITHUB_REPOSITORY" \
@@ -300,7 +300,7 @@ jobs:
               git diff --name-only -z "$BASE_SHA" "refs/remotes/origin/$BRANCH"
             )
             CHECK_ARGS=(
-              python3 tools/check_opencode_policy_lock_update.py
+              python3 tools/check_opencode_contract_lock_update.py
               "$RUNNER_TEMP/flake.lock.base"
               "$RUNNER_TEMP/flake.lock.branch"
               --candidate "$RUNNER_TEMP/flake.lock.candidate"
@@ -340,7 +340,7 @@ jobs:
           PR_URL: ${{ steps.duplicate.outputs.existing_pr }}
         run: |
           {
-            echo "### OpenCodePolicy update"
+            echo "### OpencodeContract update"
             echo
             printf "Old: \`%s\`\n" "$OLD_REV"
             printf "New: \`%s\`\n" "$NEW_REV"
@@ -364,7 +364,7 @@ jobs:
           git switch -c "$BRANCH"
           git add -- flake.lock
           test "$(git diff --cached --name-only)" = "flake.lock"
-          git commit -m "chore: update OpenCodePolicy to $SHORT_REV"
+          git commit -m "chore: update OpencodeContract to $SHORT_REV"
           git push origin HEAD:"$BRANCH"
 
       - name: Create Draft pull request
@@ -382,15 +382,16 @@ jobs:
           set -euo pipefail
           cat > "$RUNNER_TEMP/pull-request.md" <<EOF
           ## 概要
-          - OpenCodePolicyを$OLD_REVから$NEW_REVへ更新
+          - OpencodeContractを$OLD_REVから$NEW_REVへ更新
 
           ## Lock hygiene
           - nixpkgs unchanged
           - flake-utils unchanged
           - root inputs unchanged
-          - only opencodePolicy-exclusive lock subtree changed
+          - only opencodeContract-exclusive lock subtree changed
+          - update target = opencodeContract
 
-          ## Policy audit
+          ## Contract audit
           - profile = agent-core
           - strict audit: $AUDIT_SUMMARY
           - DIFF=0
@@ -403,8 +404,8 @@ jobs:
 
           ## Verification
           - nix flake check --all-systems --no-build --no-update-lock-file
-          - explicit policy check build
-          - opencode-policy validate
+          - explicit contract check build
+          - opencode-contract validate
           - strict agent-core audit
 
           ## Scope
@@ -425,7 +426,7 @@ jobs:
               --draft \
               --base main \
               --head "$BRANCH" \
-              --title "chore: update OpenCodePolicy to $SHORT_REV" \
+              --title "chore: update OpencodeContract to $SHORT_REV" \
               --body-file "$RUNNER_TEMP/pull-request.md"
           )"
           echo "url=$PR_URL" >> "$GITHUB_OUTPUT"
@@ -439,7 +440,7 @@ jobs:
           PR_URL: ${{ steps.pull_request.outputs.url }}
         run: |
           {
-            echo "### OpenCodePolicy update"
+            echo "### OpencodeContract update"
             echo
             printf "Old: \`%s\`\n" "$OLD_REV"
             printf "New: \`%s\`\n" "$NEW_REV"

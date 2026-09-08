@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -15,27 +16,28 @@ TEMPLATES = (
 )
 
 
-class OpenCodePolicyIntegrationTest(unittest.TestCase):
+class OpencodeContractIntegrationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.flake = (ROOT / "flake.nix").read_text(encoding="utf-8")
         cls.lock = json.loads((ROOT / "flake.lock").read_text(encoding="utf-8"))
 
     def test_root_flake_declares_policy_input_and_nixpkgs_follow(self) -> None:
-        self.assertIn('opencodePolicy', self.flake)
-        self.assertIn('url = "github:upiscium/OpenCodePolicy";', self.flake)
+        self.assertIn('opencodeContract', self.flake)
+        self.assertIn('url = "github:upiscium/OpencodeContract";', self.flake)
         self.assertIn('inputs.nixpkgs.follows = "nixpkgs";', self.flake)
-        self.assertRegex(self.flake, r"outputs\s*=\s*\{[^}]*\bopencodePolicy\b")
+        self.assertRegex(self.flake, r"outputs\s*=\s*\{[^}]*\bopencodeContract\b")
 
-    def test_lock_pins_opencode_policy_repository_and_revision_shape(self) -> None:
-        self.assertIn("opencodePolicy", self.lock["nodes"]["root"]["inputs"])
+    def test_lock_pins_contract_repository_and_revision_shape(self) -> None:
+        self.assertIn("opencodeContract", self.lock["nodes"]["root"]["inputs"])
         self.assertEqual(
-            "opencodePolicy",
-            self.lock["nodes"]["root"]["inputs"]["opencodePolicy"],
+            "opencodeContract",
+            self.lock["nodes"]["root"]["inputs"]["opencodeContract"],
         )
-        node = self.lock["nodes"]["opencodePolicy"]
+        node = self.lock["nodes"]["opencodeContract"]
         self.assertEqual("upiscium", node["locked"]["owner"])
-        self.assertEqual("OpenCodePolicy", node["locked"]["repo"])
+        self.assertEqual("OpencodeContract", node["locked"]["repo"])
+        self.assertEqual("7e4b7eb29c2322264c613310d7f802b0237f7b1b", node["locked"]["rev"])
         self.assertEqual("github", node["locked"]["type"])
         self.assertRegex(node["locked"]["rev"], r"^[0-9a-f]{40}$")
         self.assertEqual(["nixpkgs"], node["inputs"]["nixpkgs"])
@@ -44,12 +46,12 @@ class OpenCodePolicyIntegrationTest(unittest.TestCase):
         self.assertIn("flake-utils.lib.eachDefaultSystem", self.flake)
         self.assertIn('if system == "x86_64-darwin" then { }', self.flake)
         self.assertIn("optionalAttrs isLinux", self.flake)
-        self.assertIn("checks.opencode-policy", self.flake)
-        self.assertIn("opencodePolicy.packages.${system}.opencode-policy", self.flake)
+        self.assertIn("checks.opencode-contract", self.flake)
+        self.assertIn("opencodeContract.packages.${system}.opencode-contract", self.flake)
         self.assertRegex(
             self.flake,
             re.compile(
-                r"opencode-policy audit-consumer\s+\\\s+"
+                r"opencode-contract audit-consumer\s+\\\s+"
                 r"--profile agent-core\s+\\\s+"
                 r"--consumer \$\{self\}\s+\\\s+"
                 r"--strict",
@@ -60,7 +62,7 @@ class OpenCodePolicyIntegrationTest(unittest.TestCase):
     def test_generated_template_flakes_do_not_receive_policy_input(self) -> None:
         for template in TEMPLATES:
             flake = ROOT / "templates" / template / "flake.nix"
-            self.assertNotIn("opencodePolicy", flake.read_text(encoding="utf-8"), template)
+            self.assertNotIn("opencodeContract", flake.read_text(encoding="utf-8"), template)
 
     def test_agent_core_version_and_upstream_are_expected(self) -> None:
         core = ROOT / "components" / "agent-core" / ".automation"
@@ -79,10 +81,44 @@ class OpenCodePolicyIntegrationTest(unittest.TestCase):
             workflow,
         )
         self.assertIn(
-            "nix build .#checks.x86_64-linux.opencode-policy --no-link --no-update-lock-file",
+            "nix build .#checks.x86_64-linux.opencode-contract --no-link --no-update-lock-file",
             workflow,
         )
-        self.assertNotRegex(workflow, r"git\s+clone.*OpenCodePolicy")
+        self.assertNotRegex(workflow, r"git\s+clone.*OpencodeContract")
+
+    def test_tracked_contract_surfaces_have_no_legacy_identity(self) -> None:
+        legacy = (
+            "OpenCode" + "Policy",
+            "opencode" + "Policy",
+            "opencode" + "-policy",
+            "opencode" + "_policy",
+        )
+        tracked_and_new = subprocess.run(
+            ("git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"),
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+        ).stdout.split(b"\0")
+        matches = []
+        for raw_path in tracked_and_new:
+            if not raw_path:
+                continue
+            relative_path = raw_path.decode()
+            path = ROOT / relative_path
+            if not path.is_file():
+                continue
+            content = path.read_bytes()
+            matches.extend(
+                f"{relative_path}: legacy identity in path"
+                for forbidden in legacy
+                if forbidden in relative_path
+            )
+            matches.extend(
+                f"{relative_path}: {forbidden}"
+                for forbidden in legacy
+                if forbidden.encode() in content
+            )
+        self.assertEqual([], matches)
 
 
 if __name__ == "__main__":
