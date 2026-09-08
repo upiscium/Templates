@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 
 import task_contract
+import task_lifecycle
 
 
 class PublicationMetadataError(RuntimeError):
@@ -103,18 +104,36 @@ def completed_reviews(root: Path, task: str) -> list[str]:
         return []
     if value.get("task_id") != task or not isinstance(value.get("units"), dict):
         raise PublicationMetadataError("Work Unit evidence does not match the Task")
-    reviews = []
+    effective: dict[str, tuple[int, str, dict]] = {}
     for identifier, unit in value["units"].items():
         if not isinstance(unit, dict) or unit.get("requested_role") not in {"reviewer", "security-reviewer"}:
             continue
+        sequence = (
+            task_lifecycle.canonical_work_unit_sequence(task, identifier)
+            if isinstance(identifier, str)
+            else None
+        )
+        if sequence is None:
+            raise PublicationMetadataError(
+                f"review Work Unit has no canonical sequence: {identifier}"
+            )
+        role = unit["requested_role"]
+        if role not in effective or sequence > effective[role][0]:
+            effective[role] = (sequence, identifier, unit)
+
+    reviews = []
+    for role in ("reviewer", "security-reviewer"):
+        if role not in effective:
+            continue
+        _, identifier, unit = effective[role]
         if unit.get("state") != "completed":
             raise PublicationMetadataError(
-                f"required {unit.get('requested_role')} Work Unit is not completed: {identifier}"
+                f"required {role} Work Unit is not completed: {identifier}"
             )
         transitions = unit.get("transitions")
         digest = transitions[-1].get("evidence_sha256") if isinstance(transitions, list) and transitions else None
-        if isinstance(identifier, str) and isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
-            reviews.append(f"- `{identifier}` — `{unit['requested_role']}` — completed — evidence `{digest}`")
+        if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest):
+            reviews.append(f"- `{identifier}` — `{role}` — completed — evidence `{digest}`")
     return reviews
 
 

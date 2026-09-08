@@ -153,6 +153,26 @@ class AgentCoreSafetyTest(unittest.TestCase):
 class PublicationMetadataTest(unittest.TestCase):
     HEAD = "a" * 40
 
+    @staticmethod
+    def unit(role: str, state: str, digest: str = "c") -> dict:
+        return {
+            "requested_role": role,
+            "state": state,
+            "transitions": [{"evidence_sha256": digest * 64}],
+        }
+
+    def write_work_units(self, root: Path, units: list[tuple[str, dict]]) -> None:
+        (root / ".task-state" / "work-units.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "task_id": "19",
+                    "units": dict(units),
+                }
+            ),
+            encoding="utf-8",
+        )
+
     def test_canonical_pr_body_matches_allows_only_one_terminal_lf(self) -> None:
         matches = agent_core.publication.canonical_pr_body_matches
         self.assertTrue(matches("canonical body", "canonical body"))
@@ -237,22 +257,9 @@ None yet.
             encoding="utf-8",
         )
         if reviews:
-            digest = "c" * 64
-            (state / "work-units.json").write_text(
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "task_id": "19",
-                        "units": {
-                            "WU-19-04": {
-                                "requested_role": "reviewer",
-                                "state": "completed",
-                                "transitions": [{"evidence_sha256": digest}],
-                            },
-                        },
-                    }
-                ),
-                encoding="utf-8",
+            self.write_work_units(
+                root,
+                [("WU-19-04", self.unit("reviewer", "completed"))],
             )
 
     def test_untouched_default_template_is_rejected(self) -> None:
@@ -348,6 +355,172 @@ None yet.
             root = Path(directory)
             self.fixture(root, reviews=False)
             with self.assertRaisesRegex(agent_core.publication.PublicationMetadataError, "completed reviewer"):
+                agent_core.publication.canonical_metadata(
+                    root, "19", head=self.HEAD, changed_paths=["one"]
+                )
+
+    def test_blocked_reviewer_is_superseded_by_later_completed_reviewer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            self.write_work_units(
+                root,
+                [
+                    ("WU-19-04", self.unit("reviewer", "blocked", "b")),
+                    ("WU-19-05", self.unit("reviewer", "completed", "c")),
+                ],
+            )
+            _, body = agent_core.publication.canonical_metadata(
+                root, "19", head=self.HEAD, changed_paths=["one"]
+            )
+            self.assertIn("`WU-19-05` — `reviewer` — completed", body)
+            self.assertNotIn("WU-19-04", body)
+
+    def test_later_blocked_reviewer_supersedes_completed_reviewer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            self.write_work_units(
+                root,
+                [
+                    ("WU-19-04", self.unit("reviewer", "completed")),
+                    ("WU-19-05", self.unit("reviewer", "blocked")),
+                ],
+            )
+            with self.assertRaisesRegex(
+                agent_core.publication.PublicationMetadataError,
+                "reviewer Work Unit is not completed: WU-19-05",
+            ):
+                agent_core.publication.canonical_metadata(
+                    root, "19", head=self.HEAD, changed_paths=["one"]
+                )
+
+    def test_blocked_security_review_is_superseded_by_later_completed_review(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            self.write_work_units(
+                root,
+                [
+                    ("WU-19-04", self.unit("reviewer", "completed")),
+                    ("WU-19-05", self.unit("security-reviewer", "blocked", "b")),
+                    ("WU-19-06", self.unit("security-reviewer", "completed", "d")),
+                ],
+            )
+            _, body = agent_core.publication.canonical_metadata(
+                root, "19", head=self.HEAD, changed_paths=["one"]
+            )
+            self.assertIn("`WU-19-06` — `security-reviewer` — completed", body)
+            self.assertNotIn("WU-19-05", body)
+
+    def test_later_blocked_security_review_supersedes_completed_review(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            self.write_work_units(
+                root,
+                [
+                    ("WU-19-04", self.unit("reviewer", "completed")),
+                    ("WU-19-05", self.unit("security-reviewer", "completed")),
+                    ("WU-19-06", self.unit("security-reviewer", "blocked")),
+                ],
+            )
+            with self.assertRaisesRegex(
+                agent_core.publication.PublicationMetadataError,
+                "security-reviewer Work Unit is not completed: WU-19-06",
+            ):
+                agent_core.publication.canonical_metadata(
+                    root, "19", head=self.HEAD, changed_paths=["one"]
+                )
+
+    def test_failed_non_review_work_units_do_not_gate_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            self.write_work_units(
+                root,
+                [
+                    ("WU-19-04", self.unit("reviewer", "completed")),
+                    ("WU-19-05", self.unit("general", "blocked")),
+                    ("WU-19-06", self.unit("verifier", "failed")),
+                ],
+            )
+            _, body = agent_core.publication.canonical_metadata(
+                root, "19", head=self.HEAD, changed_paths=["one"]
+            )
+            self.assertIn("`WU-19-04` — `reviewer` — completed", body)
+
+    def test_only_highest_reviewer_sequence_is_authoritative(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            self.write_work_units(
+                root,
+                [
+                    ("WU-19-05", self.unit("reviewer", "failed")),
+                    ("WU-19-04", self.unit("reviewer", "blocked")),
+                    ("WU-19-06", self.unit("reviewer", "completed", "d")),
+                ],
+            )
+            _, body = agent_core.publication.canonical_metadata(
+                root, "19", head=self.HEAD, changed_paths=["one"]
+            )
+            self.assertIn("`WU-19-06` — `reviewer` — completed", body)
+            self.assertNotIn("WU-19-04", body)
+            self.assertNotIn("WU-19-05", body)
+
+    def test_only_highest_security_review_sequence_is_authoritative(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            self.write_work_units(
+                root,
+                [
+                    ("WU-19-04", self.unit("reviewer", "completed")),
+                    ("WU-19-06", self.unit("security-reviewer", "completed", "d")),
+                    ("WU-19-05", self.unit("security-reviewer", "failed")),
+                ],
+            )
+            _, body = agent_core.publication.canonical_metadata(
+                root, "19", head=self.HEAD, changed_paths=["one"]
+            )
+            self.assertIn("`WU-19-06` — `security-reviewer` — completed", body)
+            self.assertNotIn("WU-19-05", body)
+
+    def test_canonical_sequence_wins_over_json_insertion_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            self.write_work_units(
+                root,
+                [
+                    ("WU-19-05", self.unit("reviewer", "blocked")),
+                    ("WU-19-04", self.unit("reviewer", "completed")),
+                ],
+            )
+            with self.assertRaisesRegex(
+                agent_core.publication.PublicationMetadataError,
+                "reviewer Work Unit is not completed: WU-19-05",
+            ):
+                agent_core.publication.canonical_metadata(
+                    root, "19", head=self.HEAD, changed_paths=["one"]
+                )
+
+    def test_noncanonical_review_work_unit_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.fixture(root)
+            self.write_work_units(
+                root,
+                [
+                    ("WU-19-04", self.unit("reviewer", "completed")),
+                    ("WU-19-5", self.unit("reviewer", "completed")),
+                ],
+            )
+            with self.assertRaisesRegex(
+                agent_core.publication.PublicationMetadataError,
+                "no canonical sequence: WU-19-5",
+            ):
                 agent_core.publication.canonical_metadata(
                     root, "19", head=self.HEAD, changed_paths=["one"]
                 )
