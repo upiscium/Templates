@@ -10,6 +10,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -331,6 +332,21 @@ def pr_for_branch(root: Path, branch: str, repository: str | None = None) -> dic
     return value
 
 
+def remote_branch_head(root: Path, branch: str, repository: str) -> str:
+    value = gh(
+        "api",
+        "--hostname",
+        "github.com",
+        f"repos/{repository}/git/ref/heads/{quote(branch, safe='')}",
+        "--jq",
+        ".object.sha",
+        cwd=root,
+    )
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value):
+        raise AutomationError("remote Task branch HEAD is not a full immutable revision")
+    return value
+
+
 def _publication_context(root: Path, task: str) -> tuple[str, dict, str]:
     branch = ensure_task_branch(root, task)
     head = git("rev-parse", "HEAD", cwd=root)
@@ -410,16 +426,49 @@ def _validate_edit_target(pr: dict, *, branch: str, base: str, head: str) -> Non
         raise AutomationError("pull request repair target identity is invalid: " + ", ".join(mismatches or ["number"]))
 
 
-def pr_create(root: Path, task: str) -> None:
+def pr_create(root: Path, task: str) -> dict:
     verify(root, task)
     branch, context, head = _publication_context(root, task)
     if context["status"] != "publication-ready":
         raise AutomationError(f"pr-create requires publication-ready; found {context['status']}")
     repository = context["repository"]
-    if pr_for_branch(root, branch, repository):
-        raise AutomationError(f"pull request already exists for {branch}")
     base = default_branch(root)
     title, body, body_text = _validated_local_metadata(root, task, head)
+    existing = pr_for_branch(root, branch, repository)
+    if existing is not None:
+        if not isinstance(existing.get("number"), int) or isinstance(existing.get("number"), bool):
+            raise AutomationError("pull request reconciliation target has an invalid number")
+        _validate_live_pr(
+            existing,
+            branch=branch,
+            base=base,
+            head=head,
+            title=title,
+            body=body_text,
+            draft=True,
+        )
+        if canonical_repository(root).casefold() != repository.casefold():
+            raise AutomationError("repository identity changed during pull request reconciliation")
+        confirmed = pr_for_branch(root, branch, repository)
+        if not confirmed or confirmed.get("number") != existing["number"]:
+            raise AutomationError("pull request identity changed during guarded reconciliation")
+        _validate_live_pr(
+            confirmed,
+            branch=branch,
+            base=base,
+            head=head,
+            title=title,
+            body=body_text,
+            draft=True,
+        )
+        try:
+            lifecycle.mark_task_publication_state(context["record"], task, "publication-ready", "draft-pr-created")
+        except lifecycle.LifecycleError as exc:
+            raise AutomationError(str(exc)) from exc
+        print(json.dumps(confirmed))
+        return confirmed
+    if remote_branch_head(root, branch, repository) != head:
+        raise AutomationError("remote Task branch does not match the exact publication HEAD")
     gh("pr", "create", "--repo", repository, "--draft", "--base", base, "--head", branch, "--title", title, "--body-file", str(body), cwd=root)
     if canonical_repository(root).casefold() != repository.casefold():
         raise AutomationError("repository identity changed during pull request creation")
@@ -432,6 +481,7 @@ def pr_create(root: Path, task: str) -> None:
     except lifecycle.LifecycleError as exc:
         raise AutomationError(str(exc)) from exc
     print(json.dumps(pr))
+    return pr
 
 
 def pr_edit(root: Path, task: str) -> None:

@@ -207,6 +207,35 @@ or arbitrary consumer mutation surface. AKV #22/#23 are the motivating example
 for this first-adoption path; that example is not claimed as executed. Agent
 Core VERSION remains 3.
 
+### Issue #131: source-side publication recovery
+
+An already-complete in-flight Task can be publication-blocked when its installed
+Agent Core predates a correction to canonical publication semantics. After that
+correction is released, an operator may use a clean Templates checkout at the
+exact full release implementation revision:
+
+```sh
+just agent-core::publication-recover <consumer-task-worktree> <task> <expected-implementation-revision>
+```
+
+This is not a normal publication route. Ordinary Tasks continue to use
+`just agent::pr-prepare` followed by `just agent::pr-create`. Recovery requires
+an exact registered non-default Task worktree already in `publication-ready`, a
+clean product tree, identical local and remote Task HEADs, a resolved canonical
+Task Contract, fresh persisted verification for that HEAD, and effective
+completed review evidence. It executes canonical `pr_prepare` and `pr_create`
+from modules loaded only from verified immutable Templates commit blobs;
+consumer `.automation/bin` files are not publication authority.
+
+The operation never upgrades the consumer or changes its product HEAD. Work
+Unit, verification, and contract evidence remain byte-identical; only ignored
+publication metadata and the guarded `publication-ready -> draft-pr-created`
+transition may change. An interrupted external write is reconciled only when
+the existing PR is the exact expected same-repository OPEN Draft, including
+branch, base, head OID, title, and body. Mismatching PRs are neither edited nor
+adopted, and the bridge never marks a PR Ready. AgentKnowledgeVault Task #13 is
+the motivating downstream target, not an execution performed by this change.
+
 Issue #103 permits that separate guarded cleanup to recover when GitHub has
 already deleted a merged Task's remote branch. A configured upstream is not
 treated as a live revision: cleanup queries origin directly, requires status

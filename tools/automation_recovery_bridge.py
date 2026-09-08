@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import io
 import json
 import os
 import re
@@ -12,7 +13,8 @@ import shutil
 import stat
 import sys
 import tempfile
-from contextlib import contextmanager
+from urllib.parse import quote
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 import secrets
 import subprocess
@@ -234,6 +236,29 @@ def _validate_target_git_configuration(target: Path) -> None:
             "consumer repository has unsafe local Git configuration: "
             + ", ".join(unsafe)
         )
+    enabled = _pinned_run(
+        ["git", "config", "--local", "--no-includes", "--bool", "--get", "extensions.worktreeConfig"],
+        cwd=target,
+        check=False,
+    )
+    if enabled.returncode not in {0, 1}:
+        raise BridgeError("cannot validate consumer worktree Git configuration")
+    if enabled.returncode == 0:
+        if enabled.stdout.strip() != "true":
+            raise BridgeError("extensions.worktreeConfig must be a valid true boolean")
+        worktree = _pinned_run(
+            ["git", "config", "--worktree", "--no-includes", "--null", "--name-only", "--list"],
+            cwd=target,
+        )
+        unsafe_worktree = sorted(
+            name for name in worktree.stdout.split("\0")
+            if name and _UNSAFE_LOCAL_CONFIG.fullmatch(name)
+        )
+        if unsafe_worktree:
+            raise BridgeError(
+                "consumer worktree has unsafe Git configuration: "
+                + ", ".join(unsafe_worktree)
+            )
 
 
 @contextmanager
@@ -468,6 +493,10 @@ def parser() -> argparse.ArgumentParser:
     finalize.add_argument("task", type=_issue_argument)
     finalize.add_argument("pr", type=_issue_argument)
     finalize.add_argument("expected_implementation_revision", type=_revision_argument)
+    publication = sub.add_parser("publication-recover")
+    publication.add_argument("target", type=Path)
+    publication.add_argument("task", type=_issue_argument)
+    publication.add_argument("expected_implementation_revision", type=_revision_argument)
     return result
 
 
@@ -507,6 +536,214 @@ def _check_resume_contract(contract, target: Path, task: str) -> dict:
     return result
 
 
+def _target_git(*args: str, target: Path, check: bool = True) -> str:
+    return _pinned_run(["git", *args], cwd=target, check=check).stdout.strip()
+
+
+def _state_bytes(target: Path, name: str, contract=None) -> bytes:
+    path = target / ".task-state" / name
+    try:
+        if contract is None:
+            return path.read_bytes()
+        with contract.contract_state_lock(target) as directory_fd:
+            content = contract._read_state_file(directory_fd, name)
+            contract._assert_state_dir_binding(target, directory_fd)
+        if content is None:
+            raise BridgeError(f"cannot read required Task evidence: {path}")
+        return content
+    except BridgeError:
+        raise
+    except Exception as exc:
+        raise BridgeError(f"cannot read required Task evidence: {path}") from exc
+
+
+def _remote_branch_head(target: Path, repository: str, branch: str) -> str:
+    result = _pinned_run(
+        ["gh", "api", "--hostname", "github.com", f"repos/{repository}/git/ref/heads/{quote(branch, safe='')}", "--jq", ".object.sha"],
+        cwd=target,
+    )
+    head = result.stdout.strip()
+    if not _REVISION_RE.fullmatch(head):
+        raise BridgeError("remote Task branch HEAD is not a full immutable revision")
+    return head
+
+
+def _publication_snapshot(modules: dict, target: Path, task: str) -> dict:
+    lifecycle = modules["task_lifecycle"]
+    agent_core = modules["agent_core"]
+    try:
+        if lifecycle.repo_root(target) != target:
+            raise BridgeError("publication recovery target must be an exact Git worktree root")
+        current = lifecycle.current_worktree(target)
+        main = lifecycle.main_worktree(target)
+        record = lifecycle.worktree_for_task(target, task)
+        if current.path != target or record.path != target or current.path == main.path:
+            raise BridgeError("publication recovery target must be the exact registered non-default Task worktree")
+        lifecycle.require_resolved_contract(record, task)
+        branch = agent_core.ensure_task_branch(target, task)
+        if record.branch != branch:
+            raise BridgeError("registered Task branch identity changed")
+        status = lifecycle.state_status(lifecycle.state_path(target))
+        if status != "publication-ready":
+            raise BridgeError(f"publication recovery requires publication-ready; found {status}")
+        repository = agent_core.canonical_repository(target)
+    except BridgeError:
+        raise
+    except Exception as exc:
+        raise BridgeError(str(exc)) from exc
+
+    head = _target_git("rev-parse", "--verify", "HEAD^{commit}", target=target)
+    if not _REVISION_RE.fullmatch(head):
+        raise BridgeError("target HEAD is not a full immutable revision")
+    local_head = _target_git(
+        "rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}", target=target
+    )
+    if head != local_head or record.head != head:
+        raise BridgeError("target HEAD, local Task branch, and registered worktree HEAD differ")
+    if _target_git("status", "--porcelain=v1", "--untracked-files=all", target=target):
+        raise BridgeError("target tracked worktree must be clean")
+    if _remote_branch_head(target, repository, branch) != head:
+        raise BridgeError("remote Task branch does not match the exact target HEAD")
+
+    contract_module = modules["task_contract"]
+    work_units = _state_bytes(target, "work-units.json", contract_module)
+    verification = _state_bytes(target, "verification.json", contract_module)
+    contract = _state_bytes(target, "contract.json", contract_module)
+    state = _state_bytes(target, "task.md", contract_module)
+    try:
+        modules["publication_metadata"].verification_evidence(target, task, head)
+        modules["publication_metadata"].completed_reviews(target, task)
+    except Exception as exc:
+        raise BridgeError(str(exc)) from exc
+    return {
+        "head": head,
+        "branch": branch,
+        "repository": repository,
+        "record": record,
+        "work_units": work_units,
+        "verification": verification,
+        "contract": contract,
+        "state": state,
+    }
+
+
+def _assert_publication_postconditions(modules: dict, target: Path, task: str, before: dict) -> None:
+    after = _publication_snapshot_for_post(modules, target, task)
+    for name in ("head", "branch", "repository", "work_units", "verification", "contract"):
+        if after[name] != before[name]:
+            raise BridgeError(f"publication recovery changed immutable target evidence: {name}")
+    expected_state = re.sub(
+        rb"(?m)^- Status: publication-ready$",
+        b"- Status: draft-pr-created",
+        before["state"],
+        count=1,
+    )
+    if expected_state == before["state"] or after["state"] != expected_state:
+        raise BridgeError("publication recovery changed Task State beyond the guarded lifecycle transition")
+    if _target_git("diff", "--name-only", target=target) or _target_git(
+        "diff", "--cached", "--name-only", target=target
+    ):
+        raise BridgeError("publication recovery changed tracked consumer content")
+
+
+def _publication_snapshot_for_post(modules: dict, target: Path, task: str) -> dict:
+    lifecycle = modules["task_lifecycle"]
+    agent_core = modules["agent_core"]
+    try:
+        if lifecycle.repo_root(target) != target:
+            raise BridgeError("publication recovery target is no longer the exact Git worktree root")
+        current = lifecycle.current_worktree(target)
+        main = lifecycle.main_worktree(target)
+        record = lifecycle.worktree_for_task(target, task)
+        lifecycle.require_resolved_contract(record, task)
+        branch = agent_core.ensure_task_branch(target, task)
+        status = lifecycle.state_status(lifecycle.state_path(target))
+        repository = agent_core.canonical_repository(target)
+    except BridgeError:
+        raise
+    except Exception as exc:
+        raise BridgeError(str(exc)) from exc
+    if current.path != target or record.path != target or current.path == main.path:
+        raise BridgeError("publication recovery target worktree identity changed")
+    if status != "draft-pr-created":
+        raise BridgeError(f"publication recovery did not reach draft-pr-created; found {status}")
+    head = _target_git("rev-parse", "--verify", "HEAD^{commit}", target=target)
+    local_head = _target_git(
+        "rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}", target=target
+    )
+    if head != local_head or record.head != head or _remote_branch_head(target, repository, branch) != head:
+        raise BridgeError("target Task HEAD identity changed during publication recovery")
+    if _target_git("status", "--porcelain=v1", "--untracked-files=all", target=target):
+        raise BridgeError("target tracked worktree changed during publication recovery")
+    contract_module = modules["task_contract"]
+    return {
+        "head": head,
+        "branch": branch,
+        "repository": repository,
+        "work_units": _state_bytes(target, "work-units.json", contract_module),
+        "verification": _state_bytes(target, "verification.json", contract_module),
+        "contract": _state_bytes(target, "contract.json", contract_module),
+        "state": _state_bytes(target, "task.md", contract_module),
+    }
+
+
+def _publication_recover(modules: dict, target: Path, task: str) -> dict:
+    before = _publication_snapshot(modules, target, task)
+    agent_core = modules["agent_core"]
+    publication = modules["publication_metadata"]
+
+    def require_persisted_verification(root: Path, requested_task: str) -> None:
+        if root.resolve() != target or requested_task != task:
+            raise BridgeError("publication recovery verification target changed")
+        head = _target_git("rev-parse", "--verify", "HEAD^{commit}", target=target)
+        if head != before["head"]:
+            raise BridgeError("target HEAD changed before publication")
+        if _target_git("status", "--porcelain=v1", "--untracked-files=all", target=target):
+            raise BridgeError("target tracked worktree changed before publication")
+        publication.verification_evidence(target, task, head)
+        if _state_bytes(target, "verification.json", modules["task_contract"]) != before["verification"]:
+            raise BridgeError("project verification evidence changed before publication")
+
+    original_verify = agent_core.verify
+    output = io.StringIO()
+    try:
+        agent_core.verify = require_persisted_verification
+        with redirect_stdout(output):
+            agent_core.pr_prepare(target, task)
+            immediately_before = _publication_snapshot(modules, target, task)
+            for name in ("head", "branch", "repository", "work_units", "verification", "contract", "state"):
+                if immediately_before[name] != before[name]:
+                    raise BridgeError(f"publication authority changed before GitHub write: {name}")
+            pr = agent_core.pr_create(target, task)
+    finally:
+        agent_core.verify = original_verify
+
+    if not pr or not isinstance(pr.get("number"), int) or isinstance(pr.get("number"), bool):
+        raise BridgeError("published Draft PR cannot be resolved exactly")
+    live = agent_core.pr_for_branch(target, before["branch"], before["repository"])
+    if not live or live.get("number") != pr["number"]:
+        raise BridgeError("published Draft PR identity changed after canonical publication")
+    title, _, body = agent_core._validated_local_metadata(target, task, before["head"])
+    agent_core._validate_live_pr(
+        live,
+        branch=before["branch"],
+        base=agent_core.default_branch(target),
+        head=before["head"],
+        title=title,
+        body=body,
+        draft=True,
+    )
+    _assert_publication_postconditions(modules, target, task, before)
+    return {
+        "status": "DRAFT_PR_CREATED",
+        "task": task,
+        "branch": before["branch"],
+        "head": before["head"],
+        "repository": before["repository"],
+        "pullRequest": pr,
+    }
+
+
 def main() -> int:
     revision = None
     failure = None
@@ -517,14 +754,14 @@ def main() -> int:
         revision = _clean_root(
             ROOT,
             args.expected_implementation_revision
-            if args.command == "maintenance-finalize" else None,
+            if args.command in {"maintenance-finalize", "publication-recover"} else None,
         )
         _verify_bootstrap(ROOT, revision)
         _clean_root(ROOT, revision)
         target = args.target.resolve()
-        if args.command == "maintenance-finalize" and target == ROOT:
-            raise BridgeError("maintenance finalization target must not be the source root")
-        if args.command == "maintenance-finalize":
+        if args.command in {"maintenance-finalize", "publication-recover"} and target == ROOT:
+            raise BridgeError(f"{args.command} target must not be the source root")
+        if args.command in {"maintenance-finalize", "publication-recover"}:
             _validate_target_git_configuration(target)
         with maintenance_environment():
             if args.command in {"recover-task-contract-from-issue", "resume-contract-check"}:
@@ -543,6 +780,11 @@ def main() -> int:
                     value = modules["maintenance_lifecycle"].maintenance_finalize(
                         target, args.task, int(args.pr)
                     )
+                    result = {**value, "implementationRevision": revision}
+            elif args.command == "publication-recover":
+                with _verified_modules(ROOT, revision) as modules:
+                    _clean_root(ROOT, revision)
+                    value = _publication_recover(modules, target, args.task)
                     result = {**value, "implementationRevision": revision}
             else:
                 with _verified_engine(ROOT, revision) as engine:

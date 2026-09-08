@@ -116,6 +116,22 @@ class AutomationJustPathTest(unittest.TestCase):
         self.assertIn("/run/current-system/sw/bin/python3", text)
         self.assertLess(text.index("unset LD_PRELOAD"), text.index("selected_python="))
 
+    def test_source_publication_recover_recipe_uses_expected_revision(self) -> None:
+        text = (ROOT / "just" / "agent-core.just").read_text(encoding="utf-8")
+        self.assertIn(
+            "publication-recover target task expected_implementation_revision:", text
+        )
+        self.assertIn(
+            '"$resolved_python" -I {{quote(tool)}} publication-recover '
+            "{{quote(target)}} {{quote(task)}} "
+            "{{quote(expected_implementation_revision)}}",
+            text,
+        )
+        recipe = text[text.index("publication-recover target task"):]
+        self.assertIn("unset LD_PRELOAD", recipe)
+        self.assertIn("os.path.realpath(sys.executable)", recipe)
+        self.assertLess(recipe.index("unset LD_PRELOAD"), recipe.index("selected_python="))
+
     @staticmethod
     def _fake_python(path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

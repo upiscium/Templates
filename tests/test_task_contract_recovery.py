@@ -245,7 +245,12 @@ class TaskContractRecoveryTest(unittest.TestCase):
             )
         )
         with mock.patch.object(
-            bridge, "_pinned_run", return_value=mock.Mock(stdout=ordinary)
+            bridge,
+            "_pinned_run",
+            side_effect=[
+                mock.Mock(stdout=ordinary, returncode=0),
+                mock.Mock(stdout="", returncode=1),
+            ],
         ):
             bridge._validate_target_git_configuration(Path("/tmp/task"))
 
