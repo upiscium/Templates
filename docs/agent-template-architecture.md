@@ -749,6 +749,40 @@ generic authority-expansion or arbitrary consumer-mutation primitive. AKV
 #22/#23 motivate this first-adoption example, but their execution is not
 claimed. Agent Core VERSION remains 3.
 
+#### Issue #131 source-side publication recovery
+
+`agent-core::publication-recover` is a bounded recovery boundary for an
+already-complete in-flight consumer Task whose installed publication tooling is
+defective. It is not an alternative normal publication workflow: ordinary
+Tasks use `just agent::pr-prepare` and `just agent::pr-create`.
+
+```sh
+just agent-core::publication-recover <consumer-task-worktree> <task> <expected-implementation-revision>
+```
+
+The implementation revision is a required full exact Templates commit. The
+bridge reuses the maintenance recovery trust chain: the live bootstrap equals
+its tracked blob and mode, the source remains clean at the exact revision,
+canonical modules come only from verified commit blobs, and Git/GitHub
+execution is pinned and environment-sanitized. Consumer-local Agent Core code
+never becomes publication authority.
+
+The bridge binds the exact registered non-default worktree, Task/branch/contract
+identity, `publication-ready` state, local worktree and branch HEAD, GitHub
+remote branch OID, canonical repository, clean product status, fresh head-bound
+verification receipt, and effective review evidence. It uses the verified
+source implementation's canonical preparation and Draft creation. Product HEAD
+and tracked bytes remain unchanged; Work Unit, verification, and contract
+evidence remain byte-identical; only private publication metadata and the
+guarded `publication-ready -> draft-pr-created` transition may change.
+
+Canonical `pr_create` makes the external-write boundary retryable. With an
+existing PR while local state is still `publication-ready`, lifecycle advances
+only when that PR is the exact canonical OPEN same-repository Draft for the
+captured branch, base, head, title, and body. Wrong PR state is never edited or
+adopted. This surface does not mark Ready, upgrade the consumer, mutate product
+history, or expose arbitrary source-side Agent Core execution.
+
 #### Issue #97 provenance correction
 
 The active-consumer correction is deliberately narrow, not generic receipt

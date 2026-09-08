@@ -539,6 +539,7 @@ None yet.
                 mock.patch.object(agent_core, "_validated_local_metadata", return_value=(title, root / ".task-state/pr-body.md", body_text.rstrip())),
                 mock.patch.object(agent_core, "default_branch", return_value="main"),
                 mock.patch.object(agent_core, "canonical_repository", return_value="example/repo"),
+                mock.patch.object(agent_core, "remote_branch_head", return_value=self.HEAD),
                 mock.patch.object(agent_core, "pr_for_branch", side_effect=[None, live]),
                 mock.patch.object(agent_core, "gh") as gh,
                 mock.patch.object(agent_core.lifecycle, "mark_task_publication_state") as transition,
@@ -547,6 +548,105 @@ None yet.
             self.assertIn("--draft", gh.call_args.args)
             verify_mock.assert_called_once_with(root, "19")
             transition.assert_called_once()
+
+    def test_create_reconciles_exact_existing_draft_without_write(self) -> None:
+        live = {
+            "number": 20, "title": "title", "body": "canonical\n",
+            "headRefName": "task/19-fix", "baseRefName": "main",
+            "isDraft": True, "isCrossRepository": False, "state": "OPEN",
+            "headRefOid": self.HEAD,
+        }
+        with (
+            mock.patch.object(agent_core, "verify"),
+            mock.patch.object(agent_core, "_publication_context", return_value=(
+                "task/19-fix", {"record": mock.sentinel.record, "status": "publication-ready", "repository": "example/repo"}, self.HEAD
+            )),
+            mock.patch.object(agent_core, "default_branch", return_value="main"),
+            mock.patch.object(agent_core, "canonical_repository", return_value="example/repo"),
+            mock.patch.object(agent_core, "remote_branch_head", return_value=self.HEAD),
+            mock.patch.object(agent_core, "_validated_local_metadata", return_value=("title", Path("body"), "canonical")),
+            mock.patch.object(agent_core, "pr_for_branch", side_effect=[live, live]),
+            mock.patch.object(agent_core, "gh") as gh,
+            mock.patch.object(agent_core.lifecycle, "mark_task_publication_state") as transition,
+        ):
+            with mock.patch("builtins.print") as output:
+                agent_core.pr_create(Path("."), "19")
+        gh.assert_not_called()
+        transition.assert_called_once()
+        self.assertEqual(json.loads(output.call_args.args[0]), live)
+
+    def test_create_rejects_noncanonical_existing_pr_without_write(self) -> None:
+        for field, value in (
+            ("headRefOid", "b" * 40),
+            ("title", "wrong title"),
+            ("body", "wrong body"),
+            ("isDraft", False),
+            ("isCrossRepository", True),
+        ):
+            live = {
+                "number": 20, "title": "title", "body": "canonical",
+                "headRefName": "task/19-fix", "baseRefName": "main",
+                "isDraft": True, "isCrossRepository": False, "state": "OPEN",
+                "headRefOid": self.HEAD,
+            }
+            live[field] = value
+            with (
+                mock.patch.object(agent_core, "verify"),
+                mock.patch.object(agent_core, "_publication_context", return_value=(
+                    "task/19-fix", {"record": mock.sentinel.record, "status": "publication-ready", "repository": "example/repo"}, self.HEAD
+                )),
+                mock.patch.object(agent_core, "default_branch", return_value="main"),
+                mock.patch.object(agent_core, "canonical_repository", return_value="example/repo"),
+                mock.patch.object(agent_core, "_validated_local_metadata", return_value=("title", Path("body"), "canonical")),
+                mock.patch.object(agent_core, "pr_for_branch", return_value=live),
+                mock.patch.object(agent_core, "gh") as gh,
+                self.assertRaises(agent_core.AutomationError),
+            ):
+                agent_core.pr_create(Path("."), "19")
+            gh.assert_not_called()
+
+    def test_create_retry_reconciles_after_interrupted_transition(self) -> None:
+        live = {
+            "number": 20, "title": "title", "body": "canonical",
+            "headRefName": "task/19-fix", "baseRefName": "main",
+            "isDraft": True, "isCrossRepository": False, "state": "OPEN",
+            "headRefOid": self.HEAD,
+        }
+        context = {"record": mock.sentinel.record, "status": "publication-ready", "repository": "example/repo"}
+        with (
+            mock.patch.object(agent_core, "verify"),
+            mock.patch.object(agent_core, "_publication_context", return_value=("task/19-fix", context, self.HEAD)),
+            mock.patch.object(agent_core, "default_branch", return_value="main"),
+            mock.patch.object(agent_core, "canonical_repository", return_value="example/repo"),
+            mock.patch.object(agent_core, "remote_branch_head", return_value=self.HEAD),
+            mock.patch.object(agent_core, "_validated_local_metadata", return_value=("title", Path("body"), "canonical")),
+            mock.patch.object(agent_core, "pr_for_branch", side_effect=[None, live, live, live]),
+            mock.patch.object(agent_core, "gh"),
+            mock.patch.object(
+                agent_core.lifecycle,
+                "mark_task_publication_state",
+                side_effect=[agent_core.lifecycle.LifecycleError("interrupted"), None],
+            ) as transition,
+        ):
+            with self.assertRaisesRegex(agent_core.AutomationError, "interrupted"):
+                agent_core.pr_create(Path("."), "19")
+            agent_core.pr_create(Path("."), "19")
+        self.assertEqual(transition.call_count, 2)
+
+    def test_create_rejects_remote_head_drift_before_github_write(self) -> None:
+        context = {"record": mock.sentinel.record, "status": "publication-ready", "repository": "example/repo"}
+        with (
+            mock.patch.object(agent_core, "verify"),
+            mock.patch.object(agent_core, "_publication_context", return_value=("task/19-fix", context, self.HEAD)),
+            mock.patch.object(agent_core, "default_branch", return_value="main"),
+            mock.patch.object(agent_core, "_validated_local_metadata", return_value=("title", Path("body"), "canonical")),
+            mock.patch.object(agent_core, "pr_for_branch", return_value=None),
+            mock.patch.object(agent_core, "remote_branch_head", return_value="b" * 40),
+            mock.patch.object(agent_core, "gh") as gh,
+            self.assertRaisesRegex(agent_core.AutomationError, "remote Task branch"),
+        ):
+            agent_core.pr_create(Path("."), "19")
+        gh.assert_not_called()
 
     def test_existing_stale_draft_is_repaired_in_place(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
