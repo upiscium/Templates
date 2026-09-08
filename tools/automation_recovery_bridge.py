@@ -714,7 +714,21 @@ def _publication_recover(modules: dict, target: Path, task: str) -> dict:
             for name in ("head", "branch", "repository", "work_units", "verification", "contract", "state"):
                 if immediately_before[name] != before[name]:
                     raise BridgeError(f"publication authority changed before GitHub write: {name}")
-            pr = agent_core.pr_create(target, task)
+            existing = agent_core.pr_for_branch(target, before["branch"], before["repository"])
+            if existing is None:
+                pr = agent_core.pr_create(target, task)
+            else:
+                if (
+                    not isinstance(existing, dict)
+                    or not isinstance(existing.get("number"), int)
+                    or isinstance(existing.get("number"), bool)
+                ):
+                    raise BridgeError("existing Draft PR has an invalid or ambiguous number")
+                existing_number = existing["number"]
+                agent_core.pr_edit(target, task)
+                pr = agent_core.pr_for_branch(target, before["branch"], before["repository"])
+                if not pr or pr.get("number") != existing_number:
+                    raise BridgeError("existing Draft PR identity changed after canonical repair")
     finally:
         agent_core.verify = original_verify
 

@@ -771,17 +771,22 @@ The bridge binds the exact registered non-default worktree, Task/branch/contract
 identity, `publication-ready` state, local worktree and branch HEAD, GitHub
 remote branch OID, canonical repository, clean product status, fresh head-bound
 verification receipt, and effective review evidence. It uses the verified
-source implementation's canonical preparation and Draft creation. Product HEAD
-and tracked bytes remain unchanged; Work Unit, verification, and contract
-evidence remain byte-identical; only private publication metadata and the
-guarded `publication-ready -> draft-pr-created` transition may change.
+source implementation's canonical preparation, then canonical Draft creation
+when no PR exists or canonical Draft repair when the exact Task PR exists.
+Product HEAD and tracked bytes remain unchanged; Work Unit, verification, and
+contract evidence remain byte-identical; only private publication metadata and
+the guarded `publication-ready -> draft-pr-created` transition may change.
 
-Canonical `pr_create` makes the external-write boundary retryable. With an
-existing PR while local state is still `publication-ready`, lifecycle advances
-only when that PR is the exact canonical OPEN same-repository Draft for the
-captured branch, base, head, title, and body. Wrong PR state is never edited or
-adopted. This surface does not mark Ready, upgrade the consumer, mutate product
-history, or expose arbitrary source-side Agent Core execution.
+Canonical `pr_create` remains strict and reconciles only an already-canonical
+existing Draft. The bridge does not broaden it: after preparation, absence of a
+PR selects `pr_create`, while presence selects canonical `pr_edit`. That edit
+authority requires the exact OPEN same-repository Draft for the captured
+branch, base, and current head before changing only canonical title/body, then
+re-reads and validates the same PR identity. If GitHub editing succeeds before
+the lifecycle transition is interrupted, a retry selects that same PR and
+converges idempotently. Wrong PR state is never edited or adopted. This surface
+does not mark Ready, upgrade the consumer, mutate product history, or expose
+arbitrary source-side Agent Core execution.
 
 #### Issue #97 provenance correction
 

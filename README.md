@@ -223,18 +223,25 @@ This is not a normal publication route. Ordinary Tasks continue to use
 an exact registered non-default Task worktree already in `publication-ready`, a
 clean product tree, identical local and remote Task HEADs, a resolved canonical
 Task Contract, fresh persisted verification for that HEAD, and effective
-completed review evidence. It executes canonical `pr_prepare` and `pr_create`
-from modules loaded only from verified immutable Templates commit blobs;
-consumer `.automation/bin` files are not publication authority.
+completed review evidence. It executes canonical `pr_prepare`, then routes to
+canonical `pr_create` when no PR exists or canonical `pr_edit` when the exact
+Task PR already exists, from modules loaded only from verified immutable
+Templates commit blobs; consumer `.automation/bin` files are not publication
+authority.
 
 The operation never upgrades the consumer or changes its product HEAD. Work
 Unit, verification, and contract evidence remain byte-identical; only ignored
 publication metadata and the guarded `publication-ready -> draft-pr-created`
-transition may change. An interrupted external write is reconciled only when
-the existing PR is the exact expected same-repository OPEN Draft, including
-branch, base, head OID, title, and body. Mismatching PRs are neither edited nor
-adopted, and the bridge never marks a PR Ready. AgentKnowledgeVault Task #13 is
-the motivating downstream target, not an execution performed by this change.
+transition may change. Existing-PR repair delegates the mutation boundary to
+canonical `pr_edit`, which requires the exact same-repository OPEN Draft at the
+captured branch, base, and current head before replacing stale title/body, then
+re-reads and validates the same PR number. A retry after an edit succeeds but
+the lifecycle transition is interrupted converges on that same PR. Mismatching
+PRs are neither edited nor adopted, strict `pr_create` reconciliation remains
+unchanged, and the bridge never marks a PR Ready. AgentKnowledgeVault Task #13
+and Draft PR #29, whose old `97dbf036...` Validation metadata remained after
+the live head reached `8313bcfc...`, are the motivating downstream fixture, not
+an execution performed by this change.
 
 Issue #103 permits that separate guarded cleanup to recover when GitHub has
 already deleted a merged Task's remote branch. A configured upstream is not

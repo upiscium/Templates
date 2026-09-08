@@ -85,7 +85,7 @@ class PublicationRecoveryBridgeTest(unittest.TestCase):
         self.assertEqual(before["verification"], b"verification.json")
         self.lifecycle.require_resolved_contract.assert_called_once_with(self.record, "131")
 
-    def test_recover_runs_prepare_create_and_only_guarded_state_transition(self) -> None:
+    def test_no_existing_pr_runs_prepare_create_and_only_guarded_state_transition(self) -> None:
         before = {
             "head": self.head, "branch": self.branch, "repository": self.repository,
             "record": self.record, "work_units": b"units", "verification": b"verification",
@@ -94,7 +94,7 @@ class PublicationRecoveryBridgeTest(unittest.TestCase):
         after = {**before, "state": b"- Status: draft-pr-created\n"}
         pr = {"number": 17, "headRefName": self.branch}
         original_verify = self.agent.verify
-        self.agent.pr_for_branch.return_value = pr
+        self.agent.pr_for_branch.side_effect = [None, pr]
         self.agent._validated_local_metadata.return_value = ("131: summary", Path("/tmp/body"), "body")
         self.agent.default_branch.return_value = "main"
         self.agent._validate_live_pr.return_value = None
@@ -107,6 +107,7 @@ class PublicationRecoveryBridgeTest(unittest.TestCase):
         self.assertEqual(result["status"], "DRAFT_PR_CREATED")
         self.agent.pr_prepare.assert_called_once_with(self.target, "131")
         self.agent.pr_create.assert_called_once_with(self.target, "131")
+        self.agent.pr_edit.assert_not_called()
         self.assertIs(self.agent.verify, original_verify)
 
     def test_stale_verification_and_effective_reviewer_fail_before_create(self) -> None:
@@ -170,12 +171,61 @@ class PublicationRecoveryBridgeTest(unittest.TestCase):
             with self.assertRaisesRegex(bridge.BridgeError, "unsafe .*Git configuration"):
                 bridge._validate_target_git_configuration(self.target)
 
-    def test_historical_blocked_review_is_preserved_and_superseded(self) -> None:
+    def test_akv_stale_metadata_fixture_renders_current_evidence_and_preserves_history(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             state = root / ".task-state"
             state.mkdir()
+            old_head = "97dbf03607d8eaabfc76104be2722d89aa6ddf2d"
+            current_head = "8313bcfcfdee4a3985f8b5dd48861b2b2bcb69a4"
+            (state / "task.md").write_text(
+                """# 13
+
+## Identity
+
+- Task ID: 13
+- Branch: task/13-hybrid-level1-reranking
+- Worktree: /fixture
+- Base branch: main
+- Base revision: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
+## Purpose
+
+Repair AgentKnowledgeVault PR #29 publication metadata.
+
+## Acceptance criteria
+
+- [x] Preserve the exact Draft PR identity.
+
+## Current state
+
+- Status: publication-ready
+- Blockers: none
+- Unverified: none
+
+## Follow-up Task candidates
+
+None yet.
+""",
+                encoding="utf-8",
+            )
+            (state / "verification.json").write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "task_id": "13",
+                    "head": current_head,
+                    "clean_tracked_worktree": True,
+                    "worktree_stable": True,
+                    "project_check": {
+                        "command": ["just", "project::check"],
+                        "returncode": 0,
+                        "executed_at": "2026-09-08T00:00:00+00:00",
+                    },
+                }),
+                encoding="utf-8",
+            )
             evidence = {
+                "schema_version": 1,
                 "task_id": "13",
                 "units": {
                     "WU-13-28": {"requested_role": "reviewer", "state": "blocked", "transitions": []},
@@ -186,8 +236,23 @@ class PublicationRecoveryBridgeTest(unittest.TestCase):
             path = state / "work-units.json"
             path.write_bytes((json.dumps(evidence, separators=(",", ":")) + "\n").encode())
             before = path.read_bytes()
-            reviews = canonical_agent_core.publication.completed_reviews(root, "13")
-            self.assertEqual(len(reviews), 2)
+            initial_live_pr = {
+                "number": 29,
+                "headRefOid": current_head,
+                "body": f"## Validation\n\n- `just project::check`: PASS at {old_head}\n",
+            }
+            title, body = canonical_agent_core.publication.canonical_metadata(
+                root, "13", head=current_head, changed_paths=["product.py"]
+            )
+            self.assertEqual(initial_live_pr["number"], 29)
+            self.assertEqual(initial_live_pr["headRefOid"], current_head)
+            self.assertIn(old_head, initial_live_pr["body"])
+            self.assertIn(current_head, body)
+            self.assertNotIn(old_head, body)
+            self.assertIn("`WU-13-29` — `reviewer` — completed", body)
+            self.assertIn("`WU-13-30` — `security-reviewer` — completed", body)
+            self.assertNotIn("WU-13-28", body)
+            self.assertTrue(title.startswith("13:"))
             self.assertEqual(path.read_bytes(), before)
             self.assertIn(b'"WU-13-28"', before)
 
@@ -212,10 +277,39 @@ class PublicationRecoveryBridgeTest(unittest.TestCase):
                     self.assertEqual(bridge.main(), 2)
                 modules.assert_not_called()
 
-    def test_exact_existing_draft_reconciles_without_duplicate_create(self) -> None:
-        existing = {"number": 23, "headRefName": self.branch}
-        self.agent.pr_for_branch.return_value = existing
-        self.agent.pr_create.return_value = existing
+    def test_existing_stale_draft_routes_to_canonical_edit_without_duplicate_create(self) -> None:
+        branch = "task/13-hybrid-level1-reranking"
+        repository = "upiscium/AgentKnowledgeVault"
+        old_head = "97dbf03607d8eaabfc76104be2722d89aa6ddf2d"
+        current_head = "8313bcfcfdee4a3985f8b5dd48861b2b2bcb69a4"
+        stale = {"number": 29, "headRefName": branch, "headRefOid": current_head,
+                 "body": f"Validation PASS at {old_head}"}
+        repaired = {"number": 29, "headRefName": branch, "headRefOid": current_head,
+                    "body": f"Validation PASS at {current_head}"}
+        self.agent.pr_for_branch.side_effect = [stale, repaired, repaired]
+        self.agent._validated_local_metadata.return_value = (
+            "13: repair stale publication metadata", Path("/tmp/body"), repaired["body"]
+        )
+        self.agent.default_branch.return_value = "main"
+        before = {"head": current_head, "branch": branch, "repository": repository,
+                  "record": self.record, "work_units": b"u", "verification": b"v", "contract": b"c",
+                  "state": b"- Status: publication-ready\n"}
+        after = {**before, "state": b"- Status: draft-pr-created\n"}
+        with mock.patch.object(bridge, "_publication_snapshot", return_value=before), \
+             mock.patch.object(bridge, "_publication_snapshot_for_post", return_value=after), \
+             mock.patch.object(bridge, "_target_git", return_value=""):
+            result = bridge._publication_recover(self.modules, self.target, "13")
+        self.assertEqual(result["pullRequest"], repaired)
+        self.agent.pr_edit.assert_called_once_with(self.target, "13")
+        self.agent.pr_create.assert_not_called()
+        self.assertEqual(
+            self.agent.pr_for_branch.call_args_list,
+            [mock.call(self.target, branch, repository)] * 3,
+        )
+
+    def test_already_canonical_existing_draft_converges_through_idempotent_edit(self) -> None:
+        canonical = {"number": 23, "headRefName": self.branch, "body": "body"}
+        self.agent.pr_for_branch.return_value = canonical
         self.agent._validated_local_metadata.return_value = ("title", Path("/tmp/body"), "body")
         self.agent.default_branch.return_value = "main"
         before = {"head": self.head, "branch": self.branch, "repository": self.repository,
@@ -226,8 +320,49 @@ class PublicationRecoveryBridgeTest(unittest.TestCase):
              mock.patch.object(bridge, "_publication_snapshot_for_post", return_value=after), \
              mock.patch.object(bridge, "_target_git", return_value=""):
             result = bridge._publication_recover(self.modules, self.target, "131")
-        self.assertEqual(result["pullRequest"], existing)
-        self.agent.pr_create.assert_called_once_with(self.target, "131")
+        self.assertEqual(result["pullRequest"]["number"], 23)
+        self.agent.pr_edit.assert_called_once_with(self.target, "131")
+        self.agent.pr_create.assert_not_called()
+
+    def test_canonical_operations_use_captured_current_head_verification(self) -> None:
+        before = {"head": self.head, "branch": self.branch, "repository": self.repository,
+                  "record": self.record, "work_units": b"u", "verification": b"v", "contract": b"c",
+                  "state": b"- Status: publication-ready\n"}
+        after = {**before, "state": b"- Status: draft-pr-created\n"}
+        pr = {"number": 29}
+        self.agent.pr_prepare.side_effect = lambda root, task: self.agent.verify(root, task)
+        self.agent.pr_create.side_effect = lambda root, task: self.agent.verify(root, task) or pr
+        self.agent.pr_for_branch.side_effect = [None, pr]
+        self.agent._validated_local_metadata.return_value = ("title", Path("/tmp/body"), "body")
+        self.agent.default_branch.return_value = "main"
+
+        def git(*args: str, **_: object) -> str:
+            return self.head if args[0] == "rev-parse" else ""
+
+        with mock.patch.object(bridge, "_publication_snapshot", return_value=before), \
+             mock.patch.object(bridge, "_publication_snapshot_for_post", return_value=after), \
+             mock.patch.object(bridge, "_target_git", side_effect=git), \
+             mock.patch.object(bridge, "_state_bytes", return_value=b"v"):
+            bridge._publication_recover(self.modules, self.target, "131")
+        self.assertEqual(self.publication.verification_evidence.call_args_list, [
+            mock.call(self.target, "131", self.head),
+            mock.call(self.target, "131", self.head),
+        ])
+
+    def test_existing_draft_with_invalid_or_ambiguous_number_fails_before_edit(self) -> None:
+        before = {"head": self.head, "branch": self.branch, "repository": self.repository,
+                  "record": self.record, "work_units": b"u", "verification": b"v", "contract": b"c",
+                  "state": b"- Status: publication-ready\n"}
+        for existing in ({"number": True}, {"number": False}, {"number": "29"}, {"number": None}, []):
+            with self.subTest(existing=existing):
+                self.agent.reset_mock()
+                self.agent.pr_for_branch.return_value = existing
+                with mock.patch.object(bridge, "_publication_snapshot", return_value=before), \
+                     mock.patch.object(bridge, "_target_git", return_value=""), \
+                     self.assertRaisesRegex(bridge.BridgeError, "invalid or ambiguous number"):
+                    bridge._publication_recover(self.modules, self.target, "131")
+                self.agent.pr_edit.assert_not_called()
+                self.agent.pr_create.assert_not_called()
 
     def test_canonical_pr_create_reconciles_exact_existing_draft_without_gh_create(self) -> None:
         existing = {
@@ -250,36 +385,34 @@ class PublicationRecoveryBridgeTest(unittest.TestCase):
         transition.assert_called_once_with(self.record, "131", "publication-ready", "draft-pr-created")
         self.assertEqual(validate.call_count, 2)
 
-    def test_invalid_live_pr_identity_is_rejected(self) -> None:
-        good = {"headRefName": self.branch, "baseRefName": "main", "headRefOid": self.head,
-                "title": "title", "body": "body", "isDraft": True,
+    def test_invalid_edit_target_identity_is_rejected_before_write(self) -> None:
+        good = {"number": 29, "headRefName": self.branch, "baseRefName": "main",
+                "headRefOid": self.head, "isDraft": True,
                 "isCrossRepository": False, "state": "OPEN"}
         for key, value in (("headRefName", "other"), ("baseRefName", "other"),
-                            ("headRefOid", "wrong"), ("state", "CLOSED"),
-                            ("title", "wrong"), ("body", "wrong"), ("isDraft", False),
-                           ("isCrossRepository", True)):
+                           ("headRefOid", "wrong"), ("state", "CLOSED"),
+                           ("isDraft", False), ("isCrossRepository", True)):
             with self.subTest(key=key):
                 candidate = {**good, key: value}
                 with self.assertRaises(canonical_agent_core.AutomationError):
-                    canonical_agent_core._validate_live_pr(
-                        candidate, branch=self.branch, base="main", head=self.head,
-                        title="title", body="body", draft=True
+                    canonical_agent_core._validate_edit_target(
+                        candidate, branch=self.branch, base="main", head=self.head
                     )
 
-    def test_interruption_then_retry_creates_exactly_once(self) -> None:
+    def test_edit_success_then_lifecycle_interruption_retry_converges_on_same_pr(self) -> None:
         before = {"head": self.head, "branch": self.branch, "repository": self.repository,
                   "record": self.record, "work_units": b"u", "verification": b"v", "contract": b"c",
                   "state": b"- Status: publication-ready\n"}
         after = {**before, "state": b"- Status: draft-pr-created\n"}
-        creates = 0
-        def create(_target: Path, _task: str) -> dict:
-            nonlocal creates
-            if creates == 0:
-                creates = 1
-                raise RuntimeError("interrupted after GitHub create")
-            return {"number": 31}
-        self.agent.pr_create.side_effect = create
-        self.agent.pr_for_branch.return_value = {"number": 31}
+        existing = {"number": 29}
+        edits = 0
+        def edit(_target: Path, _task: str) -> None:
+            nonlocal edits
+            edits += 1
+            if edits == 1:
+                raise RuntimeError("interrupted after GitHub edit")
+        self.agent.pr_edit.side_effect = edit
+        self.agent.pr_for_branch.return_value = existing
         self.agent._validated_local_metadata.return_value = ("title", Path("/tmp/body"), "body")
         self.agent.default_branch.return_value = "main"
         self.agent._validate_live_pr.return_value = None
@@ -288,9 +421,10 @@ class PublicationRecoveryBridgeTest(unittest.TestCase):
              mock.patch.object(bridge, "_target_git", return_value=""):
             with self.assertRaises(RuntimeError):
                 bridge._publication_recover(self.modules, self.target, "131")
-            bridge._publication_recover(self.modules, self.target, "131")
-        self.assertEqual(creates, 1)
-        self.assertEqual(self.agent.pr_create.call_count, 2)
+            result = bridge._publication_recover(self.modules, self.target, "131")
+        self.assertEqual(result["pullRequest"], existing)
+        self.assertEqual(edits, 2)
+        self.agent.pr_create.assert_not_called()
 
 
 if __name__ == "__main__":
