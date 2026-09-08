@@ -34,23 +34,23 @@
         "type": "github"
       }
     },
-    "opencodePolicy": {
+    "opencodeContract": {
       "inputs": {
         "nixpkgs": [
           "nixpkgs"
         ]
       },
       "locked": {
-        "lastModified": 1788012886,
-        "narHash": "sha256-xYmcUhcUPfb3224lUYDXfSJWxcV5r2rwcCjY3rGE/bA=",
+        "lastModified": 1788857796,
+        "narHash": "sha256-X6WftBczLia4bqFy1JzsYlo1akja26m2DPZ8rfAW/zA=",
         "owner": "upiscium",
-        "repo": "OpenCodePolicy",
-        "rev": "e8236812f2ad384afa89b0ec9510a6990ea1bd9a",
+        "repo": "OpencodeContract",
+        "rev": "7e4b7eb29c2322264c613310d7f802b0237f7b1b",
         "type": "github"
       },
       "original": {
         "owner": "upiscium",
-        "repo": "OpenCodePolicy",
+        "repo": "OpencodeContract",
         "type": "github"
       }
     },
@@ -58,7 +58,7 @@
       "inputs": {
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs",
-        "opencodePolicy": "opencodePolicy"
+        "opencodeContract": "opencodeContract"
       }
     },
     "systems": {

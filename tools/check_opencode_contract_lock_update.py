@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-TARGET_INPUT = "opencodePolicy"
+TARGET_INPUT = "opencodeContract"
 REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -142,7 +142,7 @@ def revision(lock: dict[str, Any], graph: LockGraph, label: str) -> str:
         raise LockUpdateError(f"{label} {TARGET_INPUT} node has invalid locked metadata")
     expected = {
         "owner": "upiscium",
-        "repo": "OpenCodePolicy",
+        "repo": "OpencodeContract",
         "type": "github",
     }
     for field, expected_value in expected.items():
@@ -198,7 +198,7 @@ def validate_update(before: dict[str, Any], after: dict[str, Any]) -> tuple[str,
         raise LockUpdateError("root nixpkgs node changed")
     if before_revision == after_revision and before != after:
         raise LockUpdateError(
-            "flake.lock changed without an OpenCodePolicy revision change"
+            "flake.lock changed without an OpencodeContract revision change"
         )
     return before_revision, after_revision
 
@@ -217,7 +217,7 @@ def validate_candidate_files(before_path: Path, after_path: Path) -> tuple[bool,
         return False, before_revision, after_revision
     if before_revision == after_revision:
         raise LockUpdateError(
-            "flake.lock changed without an OpenCodePolicy revision change"
+            "flake.lock changed without an OpencodeContract revision change"
         )
     return True, before_revision, after_revision
 
@@ -253,14 +253,14 @@ def validate_existing_branch(
         raise LockUpdateError("existing branch does not contain a lock update")
     if branch_revision != expected_revision:
         raise LockUpdateError(
-            "existing branch OpenCodePolicy revision does not match validated candidate"
+            "existing branch OpencodeContract revision does not match validated candidate"
         )
     return before_revision, branch_revision
 
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        description="Validate a controlled OpenCodePolicy flake.lock update"
+        description="Validate a controlled OpencodeContract flake.lock update"
     )
     result.add_argument("before", type=Path)
     result.add_argument("after", type=Path)
@@ -299,7 +299,7 @@ def main() -> int:
         return 2
     status = "VALID" if changed else "NOOP"
     print(
-        f"{status} OpenCodePolicy lock update "
+        f"{status} OpencodeContract lock update "
         f"old={before_revision} new={after_revision}"
     )
     return 0
