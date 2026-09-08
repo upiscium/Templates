@@ -768,14 +768,16 @@ execution is pinned and environment-sanitized. Consumer-local Agent Core code
 never becomes publication authority.
 
 The bridge binds the exact registered non-default worktree, Task/branch/contract
-identity, `publication-ready` state, local worktree and branch HEAD, GitHub
-remote branch OID, canonical repository, clean product status, fresh head-bound
-verification receipt, and effective review evidence. It uses the verified
-source implementation's canonical preparation, then canonical Draft creation
-when no PR exists or canonical Draft repair when the exact Task PR exists.
-Product HEAD and tracked bytes remain unchanged; Work Unit, verification, and
-contract evidence remain byte-identical; only private publication metadata and
-the guarded `publication-ready -> draft-pr-created` transition may change.
+identity, initial `publication-ready` or `draft-pr-created` state, local
+worktree and branch HEAD, GitHub remote branch OID, canonical repository, clean
+product status, fresh head-bound verification receipt, and effective review
+evidence. It uses the verified source implementation's canonical preparation,
+then canonical Draft creation only for `publication-ready` when no PR exists,
+or canonical Draft repair when the exact Task PR exists. A `draft-pr-created`
+Task without that existing Draft fails closed. Product HEAD and tracked bytes
+remain unchanged; Work Unit, verification, and contract evidence remain
+byte-identical. Task State may perform only the guarded `publication-ready ->
+draft-pr-created` transition; from `draft-pr-created` it remains byte-identical.
 
 Canonical `pr_create` remains strict and reconciles only an already-canonical
 existing Draft. The bridge does not broaden it: after preparation, absence of a

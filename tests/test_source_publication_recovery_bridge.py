@@ -83,15 +83,30 @@ class PublicationRecoveryBridgeTest(unittest.TestCase):
         self.assertEqual(before["record"], self.record)
         self.assertEqual(before["work_units"], b"work-units.json")
         self.assertEqual(before["verification"], b"verification.json")
+        self.assertEqual(before["status"], "publication-ready")
         self.lifecycle.require_resolved_contract.assert_called_once_with(self.record, "131")
+
+    def test_snapshot_accepts_draft_pr_created_and_preserves_initial_status(self) -> None:
+        self.lifecycle.state_status.return_value = "draft-pr-created"
+        before = self.snapshot()
+        self.assertEqual(before["status"], "draft-pr-created")
+
+    def test_snapshot_rejects_other_lifecycle_states(self) -> None:
+        self.lifecycle.state_status.return_value = "implementing"
+        with self.assertRaisesRegex(
+            bridge.BridgeError,
+            "requires publication-ready or draft-pr-created",
+        ):
+            self.snapshot()
 
     def test_no_existing_pr_runs_prepare_create_and_only_guarded_state_transition(self) -> None:
         before = {
             "head": self.head, "branch": self.branch, "repository": self.repository,
             "record": self.record, "work_units": b"units", "verification": b"verification",
             "contract": b"contract", "state": b"- Status: publication-ready\n",
+            "status": "publication-ready",
         }
-        after = {**before, "state": b"- Status: draft-pr-created\n"}
+        after = {**before, "state": b"- Status: draft-pr-created\n", "status": "draft-pr-created"}
         pr = {"number": 17, "headRefName": self.branch}
         original_verify = self.agent.verify
         self.agent.pr_for_branch.side_effect = [None, pr]
@@ -109,6 +124,46 @@ class PublicationRecoveryBridgeTest(unittest.TestCase):
         self.agent.pr_create.assert_called_once_with(self.target, "131")
         self.agent.pr_edit.assert_not_called()
         self.assertIs(self.agent.verify, original_verify)
+
+    def test_draft_pr_created_without_existing_pr_fails_closed_before_mutation(self) -> None:
+        before = {
+            "head": self.head, "branch": self.branch, "repository": self.repository,
+            "record": self.record, "work_units": b"units", "verification": b"verification",
+            "contract": b"contract", "state": b"- Status: draft-pr-created\n",
+            "status": "draft-pr-created",
+        }
+        self.agent.pr_for_branch.return_value = None
+        with mock.patch.object(bridge, "_publication_snapshot", return_value=before), \
+             mock.patch.object(bridge, "_target_git", return_value=""), \
+             self.assertRaisesRegex(
+                 bridge.BridgeError,
+                 "draft-pr-created recovery requires the existing Draft PR",
+             ):
+            bridge._publication_recover(self.modules, self.target, "131")
+        self.agent.pr_prepare.assert_not_called()
+        self.agent.pr_create.assert_not_called()
+        self.agent.pr_edit.assert_not_called()
+
+    def test_draft_pr_created_replacement_during_prepare_fails_before_edit(self) -> None:
+        before = {
+            "head": self.head, "branch": self.branch, "repository": self.repository,
+            "record": self.record, "work_units": b"units", "verification": b"verification",
+            "contract": b"contract", "state": b"- Status: draft-pr-created\n",
+            "status": "draft-pr-created",
+        }
+        captured = {"number": 29}
+        replacement = {"number": 30}
+        self.agent.pr_for_branch.side_effect = [captured, replacement]
+        with mock.patch.object(bridge, "_publication_snapshot", return_value=before), \
+             mock.patch.object(bridge, "_target_git", return_value=""), \
+             self.assertRaisesRegex(
+                 bridge.BridgeError,
+                 "identity changed before canonical repair",
+             ):
+            bridge._publication_recover(self.modules, self.target, "131")
+        self.agent.pr_prepare.assert_called_once_with(self.target, "131")
+        self.agent.pr_create.assert_not_called()
+        self.agent.pr_edit.assert_not_called()
 
     def test_stale_verification_and_effective_reviewer_fail_before_create(self) -> None:
         for failure in (
@@ -293,8 +348,8 @@ None yet.
         self.agent.default_branch.return_value = "main"
         before = {"head": current_head, "branch": branch, "repository": repository,
                   "record": self.record, "work_units": b"u", "verification": b"v", "contract": b"c",
-                  "state": b"- Status: publication-ready\n"}
-        after = {**before, "state": b"- Status: draft-pr-created\n"}
+                  "state": b"- Status: publication-ready\n", "status": "publication-ready"}
+        after = {**before, "state": b"- Status: draft-pr-created\n", "status": "draft-pr-created"}
         with mock.patch.object(bridge, "_publication_snapshot", return_value=before), \
              mock.patch.object(bridge, "_publication_snapshot_for_post", return_value=after), \
              mock.patch.object(bridge, "_target_git", return_value=""):
@@ -309,6 +364,56 @@ None yet.
             [mock.call(self.target, branch, repository)] * 3,
         )
 
+    def test_draft_pr_created_stale_exact_draft_edits_with_byte_identical_state(self) -> None:
+        stale = {"number": 29, "headRefName": self.branch, "body": "stale"}
+        repaired = {"number": 29, "headRefName": self.branch, "body": "canonical"}
+        self.agent.pr_for_branch.side_effect = [stale, stale, repaired, repaired]
+        self.agent._validated_local_metadata.return_value = (
+            "title", Path("/tmp/body"), repaired["body"]
+        )
+        self.agent.default_branch.return_value = "main"
+        before = {
+            "head": self.head, "branch": self.branch, "repository": self.repository,
+            "record": self.record, "work_units": b"u", "verification": b"v",
+            "contract": b"c", "state": b"prefix\n- Status: draft-pr-created\nsuffix\n",
+            "status": "draft-pr-created",
+        }
+        after = dict(before)
+        with mock.patch.object(bridge, "_publication_snapshot", return_value=before), \
+             mock.patch.object(bridge, "_publication_snapshot_for_post", return_value=after), \
+             mock.patch.object(bridge, "_target_git", return_value=""):
+            result = bridge._publication_recover(self.modules, self.target, "131")
+        self.assertEqual(result["pullRequest"], repaired)
+        self.agent.pr_prepare.assert_called_once_with(self.target, "131")
+        self.agent.pr_edit.assert_called_once_with(
+            self.target, "131", expected_pr_number=29
+        )
+        self.agent.pr_create.assert_not_called()
+        self.assertEqual(after["state"], before["state"])
+
+    def test_draft_pr_created_canonical_draft_converges_with_byte_identical_state(self) -> None:
+        canonical = {"number": 23, "headRefName": self.branch, "body": "body"}
+        self.agent.pr_for_branch.return_value = canonical
+        self.agent._validated_local_metadata.return_value = ("title", Path("/tmp/body"), "body")
+        self.agent.default_branch.return_value = "main"
+        before = {
+            "head": self.head, "branch": self.branch, "repository": self.repository,
+            "record": self.record, "work_units": b"u", "verification": b"v",
+            "contract": b"c", "state": b"- Status: draft-pr-created\n",
+            "status": "draft-pr-created",
+        }
+        after = dict(before)
+        with mock.patch.object(bridge, "_publication_snapshot", return_value=before), \
+             mock.patch.object(bridge, "_publication_snapshot_for_post", return_value=after), \
+             mock.patch.object(bridge, "_target_git", return_value=""):
+            result = bridge._publication_recover(self.modules, self.target, "131")
+        self.assertEqual(result["pullRequest"], canonical)
+        self.agent.pr_edit.assert_called_once_with(
+            self.target, "131", expected_pr_number=23
+        )
+        self.agent.pr_create.assert_not_called()
+        self.assertEqual(after["state"], before["state"])
+
     def test_already_canonical_existing_draft_converges_through_idempotent_edit(self) -> None:
         canonical = {"number": 23, "headRefName": self.branch, "body": "body"}
         self.agent.pr_for_branch.return_value = canonical
@@ -316,8 +421,8 @@ None yet.
         self.agent.default_branch.return_value = "main"
         before = {"head": self.head, "branch": self.branch, "repository": self.repository,
                   "record": self.record, "work_units": b"u", "verification": b"v", "contract": b"c",
-                  "state": b"- Status: publication-ready\n"}
-        after = {**before, "state": b"- Status: draft-pr-created\n"}
+                  "state": b"- Status: publication-ready\n", "status": "publication-ready"}
+        after = {**before, "state": b"- Status: draft-pr-created\n", "status": "draft-pr-created"}
         with mock.patch.object(bridge, "_publication_snapshot", return_value=before), \
              mock.patch.object(bridge, "_publication_snapshot_for_post", return_value=after), \
              mock.patch.object(bridge, "_target_git", return_value=""):
@@ -331,8 +436,8 @@ None yet.
     def test_canonical_operations_use_captured_current_head_verification(self) -> None:
         before = {"head": self.head, "branch": self.branch, "repository": self.repository,
                   "record": self.record, "work_units": b"u", "verification": b"v", "contract": b"c",
-                  "state": b"- Status: publication-ready\n"}
-        after = {**before, "state": b"- Status: draft-pr-created\n"}
+                  "state": b"- Status: publication-ready\n", "status": "publication-ready"}
+        after = {**before, "state": b"- Status: draft-pr-created\n", "status": "draft-pr-created"}
         pr = {"number": 29}
         self.agent.pr_prepare.side_effect = lambda root, task: self.agent.verify(root, task)
         self.agent.pr_create.side_effect = lambda root, task: self.agent.verify(root, task) or pr
@@ -353,10 +458,31 @@ None yet.
             mock.call(self.target, "131", self.head),
         ])
 
+    def test_draft_pr_created_postcondition_rejects_any_task_state_change(self) -> None:
+        before = {
+            "head": self.head, "branch": self.branch, "repository": self.repository,
+            "work_units": b"u", "verification": b"v", "contract": b"c",
+            "state": b"- Status: draft-pr-created\n- Blockers: none\n",
+            "status": "draft-pr-created",
+        }
+        after = {
+            **before,
+            "state": b"- Status: draft-pr-created\n- Blockers: changed\n",
+        }
+        with mock.patch.object(bridge, "_publication_snapshot_for_post", return_value=after), \
+             mock.patch.object(bridge, "_target_git", return_value=""), \
+             self.assertRaisesRegex(
+                 bridge.BridgeError,
+                 "changed Task State from draft-pr-created",
+             ):
+            bridge._assert_publication_postconditions(
+                self.modules, self.target, "131", before
+            )
+
     def test_existing_draft_with_invalid_or_ambiguous_number_fails_before_edit(self) -> None:
         before = {"head": self.head, "branch": self.branch, "repository": self.repository,
                   "record": self.record, "work_units": b"u", "verification": b"v", "contract": b"c",
-                  "state": b"- Status: publication-ready\n"}
+                  "state": b"- Status: publication-ready\n", "status": "publication-ready"}
         for existing in ({"number": True}, {"number": False}, {"number": "29"}, {"number": None}, []):
             with self.subTest(existing=existing):
                 self.agent.reset_mock()
@@ -424,7 +550,7 @@ None yet.
         }
         before = {"head": self.head, "branch": self.branch, "repository": self.repository,
                   "record": self.record, "work_units": b"u", "verification": b"v", "contract": b"c",
-                  "state": b"- Status: publication-ready\n"}
+                  "state": b"- Status: publication-ready\n", "status": "publication-ready"}
 
         def git(*args: str, **_: object) -> str:
             return self.head if args[0] == "rev-parse" else ""
@@ -446,8 +572,8 @@ None yet.
     def test_edit_success_then_lifecycle_interruption_retry_converges_on_same_pr(self) -> None:
         before = {"head": self.head, "branch": self.branch, "repository": self.repository,
                   "record": self.record, "work_units": b"u", "verification": b"v", "contract": b"c",
-                  "state": b"- Status: publication-ready\n"}
-        after = {**before, "state": b"- Status: draft-pr-created\n"}
+                  "state": b"- Status: publication-ready\n", "status": "publication-ready"}
+        after = {**before, "state": b"- Status: draft-pr-created\n", "status": "draft-pr-created"}
         existing = {"number": 29}
         edits = 0
         def edit(_target: Path, _task: str, *, expected_pr_number: int) -> None:

@@ -220,20 +220,24 @@ just agent-core::publication-recover <consumer-task-worktree> <task> <expected-i
 
 This is not a normal publication route. Ordinary Tasks continue to use
 `just agent::pr-prepare` followed by `just agent::pr-create`. Recovery requires
-an exact registered non-default Task worktree already in `publication-ready`, a
-clean product tree, identical local and remote Task HEADs, a resolved canonical
-Task Contract, fresh persisted verification for that HEAD, and effective
-completed review evidence. It executes canonical `pr_prepare`, then routes to
-canonical `pr_create` when no PR exists or canonical `pr_edit` when the exact
-Task PR already exists, from modules loaded only from verified immutable
+an exact registered non-default Task worktree already in `publication-ready` or
+`draft-pr-created`, a clean product tree, identical local and remote Task HEADs,
+a resolved canonical Task Contract, fresh persisted verification for that HEAD,
+and effective completed review evidence. It executes canonical `pr_prepare`,
+then routes to canonical `pr_create` only for `publication-ready` with no PR, or
+canonical `pr_edit` when the exact Task PR already exists. A
+`draft-pr-created` Task without its existing Draft fails closed and never
+recreates a PR. Canonical modules are loaded only from verified immutable
 Templates commit blobs; consumer `.automation/bin` files are not publication
 authority.
 
 The operation never upgrades the consumer or changes its product HEAD. Work
-Unit, verification, and contract evidence remain byte-identical; only ignored
-publication metadata and the guarded `publication-ready -> draft-pr-created`
-transition may change. Existing-PR repair delegates the mutation boundary to
-canonical `pr_edit`, which requires the exact same-repository OPEN Draft at the
+Unit, verification, and contract evidence remain byte-identical. Starting from
+`publication-ready`, only ignored publication metadata and the guarded
+`publication-ready -> draft-pr-created` transition may change; starting from
+`draft-pr-created`, Task State remains byte-identical. Existing-PR repair
+delegates the mutation boundary to canonical `pr_edit`, which requires the
+exact same-repository OPEN Draft at the
 captured branch, base, and current head and binds its internal lookup to the
 bridge-captured PR number before replacing stale title/body, then re-reads and
 validates the same PR number. A retry after an edit succeeds but
