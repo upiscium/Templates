@@ -669,6 +669,39 @@ None yet.
             self.assertEqual(gh.call_args.args[:3], ("pr", "edit", "20"))
             verify_mock.assert_called_once_with(root, "19")
 
+    def test_pr_edit_expected_number_exact_match_allows_mutation(self) -> None:
+        stale = {"number": 20, "headRefName": "task/19-fix", "baseRefName": "main", "headRefOid": self.HEAD, "isDraft": True, "isCrossRepository": False, "state": "OPEN"}
+        updated = {**stale, "title": "title", "body": "canonical"}
+        context = {"record": mock.sentinel.record, "status": "publication-ready", "repository": "example/repo"}
+        with (
+            mock.patch.object(agent_core, "verify"),
+            mock.patch.object(agent_core, "_publication_context", return_value=("task/19-fix", context, self.HEAD)),
+            mock.patch.object(agent_core, "_validated_local_metadata", return_value=("title", Path("body"), "canonical")),
+            mock.patch.object(agent_core, "default_branch", return_value="main"),
+            mock.patch.object(agent_core, "canonical_repository", return_value="example/repo"),
+            mock.patch.object(agent_core, "pr_for_branch", side_effect=[stale, updated]),
+            mock.patch.object(agent_core, "gh") as gh,
+            mock.patch.object(agent_core.lifecycle, "mark_task_publication_state") as transition,
+        ):
+            agent_core.pr_edit(Path("."), "19", expected_pr_number=20)
+        self.assertEqual(gh.call_args.args[:3], ("pr", "edit", "20"))
+        transition.assert_called_once_with(mock.sentinel.record, "19", "publication-ready", "draft-pr-created")
+
+    def test_pr_edit_rejects_invalid_expected_number_before_mutation(self) -> None:
+        context = {"record": mock.sentinel.record, "status": "publication-ready", "repository": "example/repo"}
+        for expected in (True, False, 0, -1, "29"):
+            with self.subTest(expected=expected):
+                with (
+                    mock.patch.object(agent_core, "verify"),
+                    mock.patch.object(agent_core, "_publication_context", return_value=("task/19-fix", context, self.HEAD)),
+                    mock.patch.object(agent_core, "pr_for_branch") as resolve,
+                    mock.patch.object(agent_core, "gh") as gh,
+                ):
+                    with self.assertRaisesRegex(agent_core.AutomationError, "expected pull request number is invalid"):
+                        agent_core.pr_edit(Path("."), "19", expected_pr_number=expected)
+                    resolve.assert_not_called()
+                    gh.assert_not_called()
+
     def test_create_and_edit_do_not_write_when_verification_fails(self) -> None:
         for action in (agent_core.pr_create, agent_core.pr_edit):
             with (

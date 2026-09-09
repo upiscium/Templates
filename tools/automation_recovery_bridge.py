@@ -584,8 +584,11 @@ def _publication_snapshot(modules: dict, target: Path, task: str) -> dict:
         if record.branch != branch:
             raise BridgeError("registered Task branch identity changed")
         status = lifecycle.state_status(lifecycle.state_path(target))
-        if status != "publication-ready":
-            raise BridgeError(f"publication recovery requires publication-ready; found {status}")
+        if status not in {"publication-ready", "draft-pr-created"}:
+            raise BridgeError(
+                "publication recovery requires publication-ready or "
+                f"draft-pr-created; found {status}"
+            )
         repository = agent_core.canonical_repository(target)
     except BridgeError:
         raise
@@ -624,6 +627,7 @@ def _publication_snapshot(modules: dict, target: Path, task: str) -> dict:
         "verification": verification,
         "contract": contract,
         "state": state,
+        "status": status,
     }
 
 
@@ -632,14 +636,20 @@ def _assert_publication_postconditions(modules: dict, target: Path, task: str, b
     for name in ("head", "branch", "repository", "work_units", "verification", "contract"):
         if after[name] != before[name]:
             raise BridgeError(f"publication recovery changed immutable target evidence: {name}")
-    expected_state = re.sub(
-        rb"(?m)^- Status: publication-ready$",
-        b"- Status: draft-pr-created",
-        before["state"],
-        count=1,
-    )
-    if expected_state == before["state"] or after["state"] != expected_state:
-        raise BridgeError("publication recovery changed Task State beyond the guarded lifecycle transition")
+    if before["status"] == "publication-ready":
+        expected_state = re.sub(
+            rb"(?m)^- Status: publication-ready$",
+            b"- Status: draft-pr-created",
+            before["state"],
+            count=1,
+        )
+        if expected_state == before["state"] or after["state"] != expected_state:
+            raise BridgeError("publication recovery changed Task State beyond the guarded lifecycle transition")
+    elif before["status"] == "draft-pr-created":
+        if after["state"] != before["state"]:
+            raise BridgeError("publication recovery changed Task State from draft-pr-created")
+    else:  # pragma: no cover - the initial snapshot rejects this state
+        raise BridgeError(f"publication recovery started from an unsupported state: {before['status']}")
     if _target_git("diff", "--name-only", target=target) or _target_git(
         "diff", "--cached", "--name-only", target=target
     ):
@@ -684,6 +694,7 @@ def _publication_snapshot_for_post(modules: dict, target: Path, task: str) -> di
         "verification": _state_bytes(target, "verification.json", contract_module),
         "contract": _state_bytes(target, "contract.json", contract_module),
         "state": _state_bytes(target, "task.md", contract_module),
+        "status": status,
     }
 
 
@@ -691,6 +702,15 @@ def _publication_recover(modules: dict, target: Path, task: str) -> dict:
     before = _publication_snapshot(modules, target, task)
     agent_core = modules["agent_core"]
     publication = modules["publication_metadata"]
+
+    def existing_pr_number(existing: object) -> int:
+        if (
+            not isinstance(existing, dict)
+            or not isinstance(existing.get("number"), int)
+            or isinstance(existing.get("number"), bool)
+        ):
+            raise BridgeError("existing Draft PR has an invalid or ambiguous number")
+        return existing["number"]
 
     def require_persisted_verification(root: Path, requested_task: str) -> None:
         if root.resolve() != target or requested_task != task:
@@ -709,12 +729,45 @@ def _publication_recover(modules: dict, target: Path, task: str) -> dict:
     try:
         agent_core.verify = require_persisted_verification
         with redirect_stdout(output):
+            initial_pr_number = None
+            if before["status"] == "draft-pr-created":
+                initial_pr = agent_core.pr_for_branch(
+                    target, before["branch"], before["repository"]
+                )
+                if initial_pr is None:
+                    raise BridgeError(
+                        "draft-pr-created recovery requires the existing Draft PR"
+                    )
+                initial_pr_number = existing_pr_number(initial_pr)
             agent_core.pr_prepare(target, task)
             immediately_before = _publication_snapshot(modules, target, task)
-            for name in ("head", "branch", "repository", "work_units", "verification", "contract", "state"):
+            for name in (
+                "head", "branch", "repository", "work_units", "verification",
+                "contract", "state", "status",
+            ):
                 if immediately_before[name] != before[name]:
                     raise BridgeError(f"publication authority changed before GitHub write: {name}")
-            pr = agent_core.pr_create(target, task)
+            existing = agent_core.pr_for_branch(target, before["branch"], before["repository"])
+            if existing is None:
+                if before["status"] != "publication-ready":
+                    raise BridgeError(
+                        "draft-pr-created recovery requires the existing Draft PR"
+                    )
+                pr = agent_core.pr_create(target, task)
+            else:
+                existing_number = existing_pr_number(existing)
+                if initial_pr_number is not None and existing_number != initial_pr_number:
+                    raise BridgeError(
+                        "existing Draft PR identity changed before canonical repair"
+                    )
+                agent_core.pr_edit(
+                    target,
+                    task,
+                    expected_pr_number=existing_number,
+                )
+                pr = agent_core.pr_for_branch(target, before["branch"], before["repository"])
+                if not pr or pr.get("number") != existing_number:
+                    raise BridgeError("existing Draft PR identity changed after canonical repair")
     finally:
         agent_core.verify = original_verify
 
