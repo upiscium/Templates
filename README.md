@@ -207,7 +207,7 @@ or arbitrary consumer mutation surface. AKV #22/#23 are the motivating example
 for this first-adoption path; that example is not claimed as executed. Agent
 Core VERSION remains 3.
 
-### Issue #131: source-side publication recovery
+### Issues #131 and #148: source-side publication recovery
 
 An already-complete in-flight Task can be publication-blocked when its installed
 Agent Core predates a correction to canonical publication semantics. After that
@@ -220,14 +220,23 @@ just agent-core::publication-recover <consumer-task-worktree> <task> <expected-i
 
 This is not a normal publication route. Ordinary Tasks continue to use
 `just agent::pr-prepare` followed by `just agent::pr-create`. Recovery requires
-an exact registered non-default Task worktree already in `publication-ready` or
-`draft-pr-created`, a clean product tree, identical local and remote Task HEADs,
+an exact registered non-default Task worktree in `publication-ready`,
+`draft-pr-created`, or a narrowly recoverable publication-only `blocked` state,
+a clean product tree, identical local and remote Task HEADs,
 a resolved canonical Task Contract, fresh persisted verification for that HEAD,
 and effective completed review evidence. It executes canonical `pr_prepare`,
 then routes to canonical `pr_create` only for `publication-ready` with no PR, or
 canonical `pr_edit` when the exact Task PR already exists. A
 `draft-pr-created` Task without its existing Draft fails closed and never
-recreates a PR. Canonical modules are loaded only from verified immutable
+recreates a PR. A `blocked` Task is not generally publishable: recovery first
+requires an existing exact same-repository OPEN Draft for the Task branch,
+default base, and current head, plus current canonical verification and
+effective completed review evidence. The bridge captures and revalidates that
+Draft before a dedicated locked compare-and-swap changes only `blocked ->
+publication-ready`; a missing or changed Draft fails before that state mutation.
+It then uses canonical `pr_prepare` and number-bound `pr_edit`. It never creates
+a PR for a `blocked` Task, and the generic lifecycle/state-set transition table
+does not gain a bypass. Canonical modules are loaded only from verified immutable
 Templates commit blobs; consumer `.automation/bin` files are not publication
 authority.
 
@@ -235,7 +244,11 @@ The operation never upgrades the consumer or changes its product HEAD. Work
 Unit, verification, and contract evidence remain byte-identical. Starting from
 `publication-ready`, only ignored publication metadata and the guarded
 `publication-ready -> draft-pr-created` transition may change; starting from
-`draft-pr-created`, Task State remains byte-identical. Existing-PR repair
+`draft-pr-created`, Task State remains byte-identical. Starting from qualifying
+`blocked`, only the status transitions through `publication-ready` to
+`draft-pr-created`; all other Task State bytes and optional Issue evidence remain
+unchanged. An interruption after the first transition can safely retry through
+the existing publication-ready path. Existing-PR repair
 delegates the mutation boundary to canonical `pr_edit`, which requires the
 exact same-repository OPEN Draft at the
 captured branch, base, and current head and binds its internal lookup to the

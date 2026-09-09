@@ -959,6 +959,74 @@ def mark_task_publication_state(
     return "transitioned"
 
 
+def recover_blocked_publication_ready(
+    record: WorktreeRecord,
+    task: str,
+    expected_state: bytes,
+    expected_evidence: dict[str, bytes | None],
+) -> str:
+    """CAS a proven publication-only blocked Task to publication-ready.
+
+    This deliberately is not part of the general transition table: recovery
+    may use it only after its external publication evidence has been checked.
+    """
+    validate_task(task)
+    if not isinstance(expected_state, bytes):
+        raise LifecycleError("expected Task State CAS value must be bytes")
+    evidence_names = {"work-units.json", "verification.json", "contract.json", "issue.json"}
+    if set(expected_evidence) != evidence_names or any(
+        value is not None and not isinstance(value, bytes)
+        for value in expected_evidence.values()
+    ):
+        raise LifecycleError("expected publication evidence CAS values are invalid")
+    require_resolved_contract(record, task)
+    import task_contract
+
+    try:
+        state_lock = task_contract.contract_state_lock(record.path)
+    except AttributeError as exc:  # pragma: no cover - verified module contract
+        raise LifecycleError("canonical Task State lock is unavailable") from exc
+    with state_lock as directory_fd:
+        current = current_worktree(record.path)
+        if current != record:
+            raise LifecycleError("local Task worktree identity changed")
+        registered = worktree_for_task(record.path, task)
+        if registered != record:
+            raise LifecycleError("Task worktree registration identity changed")
+        assert_task_identity(record, task)
+        path = state_path(record.path)
+        try:
+            actual = task_contract._read_state_file(directory_fd, "task.md")
+            actual_evidence = {
+                name: task_contract._read_state_file(directory_fd, name)
+                for name in evidence_names
+            }
+            task_contract._assert_state_dir_binding(record.path, directory_fd)
+        except Exception as exc:
+            raise LifecycleError(f"cannot read Task State for guarded recovery: {path}") from exc
+        if actual != expected_state:
+            raise LifecycleError("Task State changed before guarded blocked recovery")
+        if actual_evidence != expected_evidence:
+            raise LifecycleError("publication evidence changed before guarded blocked recovery")
+        try:
+            text = actual.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise LifecycleError("Task State is not valid UTF-8") from exc
+        updated, count = re.subn(
+            r"(?m)^- Status: blocked$", "- Status: publication-ready", text, count=1
+        )
+        if count != 1:
+            raise LifecycleError("cannot update blocked Task State status")
+        try:
+            task_contract._write_state_file(
+                directory_fd, "task.md", updated.encode("utf-8")
+            )
+            task_contract._assert_state_dir_binding(record.path, directory_fd)
+        except Exception as exc:
+            raise LifecycleError(f"cannot update Task State for guarded recovery: {path}") from exc
+    return "transitioned"
+
+
 def mark_task_merged_from_integration(record: WorktreeRecord, task: str) -> str:
     """Dedicated terminal transition used only after guarded merge reconciliation."""
     validate_task(task)

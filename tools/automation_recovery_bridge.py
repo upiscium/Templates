@@ -557,6 +557,17 @@ def _state_bytes(target: Path, name: str, contract=None) -> bytes:
         raise BridgeError(f"cannot read required Task evidence: {path}") from exc
 
 
+def _optional_state_bytes(target: Path, name: str, contract) -> bytes | None:
+    path = target / ".task-state" / name
+    try:
+        with contract.contract_state_lock(target) as directory_fd:
+            content = contract._read_state_file(directory_fd, name)
+            contract._assert_state_dir_binding(target, directory_fd)
+        return content
+    except Exception as exc:
+        raise BridgeError(f"cannot read optional Task evidence: {path}") from exc
+
+
 def _remote_branch_head(target: Path, repository: str, branch: str) -> str:
     result = _pinned_run(
         ["gh", "api", "--hostname", "github.com", f"repos/{repository}/git/ref/heads/{quote(branch, safe='')}", "--jq", ".object.sha"],
@@ -584,9 +595,9 @@ def _publication_snapshot(modules: dict, target: Path, task: str) -> dict:
         if record.branch != branch:
             raise BridgeError("registered Task branch identity changed")
         status = lifecycle.state_status(lifecycle.state_path(target))
-        if status not in {"publication-ready", "draft-pr-created"}:
+        if status not in {"blocked", "publication-ready", "draft-pr-created"}:
             raise BridgeError(
-                "publication recovery requires publication-ready or "
+                "publication recovery requires blocked, publication-ready, or "
                 f"draft-pr-created; found {status}"
             )
         repository = agent_core.canonical_repository(target)
@@ -613,6 +624,7 @@ def _publication_snapshot(modules: dict, target: Path, task: str) -> dict:
     verification = _state_bytes(target, "verification.json", contract_module)
     contract = _state_bytes(target, "contract.json", contract_module)
     state = _state_bytes(target, "task.md", contract_module)
+    issue = _optional_state_bytes(target, "issue.json", contract_module)
     try:
         modules["publication_metadata"].verification_evidence(target, task, head)
         modules["publication_metadata"].completed_reviews(target, task)
@@ -626,6 +638,7 @@ def _publication_snapshot(modules: dict, target: Path, task: str) -> dict:
         "work_units": work_units,
         "verification": verification,
         "contract": contract,
+        "issue": issue,
         "state": state,
         "status": status,
     }
@@ -633,8 +646,8 @@ def _publication_snapshot(modules: dict, target: Path, task: str) -> dict:
 
 def _assert_publication_postconditions(modules: dict, target: Path, task: str, before: dict) -> None:
     after = _publication_snapshot_for_post(modules, target, task)
-    for name in ("head", "branch", "repository", "work_units", "verification", "contract"):
-        if after[name] != before[name]:
+    for name in ("record", "head", "branch", "repository", "work_units", "verification", "contract", "issue"):
+        if after.get(name) != before.get(name):
             raise BridgeError(f"publication recovery changed immutable target evidence: {name}")
     if before["status"] == "publication-ready":
         expected_state = re.sub(
@@ -648,6 +661,18 @@ def _assert_publication_postconditions(modules: dict, target: Path, task: str, b
     elif before["status"] == "draft-pr-created":
         if after["state"] != before["state"]:
             raise BridgeError("publication recovery changed Task State from draft-pr-created")
+    elif before["status"] == "blocked":
+        expected_state = re.sub(
+            rb"(?m)^- Status: blocked$", b"- Status: publication-ready", before["state"], count=1
+        )
+        expected_state = re.sub(
+            rb"(?m)^- Status: publication-ready$",
+            b"- Status: draft-pr-created",
+            expected_state,
+            count=1,
+        )
+        if expected_state == before["state"] or after["state"] != expected_state:
+            raise BridgeError("publication recovery changed Task State beyond the guarded lifecycle transition")
     else:  # pragma: no cover - the initial snapshot rejects this state
         raise BridgeError(f"publication recovery started from an unsupported state: {before['status']}")
     if _target_git("diff", "--name-only", target=target) or _target_git(
@@ -687,12 +712,14 @@ def _publication_snapshot_for_post(modules: dict, target: Path, task: str) -> di
         raise BridgeError("target tracked worktree changed during publication recovery")
     contract_module = modules["task_contract"]
     return {
+        "record": record,
         "head": head,
         "branch": branch,
         "repository": repository,
         "work_units": _state_bytes(target, "work-units.json", contract_module),
         "verification": _state_bytes(target, "verification.json", contract_module),
         "contract": _state_bytes(target, "contract.json", contract_module),
+        "issue": _optional_state_bytes(target, "issue.json", contract_module),
         "state": _state_bytes(target, "task.md", contract_module),
         "status": status,
     }
@@ -700,6 +727,7 @@ def _publication_snapshot_for_post(modules: dict, target: Path, task: str) -> di
 
 def _publication_recover(modules: dict, target: Path, task: str) -> dict:
     before = _publication_snapshot(modules, target, task)
+    lifecycle = modules["task_lifecycle"]
     agent_core = modules["agent_core"]
     publication = modules["publication_metadata"]
 
@@ -708,9 +736,40 @@ def _publication_recover(modules: dict, target: Path, task: str) -> dict:
             not isinstance(existing, dict)
             or not isinstance(existing.get("number"), int)
             or isinstance(existing.get("number"), bool)
+            or existing.get("number") < 1
         ):
             raise BridgeError("existing Draft PR has an invalid or ambiguous number")
         return existing["number"]
+
+    def validate_blocked_pr(existing: object, expected_base: str) -> int:
+        number = existing_pr_number(existing)
+        if (
+            existing.get("state") != "OPEN"
+            or existing.get("isDraft") is not True
+            or existing.get("isCrossRepository") is not False
+            or existing.get("headRefName") != before["branch"]
+            or existing.get("baseRefName") != expected_base
+            or existing.get("headRefOid") != before["head"]
+        ):
+            raise BridgeError("blocked publication recovery requires the exact existing Draft PR")
+        return number
+
+    def prove_canonical_metadata() -> None:
+        base_match = re.search(
+            rb"(?m)^- Base revision: ([0-9a-fA-F]{40,64})$", before["state"]
+        )
+        if base_match is None:
+            raise BridgeError("Task State has no valid Base revision")
+        base = base_match.group(1).decode("ascii")
+        paths = _target_git(
+            "diff", "--name-only", f"{base}...{before['head']}", target=target
+        ).splitlines()
+        try:
+            publication.canonical_metadata(
+                target, task, head=before["head"], changed_paths=paths
+            )
+        except Exception as exc:
+            raise BridgeError(str(exc)) from exc
 
     def require_persisted_verification(root: Path, requested_task: str) -> None:
         if root.resolve() != target or requested_task != task:
@@ -730,6 +789,71 @@ def _publication_recover(modules: dict, target: Path, task: str) -> dict:
         agent_core.verify = require_persisted_verification
         with redirect_stdout(output):
             initial_pr_number = None
+            blocked_base = None
+            authority_before = before
+            if before["status"] == "blocked":
+                initial_pr = agent_core.pr_for_branch(
+                    target, before["branch"], before["repository"]
+                )
+                if initial_pr is None:
+                    raise BridgeError(
+                        "blocked publication recovery requires the existing Draft PR"
+                    )
+                blocked_base = agent_core.default_branch(target)
+                initial_pr_number = validate_blocked_pr(initial_pr, blocked_base)
+                prove_canonical_metadata()
+                immediately_before = _publication_snapshot(modules, target, task)
+                for name in (
+                    "record", "head", "branch", "repository", "work_units", "verification",
+                    "contract", "issue", "state", "status",
+                ):
+                    if immediately_before[name] != before[name]:
+                        raise BridgeError(
+                            f"publication authority changed before blocked recovery: {name}"
+                        )
+                confirmed = agent_core.pr_for_branch(
+                    target, before["branch"], before["repository"]
+                )
+                if agent_core.default_branch(target) != blocked_base:
+                    raise BridgeError("default branch changed before blocked recovery")
+                if (
+                    confirmed is None
+                    or validate_blocked_pr(confirmed, blocked_base) != initial_pr_number
+                ):
+                    raise BridgeError("existing Draft PR identity changed before blocked recovery")
+                try:
+                    lifecycle.recover_blocked_publication_ready(
+                        before["record"],
+                        task,
+                        before["state"],
+                        {
+                            "work-units.json": before["work_units"],
+                            "verification.json": before["verification"],
+                            "contract.json": before["contract"],
+                            "issue.json": before["issue"],
+                        },
+                    )
+                except Exception as exc:
+                    raise BridgeError(str(exc)) from exc
+                authority_before = {
+                    **before,
+                    "state": re.sub(
+                        rb"(?m)^- Status: blocked$",
+                        b"- Status: publication-ready",
+                        before["state"],
+                        count=1,
+                    ),
+                    "status": "publication-ready",
+                }
+                recovered = _publication_snapshot(modules, target, task)
+                for name in (
+                    "record", "head", "branch", "repository", "work_units",
+                    "verification", "contract", "issue", "state", "status",
+                ):
+                    if recovered.get(name) != authority_before.get(name):
+                        raise BridgeError(
+                            f"blocked publication recovery changed unexpected authority: {name}"
+                        )
             if before["status"] == "draft-pr-created":
                 initial_pr = agent_core.pr_for_branch(
                     target, before["branch"], before["repository"]
@@ -741,17 +865,20 @@ def _publication_recover(modules: dict, target: Path, task: str) -> dict:
                 initial_pr_number = existing_pr_number(initial_pr)
             agent_core.pr_prepare(target, task)
             immediately_before = _publication_snapshot(modules, target, task)
-            for name in (
-                "head", "branch", "repository", "work_units", "verification",
+            names = [
+                "record", "head", "branch", "repository", "work_units", "verification",
                 "contract", "state", "status",
-            ):
-                if immediately_before[name] != before[name]:
+            ]
+            if "issue" in before:
+                names.append("issue")
+            for name in names:
+                if immediately_before.get(name) != authority_before.get(name):
                     raise BridgeError(f"publication authority changed before GitHub write: {name}")
             existing = agent_core.pr_for_branch(target, before["branch"], before["repository"])
             if existing is None:
-                if before["status"] != "publication-ready":
+                if before["status"] != "publication-ready" or initial_pr_number is not None:
                     raise BridgeError(
-                        "draft-pr-created recovery requires the existing Draft PR"
+                        f"{before['status']} recovery requires the existing Draft PR"
                     )
                 pr = agent_core.pr_create(target, task)
             else:
@@ -771,7 +898,12 @@ def _publication_recover(modules: dict, target: Path, task: str) -> dict:
     finally:
         agent_core.verify = original_verify
 
-    if not pr or not isinstance(pr.get("number"), int) or isinstance(pr.get("number"), bool):
+    if (
+        not pr
+        or not isinstance(pr.get("number"), int)
+        or isinstance(pr.get("number"), bool)
+        or pr.get("number") < 1
+    ):
         raise BridgeError("published Draft PR cannot be resolved exactly")
     live = agent_core.pr_for_branch(target, before["branch"], before["repository"])
     if not live or live.get("number") != pr["number"]:
