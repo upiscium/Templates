@@ -234,7 +234,12 @@ default base, and current head, plus current canonical verification and
 effective completed review evidence. The bridge captures and revalidates that
 Draft before a dedicated locked compare-and-swap changes only `blocked ->
 publication-ready`; a missing or changed Draft fails before that state mutation.
-It then uses canonical `pr_prepare` and number-bound `pr_edit`. It never creates
+Before that durable transition, it publishes a protected Git-private recovery
+receipt bound to repository, Task/worktree, branch, exact HEAD, base, original
+PR number, Task State, and evidence digests. Retries from `blocked`,
+`publication-ready`, or `draft-pr-created` must resolve that same receipt-bound
+Draft; absence or replacement fails closed and cannot select `pr_create`. It
+then uses canonical `pr_prepare` and number-bound `pr_edit`. It never creates
 a PR for a `blocked` Task, and the generic lifecycle/state-set transition table
 does not gain a bypass. Canonical modules are loaded only from verified immutable
 Templates commit blobs; consumer `.automation/bin` files are not publication
@@ -248,7 +253,11 @@ Unit, verification, and contract evidence remain byte-identical. Starting from
 `blocked`, only the status transitions through `publication-ready` to
 `draft-pr-created`; all other Task State bytes and optional Issue evidence remain
 unchanged. An interruption after the first transition can safely retry through
-the existing publication-ready path. Existing-PR repair
+the receipt-bound publication-ready path. The receipt is consumed only after
+exact Draft validation and convergence to `draft-pr-created`, so successful
+recovery leaves no stale authority. The exact receipt-bound canonical Draft is
+re-read immediately before consumption; replacement retains the receipt and
+fails closed. Existing-PR repair
 delegates the mutation boundary to canonical `pr_edit`, which requires the
 exact same-repository OPEN Draft at the
 captured branch, base, and current head and binds its internal lookup to the

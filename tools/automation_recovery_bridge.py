@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import io
 import json
@@ -725,11 +726,147 @@ def _publication_snapshot_for_post(modules: dict, target: Path, task: str) -> di
     }
 
 
+def _replace_publication_status(state: bytes, expected: bytes, target: bytes) -> bytes:
+    updated, count = re.subn(
+        rb"(?m)^- Status: " + re.escape(expected) + rb"$",
+        b"- Status: " + target,
+        state,
+        count=1,
+    )
+    if count != 1:
+        raise BridgeError(
+            f"cannot derive recovery Task State transition {expected.decode()} -> {target.decode()}"
+        )
+    return updated
+
+
+def _recovery_states(snapshot: dict) -> tuple[bytes, bytes, bytes]:
+    state = snapshot["state"]
+    if snapshot["status"] == "blocked":
+        blocked = state
+        ready = _replace_publication_status(blocked, b"blocked", b"publication-ready")
+        draft = _replace_publication_status(ready, b"publication-ready", b"draft-pr-created")
+    elif snapshot["status"] == "publication-ready":
+        ready = state
+        blocked = _replace_publication_status(ready, b"publication-ready", b"blocked")
+        draft = _replace_publication_status(ready, b"publication-ready", b"draft-pr-created")
+    elif snapshot["status"] == "draft-pr-created":
+        draft = state
+        ready = _replace_publication_status(draft, b"draft-pr-created", b"publication-ready")
+        blocked = _replace_publication_status(ready, b"publication-ready", b"blocked")
+    else:  # pragma: no cover - snapshots reject all other states
+        raise BridgeError("unsupported publication recovery status")
+    return blocked, ready, draft
+
+
+def _publication_recovery_receipt(
+    target: Path, task: str, snapshot: dict, base: str, pr_number: int
+) -> bytes:
+    blocked, ready, draft = _recovery_states(snapshot)
+    base_match = re.search(
+        rb"(?m)^- Base revision: ([0-9a-fA-F]{40,64})$", snapshot["state"]
+    )
+    if base_match is None:
+        raise BridgeError("Task State has no valid Base revision")
+
+    def digest(content: bytes | None) -> str | None:
+        return hashlib.sha256(content).hexdigest() if content is not None else None
+
+    value = {
+        "schema_version": 1,
+        "kind": "blocked-publication-recovery",
+        "repository": snapshot["repository"],
+        "task_id": task,
+        "worktree": str(target),
+        "branch": snapshot["branch"],
+        "head": snapshot["head"],
+        "base_branch": base,
+        "base_revision": base_match.group(1).decode("ascii").lower(),
+        "pr_number": pr_number,
+        "blocked_state_sha256": digest(blocked),
+        "publication_ready_state_sha256": digest(ready),
+        "draft_pr_created_state_sha256": digest(draft),
+        "work_units_sha256": digest(snapshot["work_units"]),
+        "verification_sha256": digest(snapshot["verification"]),
+        "contract_sha256": digest(snapshot["contract"]),
+        "issue_sha256": digest(snapshot["issue"]),
+    }
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def _read_publication_recovery_receipt(modules: dict, target: Path) -> bytes | None:
+    private = modules["git_private_state"]
+    try:
+        private.prepare(target, admin=True)
+        path = private.publication_recovery_receipt(target)
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return None
+        return private.read_bytes(path, "publication recovery receipt")
+    except Exception as exc:
+        raise BridgeError(str(exc)) from exc
+
+
+def _validate_publication_recovery_receipt(
+    receipt: bytes, target: Path, task: str, snapshot: dict, base: str
+) -> dict:
+    try:
+        value = json.loads(receipt.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise BridgeError("publication recovery receipt is invalid") from exc
+    if not isinstance(value, dict):
+        raise BridgeError("publication recovery receipt is invalid")
+    blocked, ready, draft = _recovery_states(snapshot)
+
+    def digest(content: bytes | None) -> str | None:
+        return hashlib.sha256(content).hexdigest() if content is not None else None
+
+    expected = {
+        "repository": snapshot["repository"],
+        "task_id": task,
+        "worktree": str(target),
+        "branch": snapshot["branch"],
+        "head": snapshot["head"],
+        "base_branch": base,
+        "blocked_state_sha256": digest(blocked),
+        "publication_ready_state_sha256": digest(ready),
+        "draft_pr_created_state_sha256": digest(draft),
+        "work_units_sha256": digest(snapshot["work_units"]),
+        "verification_sha256": digest(snapshot["verification"]),
+        "contract_sha256": digest(snapshot["contract"]),
+        "issue_sha256": digest(snapshot["issue"]),
+    }
+    mismatches = [name for name, expected_value in expected.items() if value.get(name) != expected_value]
+    base_match = re.search(
+        rb"(?m)^- Base revision: ([0-9a-fA-F]{40,64})$", snapshot["state"]
+    )
+    if base_match is None or value.get("base_revision") != base_match.group(1).decode("ascii").lower():
+        mismatches.append("base_revision")
+    number = value.get("pr_number")
+    if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+        mismatches.append("pr_number")
+    if mismatches:
+        raise BridgeError(
+            "publication recovery receipt does not match the exact current subject: "
+            + ", ".join(sorted(set(mismatches)))
+        )
+    return value
+
+
 def _publication_recover(modules: dict, target: Path, task: str) -> dict:
     before = _publication_snapshot(modules, target, task)
     lifecycle = modules["task_lifecycle"]
     agent_core = modules["agent_core"]
     publication = modules["publication_metadata"]
+    recovery_receipt = _read_publication_recovery_receipt(modules, target)
+    receipt_value = None
+    receipt_base = None
+    if recovery_receipt is not None:
+        receipt_base = agent_core.default_branch(target)
+        receipt_value = _validate_publication_recovery_receipt(
+            recovery_receipt, target, task, before, receipt_base
+        )
 
     def existing_pr_number(existing: object) -> int:
         if (
@@ -801,6 +938,10 @@ def _publication_recover(modules: dict, target: Path, task: str) -> dict:
                     )
                 blocked_base = agent_core.default_branch(target)
                 initial_pr_number = validate_blocked_pr(initial_pr, blocked_base)
+                if receipt_value is not None and receipt_value["pr_number"] != initial_pr_number:
+                    raise BridgeError(
+                        "existing Draft PR identity differs from recovery receipt"
+                    )
                 prove_canonical_metadata()
                 immediately_before = _publication_snapshot(modules, target, task)
                 for name in (
@@ -821,6 +962,10 @@ def _publication_recover(modules: dict, target: Path, task: str) -> dict:
                     or validate_blocked_pr(confirmed, blocked_base) != initial_pr_number
                 ):
                     raise BridgeError("existing Draft PR identity changed before blocked recovery")
+                if recovery_receipt is None:
+                    recovery_receipt = _publication_recovery_receipt(
+                        target, task, before, blocked_base, initial_pr_number
+                    )
                 try:
                     lifecycle.recover_blocked_publication_ready(
                         before["record"],
@@ -832,6 +977,7 @@ def _publication_recover(modules: dict, target: Path, task: str) -> dict:
                             "contract.json": before["contract"],
                             "issue.json": before["issue"],
                         },
+                        recovery_receipt,
                     )
                 except Exception as exc:
                     raise BridgeError(str(exc)) from exc
@@ -854,7 +1000,20 @@ def _publication_recover(modules: dict, target: Path, task: str) -> dict:
                         raise BridgeError(
                             f"blocked publication recovery changed unexpected authority: {name}"
                         )
-            if before["status"] == "draft-pr-created":
+            if before["status"] in {"publication-ready", "draft-pr-created"} and receipt_value is not None:
+                initial_pr = agent_core.pr_for_branch(
+                    target, before["branch"], before["repository"]
+                )
+                if initial_pr is None:
+                    raise BridgeError(
+                        f"{before['status']} blocked-recovery retry requires the receipt-bound Draft PR"
+                    )
+                initial_pr_number = validate_blocked_pr(initial_pr, receipt_base)
+                if initial_pr_number != receipt_value["pr_number"]:
+                    raise BridgeError(
+                        "existing Draft PR identity differs from recovery receipt"
+                    )
+            elif before["status"] == "draft-pr-created":
                 initial_pr = agent_core.pr_for_branch(
                     target, before["branch"], before["repository"]
                 )
@@ -876,7 +1035,11 @@ def _publication_recover(modules: dict, target: Path, task: str) -> dict:
                     raise BridgeError(f"publication authority changed before GitHub write: {name}")
             existing = agent_core.pr_for_branch(target, before["branch"], before["repository"])
             if existing is None:
-                if before["status"] != "publication-ready" or initial_pr_number is not None:
+                if (
+                    before["status"] != "publication-ready"
+                    or initial_pr_number is not None
+                    or recovery_receipt is not None
+                ):
                     raise BridgeError(
                         f"{before['status']} recovery requires the existing Draft PR"
                     )
@@ -887,6 +1050,8 @@ def _publication_recover(modules: dict, target: Path, task: str) -> dict:
                     raise BridgeError(
                         "existing Draft PR identity changed before canonical repair"
                     )
+                if receipt_value is not None:
+                    validate_blocked_pr(existing, receipt_base)
                 agent_core.pr_edit(
                     target,
                     task,
@@ -919,6 +1084,42 @@ def _publication_recover(modules: dict, target: Path, task: str) -> dict:
         draft=True,
     )
     _assert_publication_postconditions(modules, target, task, before)
+    if recovery_receipt is not None:
+        receipt_live = agent_core.pr_for_branch(
+            target, before["branch"], before["repository"]
+        )
+        if (
+            not receipt_live
+            or receipt_live.get("number") != json.loads(recovery_receipt)["pr_number"]
+        ):
+            raise BridgeError(
+                "receipt-bound Draft PR identity changed before receipt consumption"
+            )
+        agent_core._validate_live_pr(
+            receipt_live,
+            branch=before["branch"],
+            base=agent_core.default_branch(target),
+            head=before["head"],
+            title=title,
+            body=body,
+            draft=True,
+        )
+        _, _, final_state = _recovery_states(before)
+        try:
+            lifecycle.complete_blocked_publication_recovery(
+                before["record"],
+                task,
+                final_state,
+                {
+                    "work-units.json": before["work_units"],
+                    "verification.json": before["verification"],
+                    "contract.json": before["contract"],
+                    "issue.json": before["issue"],
+                },
+                recovery_receipt,
+            )
+        except Exception as exc:
+            raise BridgeError(str(exc)) from exc
     return {
         "status": "DRAFT_PR_CREATED",
         "task": task,

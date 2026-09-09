@@ -101,6 +101,29 @@ class GitPrivateStateTest(unittest.TestCase):
             "receipt_sha256": "a" * 64,
         }
 
+    def publication_recovery_record(self, root: Path, task: str = "1") -> dict:
+        worktree = Path(self.valid_worktree(root, f"{task}-test"))
+        head = command("git", "rev-parse", "HEAD", cwd=worktree)
+        return {
+            "schema_version": 1,
+            "kind": "blocked-publication-recovery",
+            "repository": "acme/widgets",
+            "task_id": task,
+            "worktree": str(worktree),
+            "branch": f"task/{task}-test",
+            "head": head,
+            "base_branch": "main",
+            "base_revision": head,
+            "pr_number": 149,
+            "blocked_state_sha256": "a" * 64,
+            "publication_ready_state_sha256": "b" * 64,
+            "draft_pr_created_state_sha256": "c" * 64,
+            "work_units_sha256": "d" * 64,
+            "verification_sha256": "e" * 64,
+            "contract_sha256": "f" * 64,
+            "issue_sha256": None,
+        }
+
     def proof_record(self, root: Path, task: str = "1") -> dict:
         authority = self.authority_record(root, task)
         return {
@@ -130,6 +153,40 @@ class GitPrivateStateTest(unittest.TestCase):
                 common / "agent-core" / "integration" / "pr-12.head",
             )
             self.assertFalse((common / "agent-core").exists())
+
+    def test_publication_recovery_path_is_worktree_admin_private(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(Path(directory))
+            self.assertEqual(
+                private_state.admin_git_dir(repo) / "agent-core/automation-maintenance/publication-recovery.json",
+                private_state.publication_recovery_receipt(repo),
+            )
+
+    def test_publication_recovery_receipt_is_validated_in_canonical_topology(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.repository(root)
+            linked = Path(self.valid_worktree(repo, "1-test"))
+            receipt = private_state.publication_recovery_receipt(linked)
+            private_state.prepare(linked, admin=True)
+            content = json.dumps(self.publication_recovery_record(repo)).encode()
+            private_state.exclusive_write_bytes(receipt, content)
+            private_state.prepare(linked, admin=True)
+            self.assertEqual(content, private_state.read_bytes(receipt))
+
+    def test_publication_recovery_rejects_tampered_head_and_boolean_pr_number(self) -> None:
+        for field, replacement in (("head", "a" * 40), ("pr_number", True)):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo = self.repository(root)
+                linked = Path(self.valid_worktree(repo, "1-test"))
+                private_state.prepare(linked, admin=True)
+                value = self.publication_recovery_record(repo)
+                value[field] = replacement
+                path = private_state.publication_recovery_receipt(linked)
+                private_state.write_bytes(path, json.dumps(value).encode())
+                with self.assertRaises(private_state.GitPrivateStateError):
+                    private_state.prepare(linked, admin=True)
 
     def test_regular_opencode_is_foreign_and_identity_is_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

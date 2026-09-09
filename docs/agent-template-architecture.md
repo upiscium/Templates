@@ -788,12 +788,24 @@ current-head verification and effective reviews; then rechecks Task, product,
 remote, repository, evidence, and the same PR identity. A dedicated internal
 lifecycle helper performs a locked byte-CAS that changes only `blocked ->
 publication-ready`; it is not exposed through Just/CLI and does not alter the
-generic transition table. The bridge then uses canonical preparation and
+generic transition table. Before that CAS it durably publishes a strict
+Git-private receipt binding the exact repository, Task/worktree, branch, HEAD,
+base, original PR number, Task State variants, and immutable evidence digests.
+Any retry while the receipt exists must resolve that original PR; a missing or
+replacement PR fails before GitHub mutation and never selects creation. The
+bridge then uses canonical preparation and
 number-bound edit to reach `draft-pr-created`. A blocked Task without a PR fails
 before state mutation and never selects PR creation. Work Unit, verification,
 contract, optional Issue, historical failure, product, and non-status Task State
 bytes remain unchanged. If interrupted after the CAS, retry continues through
-the existing publication-ready path on the same Draft.
+the receipt-bound publication-ready path on the same Draft. The exact receipt
+remains across edit/state interruption and is consumed only after final
+postconditions prove `draft-pr-created`; completed recovery leaves no stale
+authority. The bridge re-reads and validates the receipt-bound canonical Draft
+immediately before receipt consumption. GitHub does not provide an atomic
+compare-and-edit precondition for title/body updates, so canonical `pr_edit`
+minimizes that remote race with identity validation immediately before and
+after its mutation and fails if either observation differs.
 
 Canonical `pr_create` remains strict and reconciles only an already-canonical
 existing Draft. The bridge does not broaden it: after preparation, absence of a
