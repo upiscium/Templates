@@ -270,6 +270,35 @@ and Draft PR #29, whose old `97dbf036...` Validation metadata remained after
 the live head reached `8313bcfc...`, are the motivating downstream fixture, not
 an execution performed by this change.
 
+### Issue #151: source-side Ready recovery
+
+After source-side publication repair has produced an exact canonical Draft, an
+older consumer Agent Core can still reject `agent::pr-ready` using stale review
+semantics. Run the narrow Ready recovery from a clean Templates checkout at the
+exact full implementation revision:
+
+```sh
+just agent-core::publication-ready-recover <consumer-task-worktree> <task> <expected-implementation-revision>
+```
+
+The bridge requires the exact registered non-default Task worktree in
+`draft-pr-created`, or `integration-pending` for a validation-only terminal
+retry. It verifies clean and identical local/remote Task HEADs, a resolved
+contract, exact-current persisted verification, source-effective completed
+reviews, canonical persisted and live PR metadata, exactly one same-repository
+OPEN Task-branch PR, and absence of an unresolved publication-recovery receipt.
+It delegates the only GitHub mutation to canonical number-bound `pr_ready`,
+preserves verification rather than rerunning project checks, revalidates the
+same PR before the guarded lifecycle transition, and converges only
+`draft-pr-created -> integration-pending`.
+
+The operation never upgrades the consumer, creates or replaces a PR, changes
+product commits or evidence, marks an unrelated PR Ready, or merges. A retry
+after GitHub accepted Ready but before the local transition validates the same
+already-Ready PR and performs only the missing transition. AgentKnowledgeVault
+Task #13 / PR #29 is represented only by isolated fixtures during development;
+the real downstream Task and PR are not touched by this implementation.
+
 Issue #103 permits that separate guarded cleanup to recover when GitHub has
 already deleted a merged Task's remote branch. A configured upstream is not
 treated as a live revision: cleanup queries origin directly, requires status
