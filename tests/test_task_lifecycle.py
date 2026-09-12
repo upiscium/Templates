@@ -4,6 +4,7 @@ import importlib.util
 import sys
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest import mock
 
@@ -39,6 +40,173 @@ class TaskLifecycleTest(unittest.TestCase):
                 lifecycle.set_state_status(path, "merged")
             lifecycle.set_state_status(path, "planning")
             self.assertEqual(lifecycle.state_status(path), "planning")
+
+    def test_generic_state_set_cannot_recover_blocked_to_publication_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".task-state/task.md"
+            state.parent.mkdir()
+            state.write_text("## Current state\n\n- Status: blocked\n", encoding="utf-8")
+            record = lifecycle.WorktreeRecord(root, "task/148-recovery", "a" * 40)
+            with mock.patch.object(lifecycle, "require_local_task", return_value=record), \
+                 mock.patch.object(lifecycle, "require_resolved_contract"), \
+                 mock.patch.object(lifecycle, "assert_task_identity"), \
+                 mock.patch.object(lifecycle, "work_units_lock", return_value=mock.MagicMock(
+                     __enter__=mock.Mock(return_value=None), __exit__=mock.Mock(return_value=False)
+                 )), \
+                 self.assertRaisesRegex(lifecycle.LifecycleError, "invalid Task State transition"):
+                lifecycle.task_state_set(root, "148", "publication-ready")
+            self.assertEqual(lifecycle.state_status(state), "blocked")
+
+    def test_guarded_blocked_publication_recovery_is_exact_locked_status_cas(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".task-state/task.md"
+            state.parent.mkdir()
+            original = b"prefix\n## Current state\n\n- Status: blocked\n- Blockers: publication only\nsuffix\n"
+            state.write_bytes(original)
+            evidence = {
+                "work-units.json": b"units",
+                "verification.json": b"verification",
+                "contract.json": b"contract",
+                "issue.json": None,
+            }
+            for name, content in evidence.items():
+                if content is not None:
+                    (state.parent / name).write_bytes(content)
+            record = lifecycle.WorktreeRecord(root, "task/148-recovery", "a" * 40)
+            with mock.patch.object(lifecycle, "current_worktree", return_value=record), \
+                 mock.patch.object(lifecycle, "worktree_for_task", return_value=record), \
+                 mock.patch.object(lifecycle, "require_resolved_contract"), \
+                 mock.patch.object(lifecycle, "assert_task_identity"), \
+                 mock.patch.object(lifecycle.private_state, "prepare"), \
+                 mock.patch.object(lifecycle.private_state, "publication_recovery_receipt", return_value=root / "receipt"), \
+                 mock.patch.object(lifecycle.private_state, "_validate_legacy_content"), \
+                 mock.patch.object(lifecycle.private_state, "_validate_publication_recovery_topology"), \
+                 mock.patch.object(lifecycle.private_state, "topology"), \
+                 mock.patch.object(lifecycle.private_state, "mutation_lock", return_value=nullcontext()), \
+                 mock.patch.object(lifecycle.private_state, "exclusive_write_bytes", side_effect=lambda path, content, **_: path.write_bytes(content)):
+                result = lifecycle.recover_blocked_publication_ready(
+                    record, "148", original, evidence, b"{}"
+                )
+            self.assertEqual(result, "transitioned")
+            self.assertEqual(
+                state.read_bytes(),
+                original.replace(b"- Status: blocked", b"- Status: publication-ready"),
+            )
+
+    def test_guarded_blocked_publication_recovery_rejects_stale_state_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".task-state/task.md"
+            state.parent.mkdir()
+            state.write_text("## Current state\n\n- Status: blocked\n", encoding="utf-8")
+            record = lifecycle.WorktreeRecord(root, "task/148-recovery", "a" * 40)
+            evidence = {
+                "work-units.json": None,
+                "verification.json": None,
+                "contract.json": None,
+                "issue.json": None,
+            }
+            with mock.patch.object(lifecycle, "current_worktree", return_value=record), \
+                 mock.patch.object(lifecycle, "worktree_for_task", return_value=record), \
+                 mock.patch.object(lifecycle, "require_resolved_contract"), \
+                 mock.patch.object(lifecycle, "assert_task_identity"), \
+                 mock.patch.object(lifecycle.private_state, "prepare"), \
+                 mock.patch.object(lifecycle.private_state, "publication_recovery_receipt", return_value=root / "receipt"), \
+                 mock.patch.object(lifecycle.private_state, "_validate_legacy_content"), \
+                 mock.patch.object(lifecycle.private_state, "_validate_publication_recovery_topology"), \
+                 mock.patch.object(lifecycle.private_state, "topology"), \
+                 mock.patch.object(lifecycle.private_state, "mutation_lock", return_value=nullcontext()), \
+                 mock.patch.object(lifecycle.private_state, "exclusive_write_bytes", side_effect=lambda path, content, **_: path.write_bytes(content)), \
+                 self.assertRaisesRegex(lifecycle.LifecycleError, "Task State changed"):
+                lifecycle.recover_blocked_publication_ready(
+                    record, "148", b"stale", evidence, b"{}"
+                )
+            self.assertEqual(lifecycle.state_status(state), "blocked")
+            self.assertEqual((root / "receipt").read_bytes(), b"{}")
+
+    def test_guarded_blocked_publication_recovery_rejects_any_evidence_change(self) -> None:
+        for case in (
+            "work-units.json",
+            "verification.json",
+            "contract.json",
+            "issue.json",
+            "issue-value",
+        ):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                state = root / ".task-state/task.md"
+                state.parent.mkdir()
+                original = b"## Current state\n\n- Status: blocked\n"
+                state.write_bytes(original)
+                evidence = {
+                    "work-units.json": b"units",
+                    "verification.json": b"verification",
+                    "contract.json": b"contract",
+                    "issue.json": b"issue" if case == "issue-value" else None,
+                }
+                for name, content in evidence.items():
+                    if content is not None:
+                        (state.parent / name).write_bytes(content)
+                changed_name = "issue.json" if case == "issue-value" else case
+                (state.parent / changed_name).write_bytes(b"changed")
+                record = lifecycle.WorktreeRecord(root, "task/148-recovery", "a" * 40)
+                with mock.patch.object(lifecycle, "current_worktree", return_value=record), \
+                     mock.patch.object(lifecycle, "worktree_for_task", return_value=record), \
+                     mock.patch.object(lifecycle, "require_resolved_contract"), \
+                     mock.patch.object(lifecycle, "assert_task_identity"), \
+                     mock.patch.object(lifecycle.private_state, "prepare"), \
+                     mock.patch.object(lifecycle.private_state, "publication_recovery_receipt", return_value=root / "receipt"), \
+                     mock.patch.object(lifecycle.private_state, "_validate_legacy_content"), \
+                     mock.patch.object(lifecycle.private_state, "_validate_publication_recovery_topology"), \
+                     mock.patch.object(lifecycle.private_state, "topology"), \
+                     mock.patch.object(lifecycle.private_state, "mutation_lock", return_value=nullcontext()), \
+                     mock.patch.object(lifecycle.private_state, "exclusive_write_bytes", side_effect=lambda path, content, **_: path.write_bytes(content)), \
+                     self.assertRaisesRegex(lifecycle.LifecycleError, "publication evidence changed"):
+                    lifecycle.recover_blocked_publication_ready(
+                        record, "148", original, evidence, b"{}"
+                    )
+                self.assertEqual(state.read_bytes(), original)
+
+    def test_completed_blocked_recovery_consumes_exact_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".task-state/task.md"
+            state.parent.mkdir()
+            final = b"## Current state\n\n- Status: draft-pr-created\n"
+            state.write_bytes(final)
+            evidence = {
+                "work-units.json": b"units",
+                "verification.json": b"verification",
+                "contract.json": b"contract",
+                "issue.json": None,
+            }
+            for name, content in evidence.items():
+                if content is not None:
+                    (state.parent / name).write_bytes(content)
+            receipt = root / "receipt"
+            receipt.write_bytes(b"receipt")
+            record = lifecycle.WorktreeRecord(root, "task/148-recovery", "a" * 40)
+
+            def consume(path: Path, **_: object) -> None:
+                path.unlink()
+
+            with mock.patch.object(lifecycle, "current_worktree", return_value=record), \
+                 mock.patch.object(lifecycle, "worktree_for_task", return_value=record), \
+                 mock.patch.object(lifecycle, "require_resolved_contract"), \
+                 mock.patch.object(lifecycle, "assert_task_identity"), \
+                 mock.patch.object(lifecycle.private_state, "prepare"), \
+                 mock.patch.object(lifecycle.private_state, "publication_recovery_receipt", return_value=receipt), \
+                 mock.patch.object(lifecycle.private_state, "mutation_lock", return_value=nullcontext()), \
+                 mock.patch.object(lifecycle.private_state, "read_bytes_identity", return_value=(b"receipt", (1, 2))), \
+                 mock.patch.object(lifecycle.private_state, "unlink", side_effect=consume) as unlink:
+                result = lifecycle.complete_blocked_publication_recovery(
+                    record, "148", final, evidence, b"receipt"
+                )
+            self.assertEqual(result, "consumed")
+            self.assertFalse(receipt.exists())
+            unlink.assert_called_once()
 
     def test_batch_conflict_detects_dependency_and_shared_resources(self) -> None:
         summaries = [

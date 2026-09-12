@@ -47,11 +47,18 @@ class PublicationRecoveryBridgeTest(unittest.TestCase):
         self.publication = mock.Mock()
         self.publication.verification_evidence.return_value = {"head": self.head}
         self.publication.completed_reviews.return_value = ["- `review` — `reviewer` — completed"]
+        self.contract = mock.MagicMock()
+        self.contract._read_state_file.return_value = None
+        self.private = mock.Mock()
+        self.private.publication_recovery_receipt.return_value = Path(
+            "/tmp/nonexistent-publication-recovery-receipt"
+        )
         self.modules = {
+            "git_private_state": self.private,
             "task_lifecycle": self.lifecycle,
             "agent_core": self.agent,
             "publication_metadata": self.publication,
-            "task_contract": mock.Mock(),
+            "task_contract": self.contract,
         }
 
     def snapshot_git(self, *args: str, **_: object) -> str:
@@ -91,11 +98,16 @@ class PublicationRecoveryBridgeTest(unittest.TestCase):
         before = self.snapshot()
         self.assertEqual(before["status"], "draft-pr-created")
 
+    def test_snapshot_accepts_blocked_only_as_a_recovery_candidate(self) -> None:
+        self.lifecycle.state_status.return_value = "blocked"
+        before = self.snapshot()
+        self.assertEqual(before["status"], "blocked")
+
     def test_snapshot_rejects_other_lifecycle_states(self) -> None:
         self.lifecycle.state_status.return_value = "implementing"
         with self.assertRaisesRegex(
             bridge.BridgeError,
-            "requires publication-ready or draft-pr-created",
+            "requires blocked, publication-ready, or draft-pr-created",
         ):
             self.snapshot()
 
@@ -123,6 +135,7 @@ class PublicationRecoveryBridgeTest(unittest.TestCase):
         self.agent.pr_prepare.assert_called_once_with(self.target, "131")
         self.agent.pr_create.assert_called_once_with(self.target, "131")
         self.agent.pr_edit.assert_not_called()
+        self.lifecycle.complete_blocked_publication_recovery.assert_not_called()
         self.assertIs(self.agent.verify, original_verify)
 
     def test_draft_pr_created_without_existing_pr_fails_closed_before_mutation(self) -> None:
@@ -165,7 +178,360 @@ class PublicationRecoveryBridgeTest(unittest.TestCase):
         self.agent.pr_create.assert_not_called()
         self.agent.pr_edit.assert_not_called()
 
+    def test_blocked_without_existing_pr_fails_before_state_or_github_mutation(self) -> None:
+        before = {
+            "head": self.head, "branch": self.branch, "repository": self.repository,
+            "record": self.record, "work_units": b"units", "verification": b"verification",
+            "contract": b"contract", "issue": b"issue", "state": b"- Status: blocked\n",
+            "status": "blocked",
+        }
+        self.agent.pr_for_branch.return_value = None
+        with mock.patch.object(bridge, "_publication_snapshot", return_value=before), \
+             self.assertRaisesRegex(bridge.BridgeError, "blocked publication recovery requires the existing Draft PR"):
+            bridge._publication_recover(self.modules, self.target, "131")
+        self.lifecycle.recover_blocked_publication_ready.assert_not_called()
+        self.agent.pr_prepare.assert_not_called()
+        self.agent.pr_create.assert_not_called()
+        self.agent.pr_edit.assert_not_called()
+
+    def test_blocked_akv_shaped_stale_draft_recovers_same_pr_and_preserves_subject(self) -> None:
+        current_head = "8313bcfcfdee4a3985f8b5dd48861b2b2bcb69a4"
+        branch = "task/13-hybrid-level1-reranking"
+        repository = "upiscium/AgentKnowledgeVault"
+        original_state = (
+            b"prefix\n- Base revision: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"
+            b"- Status: blocked\n- Blockers: publication-only failure\nsuffix\n"
+        )
+        ready_state = original_state.replace(b"- Status: blocked", b"- Status: publication-ready")
+        final_state = original_state.replace(b"- Status: blocked", b"- Status: draft-pr-created")
+        before = {
+            "head": current_head, "branch": branch, "repository": repository,
+            "record": self.record, "work_units": b'history including WU-13-28',
+            "verification": b"current verification", "contract": b"contract",
+            "issue": b"issue", "state": original_state, "status": "blocked",
+        }
+        ready = {**before, "state": ready_state, "status": "publication-ready"}
+        after = {**before, "state": final_state, "status": "draft-pr-created"}
+        stale = {
+            "number": 29, "headRefName": branch, "baseRefName": "main",
+            "headRefOid": current_head, "isDraft": True,
+            "isCrossRepository": False, "state": "OPEN",
+            "body": "Validation at 97dbf03607d8eaabfc76104be2722d89aa6ddf2d",
+        }
+        repaired = {**stale, "body": f"Validation at {current_head}"}
+        self.agent.pr_for_branch.side_effect = [stale, stale, stale, repaired, repaired, repaired]
+        self.agent.default_branch.return_value = "main"
+        self.publication.canonical_metadata.return_value = ("13: canonical", repaired["body"])
+        self.agent._validated_local_metadata.return_value = (
+            "13: canonical", Path("/tmp/body"), repaired["body"]
+        )
+        with mock.patch.object(bridge, "_publication_snapshot", side_effect=[before, before, ready, ready]), \
+             mock.patch.object(bridge, "_publication_snapshot_for_post", return_value=after), \
+             mock.patch.object(bridge, "_target_git", return_value=""):
+            result = bridge._publication_recover(self.modules, self.target, "13")
+        self.assertEqual(result["pullRequest"]["number"], 29)
+        self.lifecycle.recover_blocked_publication_ready.assert_called_once_with(
+            self.record,
+            "13",
+            original_state,
+            {
+                "work-units.json": before["work_units"],
+                "verification.json": before["verification"],
+                "contract.json": before["contract"],
+                "issue.json": before["issue"],
+            },
+            mock.ANY,
+        )
+        self.agent.pr_edit.assert_called_once_with(self.target, "13", expected_pr_number=29)
+        self.agent.pr_create.assert_not_called()
+        self.assertEqual(after["work_units"], before["work_units"])
+        self.assertIn(b"WU-13-28", after["work_units"])
+        self.lifecycle.complete_blocked_publication_recovery.assert_called_once()
+
+    def test_blocked_invalid_or_moved_pr_fails_before_state_mutation(self) -> None:
+        before = {
+            "head": self.head, "branch": self.branch, "repository": self.repository,
+            "record": self.record, "work_units": b"units", "verification": b"verification",
+            "contract": b"contract", "issue": b"issue",
+            "state": b"- Base revision: " + b"b" * 40 + b"\n- Status: blocked\n",
+            "status": "blocked",
+        }
+        exact = {
+            "number": 29, "headRefName": self.branch, "baseRefName": "main",
+            "headRefOid": self.head, "isDraft": True,
+            "isCrossRepository": False, "state": "OPEN",
+        }
+        cases = [
+            ("number", {**exact, "number": 0}),
+            ("bool number", {**exact, "number": True}),
+            ("branch", {**exact, "headRefName": "task/other"}),
+            ("base", {**exact, "baseRefName": "other"}),
+            ("head", {**exact, "headRefOid": "c" * 40}),
+            ("ready", {**exact, "isDraft": False}),
+            ("closed", {**exact, "state": "CLOSED"}),
+            ("cross repository", {**exact, "isCrossRepository": True}),
+        ]
+        self.agent.default_branch.return_value = "main"
+        for name, candidate in cases:
+            with self.subTest(name=name):
+                self.agent.reset_mock()
+                self.agent.default_branch.return_value = "main"
+                self.agent.pr_for_branch.return_value = candidate
+                with mock.patch.object(bridge, "_publication_snapshot", return_value=before), \
+                     self.assertRaises(bridge.BridgeError):
+                    bridge._publication_recover(self.modules, self.target, "131")
+                self.lifecycle.recover_blocked_publication_ready.assert_not_called()
+                self.agent.pr_edit.assert_not_called()
+
+    def test_blocked_pr_replacement_before_state_mutation_fails_closed(self) -> None:
+        before = {
+            "head": self.head, "branch": self.branch, "repository": self.repository,
+            "record": self.record, "work_units": b"units", "verification": b"verification",
+            "contract": b"contract", "issue": b"issue",
+            "state": b"- Base revision: " + b"b" * 40 + b"\n- Status: blocked\n",
+            "status": "blocked",
+        }
+        exact = {
+            "number": 29, "headRefName": self.branch, "baseRefName": "main",
+            "headRefOid": self.head, "isDraft": True,
+            "isCrossRepository": False, "state": "OPEN",
+        }
+        self.publication.canonical_metadata.return_value = ("title", "body")
+        for field, changed in (
+            ("number", 30), ("headRefName", "task/other"),
+            ("baseRefName", "other"), ("headRefOid", "c" * 40),
+            ("isDraft", False), ("state", "CLOSED"),
+        ):
+            with self.subTest(field=field):
+                self.agent.reset_mock()
+                self.agent.default_branch.return_value = "main"
+                self.agent.pr_for_branch.side_effect = [exact, {**exact, field: changed}]
+                with mock.patch.object(bridge, "_publication_snapshot", side_effect=[before, before]), \
+                     mock.patch.object(bridge, "_target_git", return_value=""), \
+                     self.assertRaises(bridge.BridgeError):
+                    bridge._publication_recover(self.modules, self.target, "131")
+                self.lifecycle.recover_blocked_publication_ready.assert_not_called()
+                self.agent.pr_edit.assert_not_called()
+
+    def test_blocked_default_branch_move_before_state_mutation_fails_closed(self) -> None:
+        before = {
+            "head": self.head, "branch": self.branch, "repository": self.repository,
+            "record": self.record, "work_units": b"units", "verification": b"verification",
+            "contract": b"contract", "issue": b"issue",
+            "state": b"- Base revision: " + b"b" * 40 + b"\n- Status: blocked\n",
+            "status": "blocked",
+        }
+        exact = {
+            "number": 29, "headRefName": self.branch, "baseRefName": "main",
+            "headRefOid": self.head, "isDraft": True,
+            "isCrossRepository": False, "state": "OPEN",
+        }
+        self.agent.default_branch.side_effect = ["main", "moved"]
+        self.agent.pr_for_branch.return_value = exact
+        self.publication.canonical_metadata.return_value = ("title", "body")
+        with mock.patch.object(bridge, "_publication_snapshot", side_effect=[before, before]), \
+             mock.patch.object(bridge, "_target_git", return_value=""), \
+             self.assertRaisesRegex(bridge.BridgeError, "default branch changed"):
+            bridge._publication_recover(self.modules, self.target, "131")
+        self.lifecycle.recover_blocked_publication_ready.assert_not_called()
+
+    def test_blocked_authority_change_before_state_mutation_fails_closed(self) -> None:
+        before = {
+            "head": self.head, "branch": self.branch, "repository": self.repository,
+            "record": self.record, "work_units": b"units", "verification": b"verification",
+            "contract": b"contract", "issue": b"issue",
+            "state": b"- Base revision: " + b"b" * 40 + b"\n- Status: blocked\n",
+            "status": "blocked",
+        }
+        exact = {
+            "number": 29, "headRefName": self.branch, "baseRefName": "main",
+            "headRefOid": self.head, "isDraft": True,
+            "isCrossRepository": False, "state": "OPEN",
+        }
+        self.agent.default_branch.return_value = "main"
+        self.agent.pr_for_branch.return_value = exact
+        self.publication.canonical_metadata.return_value = ("title", "body")
+        for field, changed in (
+            ("status", "planning"), ("head", "c" * 40),
+            ("branch", "task/other"), ("repository", "other/repository"),
+            ("work_units", b"changed"), ("verification", b"changed"),
+            ("contract", b"changed"), ("issue", b"changed"),
+        ):
+            with self.subTest(field=field):
+                self.agent.reset_mock()
+                self.agent.default_branch.return_value = "main"
+                self.agent.pr_for_branch.return_value = exact
+                moved = {**before, field: changed}
+                with mock.patch.object(bridge, "_publication_snapshot", side_effect=[before, moved]), \
+                     mock.patch.object(bridge, "_target_git", return_value=""), \
+                     self.assertRaisesRegex(bridge.BridgeError, "authority changed"):
+                    bridge._publication_recover(self.modules, self.target, "131")
+                self.lifecycle.recover_blocked_publication_ready.assert_not_called()
+
+    def test_interrupted_blocked_recovery_retry_without_bound_pr_fails_closed(self) -> None:
+        ready = {
+            "head": self.head, "branch": self.branch, "repository": self.repository,
+            "record": self.record, "work_units": b"units", "verification": b"verification",
+            "contract": b"contract", "issue": b"issue",
+            "state": b"- Base revision: " + b"b" * 40 + b"\n- Status: publication-ready\n",
+            "status": "publication-ready",
+        }
+        receipt = bridge._publication_recovery_receipt(
+            self.target, "131", ready, "main", 29
+        )
+        self.agent.default_branch.return_value = "main"
+        self.agent.pr_for_branch.return_value = None
+        with mock.patch.object(bridge, "_publication_snapshot", return_value=ready), \
+             mock.patch.object(bridge, "_read_publication_recovery_receipt", return_value=receipt), \
+             self.assertRaisesRegex(bridge.BridgeError, "receipt-bound Draft PR"):
+            bridge._publication_recover(self.modules, self.target, "131")
+        self.agent.pr_create.assert_not_called()
+        self.agent.pr_edit.assert_not_called()
+        self.agent.gh.assert_not_called()
+
+    def test_interrupted_blocked_recovery_retry_rejects_replacement_pr(self) -> None:
+        ready = {
+            "head": self.head, "branch": self.branch, "repository": self.repository,
+            "record": self.record, "work_units": b"units", "verification": b"verification",
+            "contract": b"contract", "issue": b"issue",
+            "state": b"- Base revision: " + b"b" * 40 + b"\n- Status: publication-ready\n",
+            "status": "publication-ready",
+        }
+        receipt = bridge._publication_recovery_receipt(
+            self.target, "131", ready, "main", 29
+        )
+        replacement = {
+            "number": 30, "headRefName": self.branch, "baseRefName": "main",
+            "headRefOid": self.head, "isDraft": True,
+            "isCrossRepository": False, "state": "OPEN",
+        }
+        self.agent.default_branch.return_value = "main"
+        self.agent.pr_for_branch.return_value = replacement
+        with mock.patch.object(bridge, "_publication_snapshot", return_value=ready), \
+             mock.patch.object(bridge, "_read_publication_recovery_receipt", return_value=receipt), \
+             self.assertRaisesRegex(bridge.BridgeError, "differs from recovery receipt"):
+            bridge._publication_recover(self.modules, self.target, "131")
+        self.agent.pr_create.assert_not_called()
+        self.agent.pr_edit.assert_not_called()
+
+    def test_interrupted_blocked_recovery_retry_converges_same_pr_and_consumes_receipt(self) -> None:
+        ready = {
+            "head": self.head, "branch": self.branch, "repository": self.repository,
+            "record": self.record, "work_units": b"units", "verification": b"verification",
+            "contract": b"contract", "issue": b"issue",
+            "state": b"- Base revision: " + b"b" * 40 + b"\n- Status: publication-ready\n",
+            "status": "publication-ready",
+        }
+        blocked = {
+            **ready,
+            "state": ready["state"].replace(b"publication-ready", b"blocked"),
+            "status": "blocked",
+        }
+        final = {
+            **ready,
+            "state": ready["state"].replace(b"publication-ready", b"draft-pr-created"),
+            "status": "draft-pr-created",
+        }
+        exact = {
+            "number": 29, "headRefName": self.branch, "baseRefName": "main",
+            "headRefOid": self.head, "isDraft": True,
+            "isCrossRepository": False, "state": "OPEN", "body": "canonical",
+        }
+        self.agent.default_branch.return_value = "main"
+        self.agent.pr_for_branch.return_value = exact
+        self.publication.canonical_metadata.return_value = ("title", "canonical")
+        captured_receipts: list[bytes] = []
+
+        def interrupt_after_cas(
+            _record: object,
+            _task: str,
+            _state: bytes,
+            _evidence: dict,
+            receipt: bytes,
+        ) -> None:
+            captured_receipts.append(receipt)
+            raise RuntimeError("interrupted after durable publication-ready CAS")
+
+        self.lifecycle.recover_blocked_publication_ready.side_effect = interrupt_after_cas
+        with mock.patch.object(bridge, "_publication_snapshot", side_effect=[blocked, blocked]), \
+             mock.patch.object(bridge, "_read_publication_recovery_receipt", return_value=None), \
+             mock.patch.object(bridge, "_target_git", return_value=""), \
+             self.assertRaisesRegex(bridge.BridgeError, "interrupted after durable"):
+            bridge._publication_recover(self.modules, self.target, "131")
+        self.agent.pr_prepare.assert_not_called()
+        self.agent.pr_edit.assert_not_called()
+        self.agent.pr_create.assert_not_called()
+        self.assertEqual(len(captured_receipts), 1)
+
+        receipt = captured_receipts[0]
+        self.agent.reset_mock()
+        self.lifecycle.reset_mock()
+        self.lifecycle.recover_blocked_publication_ready.side_effect = None
+        self.agent.default_branch.return_value = "main"
+        self.agent.pr_for_branch.return_value = exact
+        self.agent._validated_local_metadata.return_value = (
+            "title", Path("/tmp/body"), "canonical"
+        )
+        with mock.patch.object(bridge, "_publication_snapshot", side_effect=[ready, ready]), \
+             mock.patch.object(bridge, "_publication_snapshot_for_post", return_value=final), \
+             mock.patch.object(bridge, "_read_publication_recovery_receipt", return_value=receipt), \
+             mock.patch.object(bridge, "_target_git", return_value=""):
+            result = bridge._publication_recover(self.modules, self.target, "131")
+        self.assertEqual(result["pullRequest"]["number"], 29)
+        self.agent.pr_edit.assert_called_once_with(
+            self.target, "131", expected_pr_number=29
+        )
+        self.agent.pr_create.assert_not_called()
+        self.lifecycle.complete_blocked_publication_recovery.assert_called_once_with(
+            self.record,
+            "131",
+            final["state"],
+            {
+                "work-units.json": ready["work_units"],
+                "verification.json": ready["verification"],
+                "contract.json": ready["contract"],
+                "issue.json": ready["issue"],
+            },
+            receipt,
+        )
+
+    def test_receipt_is_retained_when_pr_changes_before_consumption(self) -> None:
+        ready = {
+            "head": self.head, "branch": self.branch, "repository": self.repository,
+            "record": self.record, "work_units": b"units", "verification": b"verification",
+            "contract": b"contract", "issue": b"issue",
+            "state": b"- Base revision: " + b"b" * 40 + b"\n- Status: publication-ready\n",
+            "status": "publication-ready",
+        }
+        final = {
+            **ready,
+            "state": ready["state"].replace(b"publication-ready", b"draft-pr-created"),
+            "status": "draft-pr-created",
+        }
+        receipt = bridge._publication_recovery_receipt(
+            self.target, "131", ready, "main", 29
+        )
+        exact = {
+            "number": 29, "headRefName": self.branch, "baseRefName": "main",
+            "headRefOid": self.head, "isDraft": True,
+            "isCrossRepository": False, "state": "OPEN", "body": "canonical",
+        }
+        replacement = {**exact, "number": 30}
+        self.agent.default_branch.return_value = "main"
+        self.agent.pr_for_branch.side_effect = [exact, exact, exact, exact, replacement]
+        self.agent._validated_local_metadata.return_value = (
+            "title", Path("/tmp/body"), "canonical"
+        )
+        with mock.patch.object(bridge, "_publication_snapshot", side_effect=[ready, ready]), \
+             mock.patch.object(bridge, "_publication_snapshot_for_post", return_value=final), \
+             mock.patch.object(bridge, "_read_publication_recovery_receipt", return_value=receipt), \
+             mock.patch.object(bridge, "_target_git", return_value=""), \
+             self.assertRaisesRegex(bridge.BridgeError, "changed before receipt consumption"):
+            bridge._publication_recover(self.modules, self.target, "131")
+        self.lifecycle.complete_blocked_publication_recovery.assert_not_called()
+
     def test_stale_verification_and_effective_reviewer_fail_before_create(self) -> None:
+        self.lifecycle.state_status.return_value = "blocked"
         for failure in (
             "project verification evidence is stale",
             "required reviewer Work Unit is not completed",
@@ -203,6 +569,7 @@ class PublicationRecoveryBridgeTest(unittest.TestCase):
         for name, mutate in cases.items():
             with self.subTest(name=name):
                 self.setUp()
+                self.lifecycle.state_status.return_value = "blocked"
                 mutate()
                 git = (lambda *args, **kwargs: "tracked\n") if name == "dirty target" else self.snapshot_git
                 with mock.patch.object(bridge, "_target_git", side_effect=git), \
@@ -210,6 +577,57 @@ class PublicationRecoveryBridgeTest(unittest.TestCase):
                       mock.patch.object(bridge, "_state_bytes", side_effect=lambda _root, n, *_: n.encode()), \
                      self.assertRaises(bridge.BridgeError):
                     bridge._publication_snapshot(self.modules, self.target, "131")
+
+    def test_blocked_local_or_remote_head_mismatch_is_rejected(self) -> None:
+        self.lifecycle.state_status.return_value = "blocked"
+
+        def local_mismatch(*args: str, **_: object) -> str:
+            if args[:2] == ("rev-parse", "--verify"):
+                return self.head if args[2] == "HEAD^{commit}" else "c" * 40
+            return ""
+
+        with mock.patch.object(bridge, "_target_git", side_effect=local_mismatch), \
+             mock.patch.object(bridge, "_optional_state_bytes", return_value=None), \
+             self.assertRaisesRegex(bridge.BridgeError, "HEAD.*differ"):
+            bridge._publication_snapshot(self.modules, self.target, "131")
+        with mock.patch.object(bridge, "_target_git", side_effect=self.snapshot_git), \
+             mock.patch.object(bridge, "_remote_branch_head", return_value="c" * 40), \
+             mock.patch.object(bridge, "_optional_state_bytes", return_value=None), \
+             self.assertRaisesRegex(bridge.BridgeError, "remote Task branch"):
+            bridge._publication_snapshot(self.modules, self.target, "131")
+
+    def test_blocked_unresolved_contract_is_rejected_before_evidence_or_pr(self) -> None:
+        self.lifecycle.state_status.return_value = "blocked"
+        self.lifecycle.require_resolved_contract.side_effect = RuntimeError("contract mismatch")
+        with mock.patch.object(bridge, "_target_git", side_effect=self.snapshot_git), \
+             self.assertRaisesRegex(bridge.BridgeError, "contract mismatch"):
+            bridge._publication_snapshot(self.modules, self.target, "131")
+        self.publication.verification_evidence.assert_not_called()
+        self.agent.pr_for_branch.assert_not_called()
+
+    def test_blocked_missing_current_reviewer_metadata_rejects_before_state_mutation(self) -> None:
+        before = {
+            "head": self.head, "branch": self.branch, "repository": self.repository,
+            "record": self.record, "work_units": b"units", "verification": b"verification",
+            "contract": b"contract", "issue": b"issue",
+            "state": b"- Base revision: " + b"b" * 40 + b"\n- Status: blocked\n",
+            "status": "blocked",
+        }
+        exact = {
+            "number": 29, "headRefName": self.branch, "baseRefName": "main",
+            "headRefOid": self.head, "isDraft": True,
+            "isCrossRepository": False, "state": "OPEN",
+        }
+        self.agent.default_branch.return_value = "main"
+        self.agent.pr_for_branch.return_value = exact
+        self.publication.canonical_metadata.side_effect = RuntimeError(
+            "publication requires a completed reviewer Work Unit"
+        )
+        with mock.patch.object(bridge, "_publication_snapshot", return_value=before), \
+             mock.patch.object(bridge, "_target_git", return_value=""), \
+             self.assertRaisesRegex(bridge.BridgeError, "completed reviewer"):
+            bridge._publication_recover(self.modules, self.target, "131")
+        self.lifecycle.recover_blocked_publication_ready.assert_not_called()
 
     def test_unsafe_config_is_rejected(self) -> None:
         with mock.patch.object(bridge, "_pinned_run", return_value=mock.Mock(stdout="core.sshCommand\0")):
@@ -254,7 +672,7 @@ Repair AgentKnowledgeVault PR #29 publication metadata.
 
 ## Current state
 
-- Status: publication-ready
+- Status: blocked
 - Blockers: none
 - Unverified: none
 

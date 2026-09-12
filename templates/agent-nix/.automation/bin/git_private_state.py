@@ -22,7 +22,11 @@ HASH_RE = re.compile(r"[0-9a-f]{64}")
 OID_RE = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
 REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 SHARED_DIRS = ("cleanup", "integration", "discard-pristine", "automation-maintenance")
-FIXED_AUTHORITY_FILES = {"authority.json", "source-recovery-proof.json"}
+FIXED_AUTHORITY_FILES = {
+    "authority.json",
+    "source-recovery-proof.json",
+    "publication-recovery.json",
+}
 LOCK_FILES = {"cleanup.lock", "migration.lock"}
 TEMP_RE = re.compile(r"\.(?:migrate|record)\.[0-9]+\.[0-9a-f]{16}")
 _GIT_EXECUTABLE = "git"
@@ -96,6 +100,11 @@ def common_state(root: Path) -> Path:
 
 def admin_maintenance(root: Path) -> Path:
     return admin_git_dir(root) / NAMESPACE / "automation-maintenance"
+
+
+def publication_recovery_receipt(root: Path) -> Path:
+    """Return the protected receipt path in this worktree's Git admin dir."""
+    return admin_maintenance(root) / "publication-recovery.json"
 
 
 def cleanup_receipt(root: Path, task: str) -> Path:
@@ -564,6 +573,41 @@ def _validate_authority_topology(path: Path, content: bytes, layout: Topology) -
     return admin
 
 
+def _validate_publication_recovery_topology(
+    path: Path, value: dict, layout: Topology
+) -> Path:
+    """Bind a publication recovery receipt to its exact worktree and HEAD."""
+    admin = _validate_authority_topology(path, json.dumps(value).encode(), layout)
+    worktree = Path(value["worktree"])
+    try:
+        result = subprocess.run(
+            [_GIT_EXECUTABLE, "-C", str(worktree), "rev-parse", "--verify", "HEAD"],
+            text=True,
+            capture_output=True,
+            check=False,
+            env={
+                key: value
+                for key, value in os.environ.items()
+                if not key.startswith("GIT_")
+            } | {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_TERMINAL_PROMPT": "0",
+            },
+        )
+        actual_head = result.stdout.strip()
+    except OSError as exc:
+        raise GitPrivateStateError(
+            f"publication recovery worktree HEAD is unreadable: {path}"
+        ) from exc
+    if result.returncode != 0 or not _valid_oid(actual_head):
+        raise GitPrivateStateError(f"publication recovery worktree HEAD is unreadable: {path}")
+    if value["head"] != actual_head:
+        raise GitPrivateStateError(f"publication recovery HEAD does not match worktree: {path}")
+    return admin
+
+
 def _validate_legacy_content(path: Path, content: bytes) -> None:
     directory = path.parent.name
     name = path.name
@@ -606,6 +650,35 @@ def _validate_legacy_content(path: Path, content: bytes) -> None:
             and _valid_oid(value.get("base_revision"))
             and _valid_oid(value.get("local_head"))
             and value.get("local_head").casefold() == value.get("base_revision").casefold()
+        )
+    elif name == "publication-recovery.json":
+        required = {
+            "schema_version", "kind", "repository", "task_id", "worktree", "branch",
+            "head", "base_branch", "base_revision", "pr_number",
+            "blocked_state_sha256", "publication_ready_state_sha256",
+            "draft_pr_created_state_sha256", "work_units_sha256", "verification_sha256",
+            "contract_sha256", "issue_sha256",
+        }
+        valid = (
+            set(value) == required
+            and value.get("schema_version") == 1
+            and value.get("kind") == "blocked-publication-recovery"
+            and _valid_repository(value.get("repository"))
+            and _valid_task_id(value.get("task_id"))
+            and _valid_absolute_path(value.get("worktree"))
+            and _valid_task_branch(value.get("branch"), value.get("task_id"))
+            and _valid_oid(value.get("head"))
+            and _valid_nonempty(value.get("base_branch"))
+            and _valid_oid(value.get("base_revision"))
+            and isinstance(value.get("pr_number"), int)
+            and not isinstance(value.get("pr_number"), bool)
+            and value.get("pr_number") > 0
+            and all(_valid_digest(value.get(field)) for field in (
+                "blocked_state_sha256", "publication_ready_state_sha256",
+                "draft_pr_created_state_sha256", "work_units_sha256",
+                "verification_sha256", "contract_sha256",
+            ))
+            and (value.get("issue_sha256") is None or _valid_digest(value.get("issue_sha256")))
         )
     elif name == "source-recovery-proof.json":
         required = {
@@ -685,7 +758,12 @@ def _scan_shared_legacy(layout: Topology) -> tuple[list[tuple[Path, Path]], Path
                 content = read_bytes(child)
                 _validate_legacy_content(child, content)
                 _validate_authority_filename(child, content)
-                authority_admin = _validate_authority_topology(child, content, layout)
+                authority_value = _legacy_json(content, child)
+                authority_admin = (
+                    _validate_publication_recovery_topology(child, authority_value, layout)
+                    if child.name == "publication-recovery.json"
+                    else _validate_authority_topology(child, content, layout)
+                )
             if child.name in FIXED_AUTHORITY_FILES:
                 if authority_admin not in {layout.common, layout.admin}:
                     raise GitPrivateStateError(
@@ -723,7 +801,13 @@ def _scan_admin_legacy(layout: Topology) -> list[tuple[Path, Path]]:
         content = read_bytes(child)
         _validate_legacy_content(child, content)
         _validate_authority_filename(child, content)
-        if _validate_authority_topology(child, content, layout) != layout.admin:
+        authority_value = _legacy_json(content, child)
+        owner = (
+            _validate_publication_recovery_topology(child, authority_value, layout)
+            if child.name == "publication-recovery.json"
+            else _validate_authority_topology(child, content, layout)
+        )
+        if owner != layout.admin:
             raise GitPrivateStateError(f"fixed authority is outside its worktree admin: {child}")
         pairs.append((child, layout.admin / NAMESPACE / "automation-maintenance" / child.name))
     _validate_legacy_relations(
@@ -826,7 +910,12 @@ def _validate_canonical(
                 _validate_legacy_content(child, content)
                 _validate_authority_filename(child, content)
                 if entry.name == "automation-maintenance":
-                    authority_admin = _validate_authority_topology(child, content, layout)
+                    authority_value = _legacy_json(content, child)
+                    authority_admin = (
+                        _validate_publication_recovery_topology(child, authority_value, layout)
+                        if child.name == "publication-recovery.json"
+                        else _validate_authority_topology(child, content, layout)
+                    )
                     if child.name in FIXED_AUTHORITY_FILES and authority_admin != layout.common:
                         raise GitPrivateStateError(
                             f"fixed authority is outside its worktree admin: {child}"
@@ -863,7 +952,13 @@ def _validate_canonical(
                     content = read_bytes(child, "canonical private-state record")
                     _validate_legacy_content(child, content)
                     _validate_authority_filename(child, content)
-                    if _validate_authority_topology(child, content, layout) != layout.admin:
+                    authority_value = _legacy_json(content, child)
+                    owner = (
+                        _validate_publication_recovery_topology(child, authority_value, layout)
+                        if child.name == "publication-recovery.json"
+                        else _validate_authority_topology(child, content, layout)
+                    )
+                    if owner != layout.admin:
                         raise GitPrivateStateError(
                             f"fixed authority is outside its worktree admin: {child}"
                         )

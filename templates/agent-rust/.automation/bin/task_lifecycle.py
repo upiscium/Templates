@@ -959,6 +959,156 @@ def mark_task_publication_state(
     return "transitioned"
 
 
+def recover_blocked_publication_ready(
+    record: WorktreeRecord,
+    task: str,
+    expected_state: bytes,
+    expected_evidence: dict[str, bytes | None],
+    recovery_receipt: bytes,
+) -> str:
+    """CAS a proven publication-only blocked Task to publication-ready.
+
+    This deliberately is not part of the general transition table: recovery
+    may use it only after its external publication evidence has been checked.
+    """
+    validate_task(task)
+    if not isinstance(expected_state, bytes):
+        raise LifecycleError("expected Task State CAS value must be bytes")
+    evidence_names = {"work-units.json", "verification.json", "contract.json", "issue.json"}
+    if set(expected_evidence) != evidence_names or any(
+        value is not None and not isinstance(value, bytes)
+        for value in expected_evidence.values()
+    ):
+        raise LifecycleError("expected publication evidence CAS values are invalid")
+    require_resolved_contract(record, task)
+    import task_contract
+
+    receipt_path = private_state.publication_recovery_receipt(record.path)
+    try:
+        private_state.prepare(record.path, admin=True)
+        receipt_value = json.loads(recovery_receipt.decode("utf-8"))
+        private_state._validate_legacy_content(receipt_path, recovery_receipt)
+        private_state._validate_publication_recovery_topology(
+            receipt_path, receipt_value, private_state.topology(record.path)
+        )
+        with private_state.mutation_lock(record.path, admin=True):
+            try:
+                receipt_path.lstat()
+            except FileNotFoundError:
+                private_state.exclusive_write_bytes(
+                    receipt_path, recovery_receipt, _lock_held=True
+                )
+            else:
+                existing = private_state.read_bytes(
+                    receipt_path, "publication recovery receipt"
+                )
+                if existing != recovery_receipt:
+                    raise LifecycleError(
+                        "conflicting publication recovery receipt already exists"
+                    )
+    except LifecycleError:
+        raise
+    except Exception as exc:
+        raise LifecycleError("cannot durably bind blocked publication recovery") from exc
+
+    try:
+        state_lock = task_contract.contract_state_lock(record.path)
+    except AttributeError as exc:  # pragma: no cover - verified module contract
+        raise LifecycleError("canonical Task State lock is unavailable") from exc
+    with state_lock as directory_fd:
+        current = current_worktree(record.path)
+        if current != record:
+            raise LifecycleError("local Task worktree identity changed")
+        registered = worktree_for_task(record.path, task)
+        if registered != record:
+            raise LifecycleError("Task worktree registration identity changed")
+        assert_task_identity(record, task)
+        path = state_path(record.path)
+        try:
+            actual = task_contract._read_state_file(directory_fd, "task.md")
+            actual_evidence = {
+                name: task_contract._read_state_file(directory_fd, name)
+                for name in evidence_names
+            }
+            task_contract._assert_state_dir_binding(record.path, directory_fd)
+        except Exception as exc:
+            raise LifecycleError(f"cannot read Task State for guarded recovery: {path}") from exc
+        if actual != expected_state:
+            raise LifecycleError("Task State changed before guarded blocked recovery")
+        if actual_evidence != expected_evidence:
+            raise LifecycleError("publication evidence changed before guarded blocked recovery")
+        try:
+            text = actual.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise LifecycleError("Task State is not valid UTF-8") from exc
+        updated, count = re.subn(
+            r"(?m)^- Status: blocked$", "- Status: publication-ready", text, count=1
+        )
+        if count != 1:
+            raise LifecycleError("cannot update blocked Task State status")
+        try:
+            task_contract._write_state_file(
+                directory_fd, "task.md", updated.encode("utf-8")
+            )
+            task_contract._assert_state_dir_binding(record.path, directory_fd)
+        except Exception as exc:
+            raise LifecycleError(f"cannot update Task State for guarded recovery: {path}") from exc
+    return "transitioned"
+
+
+def complete_blocked_publication_recovery(
+    record: WorktreeRecord,
+    task: str,
+    expected_state: bytes,
+    expected_evidence: dict[str, bytes | None],
+    recovery_receipt: bytes,
+) -> str:
+    """Consume the exact recovery receipt only after Draft convergence."""
+    validate_task(task)
+    evidence_names = {"work-units.json", "verification.json", "contract.json", "issue.json"}
+    if not isinstance(expected_state, bytes) or set(expected_evidence) != evidence_names:
+        raise LifecycleError("expected recovered publication subject is invalid")
+    require_resolved_contract(record, task)
+    import task_contract
+
+    receipt_path = private_state.publication_recovery_receipt(record.path)
+    try:
+        private_state.prepare(record.path, admin=True)
+        with private_state.mutation_lock(record.path, admin=True):
+            receipt_content, receipt_identity = private_state.read_bytes_identity(
+                receipt_path, "publication recovery receipt"
+            )
+            if receipt_content != recovery_receipt:
+                raise LifecycleError("publication recovery receipt changed before consumption")
+            with task_contract.contract_state_lock(record.path) as directory_fd:
+                current = current_worktree(record.path)
+                registered = worktree_for_task(record.path, task)
+                if current != record or registered != record:
+                    raise LifecycleError("Task worktree identity changed before receipt consumption")
+                assert_task_identity(record, task)
+                actual_state = task_contract._read_state_file(directory_fd, "task.md")
+                actual_evidence = {
+                    name: task_contract._read_state_file(directory_fd, name)
+                    for name in evidence_names
+                }
+                task_contract._assert_state_dir_binding(record.path, directory_fd)
+                if actual_state != expected_state or actual_evidence != expected_evidence:
+                    raise LifecycleError(
+                        "recovered publication subject changed before receipt consumption"
+                    )
+                private_state.unlink(
+                    receipt_path,
+                    expected_identity=receipt_identity,
+                    expected_content=recovery_receipt,
+                    _lock_held=True,
+                )
+    except LifecycleError:
+        raise
+    except Exception as exc:
+        raise LifecycleError("cannot consume blocked publication recovery receipt") from exc
+    return "consumed"
+
+
 def mark_task_merged_from_integration(record: WorktreeRecord, task: str) -> str:
     """Dedicated terminal transition used only after guarded merge reconciliation."""
     validate_task(task)

@@ -749,7 +749,7 @@ generic authority-expansion or arbitrary consumer-mutation primitive. AKV
 #22/#23 motivate this first-adoption example, but their execution is not
 claimed. Agent Core VERSION remains 3.
 
-#### Issue #131 source-side publication recovery
+#### Issues #131 and #148 source-side publication recovery
 
 `agent-core::publication-recover` is a bounded recovery boundary for an
 already-complete in-flight consumer Task whose installed publication tooling is
@@ -768,7 +768,8 @@ execution is pinned and environment-sanitized. Consumer-local Agent Core code
 never becomes publication authority.
 
 The bridge binds the exact registered non-default worktree, Task/branch/contract
-identity, initial `publication-ready` or `draft-pr-created` state, local
+identity, initial `publication-ready`, `draft-pr-created`, or narrowly
+recoverable publication-only `blocked` state, local
 worktree and branch HEAD, GitHub remote branch OID, canonical repository, clean
 product status, fresh head-bound verification receipt, and effective review
 evidence. It uses the verified source implementation's canonical preparation,
@@ -778,6 +779,33 @@ Task without that existing Draft fails closed. Product HEAD and tracked bytes
 remain unchanged; Work Unit, verification, and contract evidence remain
 byte-identical. Task State may perform only the guarded `publication-ready ->
 draft-pr-created` transition; from `draft-pr-created` it remains byte-identical.
+
+`blocked` is only a recovery candidate, never ordinary publication authority.
+Before any lifecycle or GitHub mutation, the bridge requires and captures an
+existing positive-numbered exact same-repository OPEN Draft at the Task branch,
+default base, and current head; regenerates canonical metadata from fresh
+current-head verification and effective reviews; then rechecks Task, product,
+remote, repository, evidence, and the same PR identity. A dedicated internal
+lifecycle helper performs a locked byte-CAS that changes only `blocked ->
+publication-ready`; it is not exposed through Just/CLI and does not alter the
+generic transition table. Before that CAS it durably publishes a strict
+Git-private receipt binding the exact repository, Task/worktree, branch, HEAD,
+base, original PR number, Task State variants, and immutable evidence digests.
+Any retry while the receipt exists must resolve that original PR; a missing or
+replacement PR fails before GitHub mutation and never selects creation. The
+bridge then uses canonical preparation and
+number-bound edit to reach `draft-pr-created`. A blocked Task without a PR fails
+before state mutation and never selects PR creation. Work Unit, verification,
+contract, optional Issue, historical failure, product, and non-status Task State
+bytes remain unchanged. If interrupted after the CAS, retry continues through
+the receipt-bound publication-ready path on the same Draft. The exact receipt
+remains across edit/state interruption and is consumed only after final
+postconditions prove `draft-pr-created`; completed recovery leaves no stale
+authority. The bridge re-reads and validates the receipt-bound canonical Draft
+immediately before receipt consumption. GitHub does not provide an atomic
+compare-and-edit precondition for title/body updates, so canonical `pr_edit`
+minimizes that remote race with identity validation immediately before and
+after its mutation and fails if either observation differs.
 
 Canonical `pr_create` remains strict and reconciles only an already-canonical
 existing Draft. The bridge does not broaden it: after preparation, absence of a
