@@ -736,13 +736,133 @@ None yet.
             mock.patch.object(agent_core, "_publication_context", return_value=("task/19-fix", {"record": mock.sentinel.record, "status": "draft-pr-created", "repository": "example/repo"}, self.HEAD)),
             mock.patch.object(agent_core, "_validated_local_metadata", return_value=("title", Path("body"), "canonical")),
             mock.patch.object(agent_core, "default_branch", return_value="main"),
-            mock.patch.object(agent_core, "pr_for_branch", return_value=ready),
+            mock.patch.object(agent_core, "pr_for_branch", side_effect=[ready, ready]),
             mock.patch.object(agent_core, "gh") as gh,
             mock.patch.object(agent_core.lifecycle, "mark_task_publication_state") as transition,
         ):
             agent_core.pr_ready(Path("."), "19")
         gh.assert_not_called()
         transition.assert_called_once()
+
+    def test_pr_ready_expected_number_validation_precedes_lookup(self) -> None:
+        context = {"record": mock.sentinel.record, "status": "draft-pr-created", "repository": "example/repo"}
+        for expected in (True, False, 0, -1, "20"):
+            with self.subTest(expected=expected):
+                with (
+                    mock.patch.object(agent_core, "verify"),
+                    mock.patch.object(agent_core, "pr_for_branch") as resolve,
+                    mock.patch.object(agent_core, "gh") as gh,
+                ):
+                    with self.assertRaisesRegex(agent_core.AutomationError, "expected pull request number is invalid"):
+                        agent_core.pr_ready(Path("."), "19", expected_pr_number=expected)
+                    resolve.assert_not_called()
+                    gh.assert_not_called()
+
+    def test_pr_ready_expected_number_must_match_before_mutation(self) -> None:
+        pr = {"number": 20}
+        context = {"record": mock.sentinel.record, "status": "draft-pr-created", "repository": "example/repo"}
+        with (
+            mock.patch.object(agent_core, "verify"),
+            mock.patch.object(agent_core, "_publication_context", return_value=("task/19-fix", context, self.HEAD)),
+            mock.patch.object(agent_core, "_validated_local_metadata", return_value=("title", Path("body"), "canonical")),
+            mock.patch.object(agent_core, "default_branch", return_value="main"),
+            mock.patch.object(agent_core, "pr_for_branch", return_value=pr),
+            mock.patch.object(agent_core, "gh") as gh,
+        ):
+            with self.assertRaisesRegex(agent_core.AutomationError, "identity changed before mutation"):
+                agent_core.pr_ready(Path("."), "19", expected_pr_number=21)
+        gh.assert_not_called()
+
+    def test_pr_ready_exact_match_rechecks_before_ready_write(self) -> None:
+        draft = {"number": 20, "title": "title", "body": "canonical", "headRefName": "task/19-fix", "baseRefName": "main", "isDraft": True, "isCrossRepository": False, "state": "OPEN", "headRefOid": self.HEAD}
+        replacement = {**draft, "number": 21}
+        context = {"record": mock.sentinel.record, "status": "draft-pr-created", "repository": "example/repo"}
+        with (
+            mock.patch.object(agent_core, "verify"),
+            mock.patch.object(agent_core, "_publication_context", return_value=("task/19-fix", context, self.HEAD)),
+            mock.patch.object(agent_core, "_validated_local_metadata", return_value=("title", Path("body"), "canonical")),
+            mock.patch.object(agent_core, "default_branch", return_value="main"),
+            mock.patch.object(agent_core, "pr_for_branch", side_effect=[draft, replacement]),
+            mock.patch.object(agent_core, "gh") as gh,
+        ):
+            with self.assertRaisesRegex(agent_core.AutomationError, "identity changed before mutation"):
+                agent_core.pr_ready(Path("."), "19", expected_pr_number=20)
+        gh.assert_not_called()
+
+    def test_pr_ready_rejects_replacement_before_lifecycle_transition(self) -> None:
+        draft = {"number": 20, "title": "title", "body": "canonical", "headRefName": "task/19-fix", "baseRefName": "main", "isDraft": True, "isCrossRepository": False, "state": "OPEN", "headRefOid": self.HEAD}
+        ready = {**draft, "isDraft": False}
+        replacement = {**ready, "number": 21}
+        context = {"record": mock.sentinel.record, "status": "draft-pr-created", "repository": "example/repo"}
+        with (
+            mock.patch.object(agent_core, "verify"),
+            mock.patch.object(agent_core, "_publication_context", return_value=("task/19-fix", context, self.HEAD)),
+            mock.patch.object(agent_core, "_validated_local_metadata", return_value=("title", Path("body"), "canonical")),
+            mock.patch.object(agent_core, "default_branch", return_value="main"),
+            mock.patch.object(agent_core, "canonical_repository", return_value="example/repo"),
+            mock.patch.object(agent_core, "pr_for_branch", side_effect=[draft, draft, ready, replacement]),
+            mock.patch.object(agent_core, "gh"),
+            mock.patch.object(agent_core.lifecycle, "mark_task_publication_state") as transition,
+        ):
+            with self.assertRaisesRegex(agent_core.AutomationError, "before lifecycle transition"):
+                agent_core.pr_ready(Path("."), "19", expected_pr_number=20)
+        transition.assert_not_called()
+
+    def test_pr_ready_explicit_guard_rejects_context_drift(self) -> None:
+        draft = {"number": 20, "title": "title", "body": "canonical", "headRefName": "task/19-fix", "baseRefName": "main", "isDraft": True, "isCrossRepository": False, "state": "OPEN", "headRefOid": self.HEAD}
+        ready = {**draft, "isDraft": False}
+        initial = {"record": mock.sentinel.record, "status": "draft-pr-created", "repository": "example/repo"}
+        changed = {"record": mock.sentinel.other_record, "status": "draft-pr-created", "repository": "example/repo"}
+        with (
+            mock.patch.object(agent_core, "verify"),
+            mock.patch.object(agent_core, "_publication_context", side_effect=[("task/19-fix", initial, self.HEAD), ("task/19-fix", changed, self.HEAD)]),
+            mock.patch.object(agent_core, "_validated_local_metadata", return_value=("title", Path("body"), "canonical")),
+            mock.patch.object(agent_core, "default_branch", return_value="main"),
+            mock.patch.object(agent_core, "canonical_repository", return_value="example/repo"),
+            mock.patch.object(agent_core, "pr_for_branch", side_effect=[draft, draft, ready]),
+            mock.patch.object(agent_core, "gh"),
+            mock.patch.object(agent_core.lifecycle, "mark_task_publication_state") as transition,
+        ):
+            with self.assertRaisesRegex(agent_core.AutomationError, "publication context changed"):
+                agent_core.pr_ready(Path("."), "19", expected_pr_number=20)
+        transition.assert_not_called()
+
+    def test_pr_ready_explicit_guard_rejects_post_ready_metadata_drift(self) -> None:
+        draft = {"number": 20, "title": "title", "body": "canonical", "headRefName": "task/19-fix", "baseRefName": "main", "isDraft": True, "isCrossRepository": False, "state": "OPEN", "headRefOid": self.HEAD}
+        ready = {**draft, "isDraft": False}
+        context = {"record": mock.sentinel.record, "status": "draft-pr-created", "repository": "example/repo"}
+        with (
+            mock.patch.object(agent_core, "verify"),
+            mock.patch.object(agent_core, "_publication_context", return_value=("task/19-fix", context, self.HEAD)),
+            mock.patch.object(agent_core, "_validated_local_metadata", side_effect=[("title", Path("body"), "canonical"), ("changed", Path("body"), "canonical")]),
+            mock.patch.object(agent_core, "default_branch", return_value="main"),
+            mock.patch.object(agent_core, "canonical_repository", return_value="example/repo"),
+            mock.patch.object(agent_core, "pr_for_branch", side_effect=[draft, draft, ready]),
+            mock.patch.object(agent_core, "gh"),
+            mock.patch.object(agent_core.lifecycle, "mark_task_publication_state") as transition,
+        ):
+            with self.assertRaisesRegex(agent_core.AutomationError, "local publication metadata changed"):
+                agent_core.pr_ready(Path("."), "19", expected_pr_number=20)
+        transition.assert_not_called()
+
+    def test_pr_ready_none_preserves_normal_ready_flow(self) -> None:
+        draft = {"number": 20, "title": "title", "body": "canonical", "headRefName": "task/19-fix", "baseRefName": "main", "isDraft": True, "isCrossRepository": False, "state": "OPEN", "headRefOid": self.HEAD}
+        ready = {**draft, "isDraft": False}
+        context = {"record": mock.sentinel.record, "status": "draft-pr-created", "repository": "example/repo"}
+        with (
+            mock.patch.object(agent_core, "verify") as verify_mock,
+            mock.patch.object(agent_core, "_publication_context", return_value=("task/19-fix", context, self.HEAD)),
+            mock.patch.object(agent_core, "_validated_local_metadata", return_value=("title", Path("body"), "canonical")),
+            mock.patch.object(agent_core, "default_branch", return_value="main"),
+            mock.patch.object(agent_core, "canonical_repository", return_value="example/repo"),
+            mock.patch.object(agent_core, "pr_for_branch", side_effect=[draft, ready]),
+            mock.patch.object(agent_core, "gh") as gh,
+            mock.patch.object(agent_core.lifecycle, "mark_task_publication_state") as transition,
+        ):
+            agent_core.pr_ready(Path("."), "19")
+        gh.assert_called_once_with("pr", "ready", "20", "--repo", "example/repo", cwd=Path("."))
+        transition.assert_called_once_with(mock.sentinel.record, "19", "draft-pr-created", "integration-pending")
+        verify_mock.assert_called_once_with(Path("."), "19")
 
     def test_pr_ready_rejects_stale_live_body_before_write(self) -> None:
         live = {"number": 20, "title": "title", "body": "stale", "headRefName": "task/19-fix", "baseRefName": "main", "isDraft": True, "isCrossRepository": False, "state": "OPEN", "headRefOid": self.HEAD}
