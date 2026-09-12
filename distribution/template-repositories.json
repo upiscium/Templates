@@ -29,6 +29,12 @@
       "repository": "Template-Agent-Rust",
       "default_branch": "main",
       "description": "Generated Agent-ready Rust template. Source: upiscium/Templates; do not edit directly."
+    },
+    "agent-typescript-node": {
+      "published": true,
+      "repository": "Template-Agent-TypeScript-Node",
+      "default_branch": "main",
+      "description": "Generated Agent-ready TypeScript + Node.js + npm template. Source: upiscium/Templates; do not edit directly."
     }
   }
 }

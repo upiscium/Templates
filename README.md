@@ -13,6 +13,7 @@ agent-python     -> upiscium/Template-Agent-Python
 agent-rust       -> upiscium/Template-Agent-Rust
 agent-nix        -> upiscium/Template-Agent-Nix
 agent-cpp-cmake  -> upiscium/Template-Agent-Cpp-CMake
+agent-typescript-node -> upiscium/Template-Agent-TypeScript-Node
 ```
 
 The GitHub distribution repositories are generated artifacts synchronized from this repository; they are not independent sources of truth. See `docs/github-template-distribution.md` for setup, publishing, and ownership details.
@@ -25,6 +26,7 @@ nix flake init -t github:upiscium/Templates#agent-python
 nix flake init -t github:upiscium/Templates#agent-rust
 nix flake init -t github:upiscium/Templates#agent-nix
 nix flake init -t github:upiscium/Templates#agent-cpp-cmake
+nix flake init -t github:upiscium/Templates#agent-typescript-node
 ```
 
 Compatibility aliases remain available:
@@ -127,7 +129,7 @@ nix develop --command just template::adopt-apply /path/to/repository base
 nix develop --command just template::adopt-apply /path/to/repository python
 ```
 
-Auto-detection prefers CMake/Python/Rust markers; a standalone `flake.nix` selects Nix; unknown or ambiguous repositories fall back to `base`.
+Auto-detection prefers CMake/Python/Rust/TypeScript-Node markers; a standalone `flake.nix` selects Nix; unknown or ambiguous repositories fall back to `base`.
 
 Migrate a base-adopted repository by inspecting the read-only migration plan before changing Adapter-owned paths:
 
@@ -651,6 +653,7 @@ just template::render agent-python
 just template::render agent-rust
 just template::render agent-nix
 just template::render agent-cpp-cmake
+just template::render agent-typescript-node
 just template::render-all
 just template::check
 just template::distribution-verify

@@ -67,6 +67,10 @@
         path = ./templates/agent-rust;
         description = "Generated Agent-ready Rust repository scaffold";
       };
+      agent-typescript-node = {
+        path = ./templates/agent-typescript-node;
+        description = "Generated Agent-ready TypeScript + Node.js + npm repository scaffold";
+      };
     };
   };
 }

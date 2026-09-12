@@ -19,6 +19,10 @@
     "agent-rust": {
       "adapter": "rust",
       "description": "Generated Agent-ready Rust repository scaffold"
+    },
+    "agent-typescript-node": {
+      "adapter": "typescript-node",
+      "description": "Generated Agent-ready TypeScript + Node.js + npm repository scaffold"
     }
   }
 }

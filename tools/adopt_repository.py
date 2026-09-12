@@ -93,6 +93,7 @@ def detect_adapter(target: Path, adapters: set[str]) -> tuple[str, str, list[str
         ("cpp-cmake", "CMakeLists.txt"),
         ("python", "pyproject.toml"),
         ("rust", "Cargo.toml"),
+        ("typescript-node", "package.json"),
     ]
     primary = [
         (adapter, marker)
@@ -196,6 +197,19 @@ def materialized_bytes(source_path: Path) -> bytes:
     return source_path.read_bytes()
 
 
+def unsafe_destination_reason(root: Path, destination: Path) -> str | None:
+    current = root
+    for part in destination.relative_to(root).parts:
+        current = current / part
+        if current.is_symlink():
+            return f"destination path traverses symlink: {current.relative_to(root)}"
+    try:
+        destination.parent.resolve(strict=False).relative_to(root)
+    except ValueError:
+        return "destination parent resolves outside repository root"
+    return None
+
+
 def build_plan(source: Path, target: Path, requested_adapter: str) -> dict:
     root = repository_root(target)
     adapter, reason, detected = select_adapter(source, root, requested_adapter)
@@ -212,6 +226,12 @@ def build_plan(source: Path, target: Path, requested_adapter: str) -> dict:
         rel = relative.as_posix()
         destination = root / relative
         owner = entry.component
+
+        unsafe = unsafe_destination_reason(root, destination)
+        if unsafe:
+            blockers.append(f"{rel}: {unsafe}")
+            actions.append(Action(rel, "blocked", owner, unsafe))
+            continue
 
         if not destination.exists() and not destination.is_symlink():
             actions.append(Action(rel, "create", owner, "path does not exist"))
@@ -290,6 +310,9 @@ def apply_plan(source: Path, target: Path, requested_adapter: str) -> dict:
         rel = relative.as_posix()
         destination = root / relative
         action = action_by_path[rel]["action"]
+        unsafe = unsafe_destination_reason(root, destination)
+        if unsafe:
+            raise AdoptionError(f"adoption destination became unsafe for {rel}: {unsafe}")
         if action in {"noop", "preserve"}:
             continue
         destination.parent.mkdir(parents=True, exist_ok=True)
