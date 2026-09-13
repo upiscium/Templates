@@ -575,12 +575,14 @@ mod project 'just/project/mod.just'
         recipe = (ROOT / "components" / "agent-core" / ".automation" / "just" / "automation.just").read_text()
         self.assertIn("bootstrap-receipt source expected_revision:", recipe)
         self.assertIn(
-            "python3 {{quote(script)}} upgrade --source {{quote(source)}} "
+            "env PYTHONDONTWRITEBYTECODE=1 python3 -B {{quote(script)}} "
+            "upgrade --source {{quote(source)}} "
             "--expected-source-revision {{quote(expected_revision)}}",
             recipe,
         )
         self.assertIn(
-            "python3 {{quote(script)}} bootstrap-receipt --source {{quote(source)}} "
+            "env PYTHONDONTWRITEBYTECODE=1 python3 -B {{quote(script)}} "
+            "bootstrap-receipt --source {{quote(source)}} "
             "--expected-source-revision {{quote(expected_revision)}}",
             recipe,
         )

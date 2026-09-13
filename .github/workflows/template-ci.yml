@@ -44,9 +44,11 @@ jobs:
           set -euo pipefail
           target="$RUNNER_TEMP/${{ matrix.template }}"
           mkdir -p "$target"
-          cd "$target"
-          nix flake init -t "path:$GITHUB_WORKSPACE#${{ matrix.template }}"
-          if [ "${{ matrix.template }}" = agent-python ]; then
+           cd "$target"
+           nix flake init -t "path:$GITHUB_WORKSPACE#${{ matrix.template }}"
+           python3 -c 'from pathlib import Path; p = Path(".gitignore"); p.write_text(p.read_text().replace("__pycache__/\n", "").replace("*.py[oc]\n", ""))'
+           ! grep -qi pycache .gitignore
+           if [ "${{ matrix.template }}" = agent-python ]; then
             test ! -e flake.lock
             test ! -e uv.lock
             nix develop --no-write-lock-file --command just project::bootstrap smoke-project
@@ -103,9 +105,12 @@ jobs:
           set -euo pipefail
           target="$RUNNER_TEMP/${{ matrix.template }}"
           cd "$target"
-          nix develop --no-update-lock-file --command just agent::preflight
-          nix develop --no-update-lock-file --command just agent::doctor
-          nix develop --no-update-lock-file --command just agent::context
+           nix develop --no-update-lock-file --command just agent::preflight
+           nix develop --no-update-lock-file --command just agent::doctor
+           nix develop --no-update-lock-file --command just agent::context
+           nix develop --no-update-lock-file --command just automation::version
+           test -z "$(find .automation -type d -name __pycache__ -print -o -type f \( -name '*.pyc' -o -name '*.pyo' \) -print)"
+           test -z "$(git status --porcelain)"
       - name: Project Adapter smoke
         shell: bash
         run: |

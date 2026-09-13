@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -98,10 +99,15 @@ class BootstrapUpgradeBridgeTest(unittest.TestCase):
             "components/agent-core/.automation/bin/publication_metadata.py",
             "components/agent-core/.automation/bin/agent_core.py",
             "components/agent-core/.automation/bin/maintenance_lifecycle.py",
+            "components/agent-core/.automation/just/agent.just",
+            "components/agent-core/.automation/just/automation.just",
+            "components/agent-core/.automation/just/integrate.just",
+            "components/agent-core/.automation/just/repository.just",
         ):
             shutil.copy2(ROOT / relative, self.candidate / relative)
         self.git(self.candidate, "add", "tools/automation_recovery_bridge.py",
-                 "components/agent-core/.automation/bin")
+                 "components/agent-core/.automation/bin",
+                 "components/agent-core/.automation/just")
         self.git(
             self.candidate,
             "commit",
@@ -236,6 +242,17 @@ class BootstrapUpgradeBridgeTest(unittest.TestCase):
         admin = Path(self.git(self.task, "rev-parse", "--absolute-git-dir"))
         return admin / "agent-core/automation-maintenance/authority.json"
 
+    def pending_paths(self) -> list[str]:
+        paths: set[str] = set()
+        for arguments in (
+            ("diff", "--no-ext-diff", "--name-only", "-z"),
+            ("diff", "--no-ext-diff", "--cached", "--name-only", "-z"),
+            ("ls-files", "--others", "--exclude-standard", "-z"),
+        ):
+            output = subprocess.check_output(("git", *arguments), cwd=self.task)
+            paths.update(raw.decode("utf-8") for raw in output.split(b"\0") if raw)
+        return sorted(paths)
+
     def protected_files(self) -> dict[str, bytes]:
         """Capture the complete adapter/repository/product surface of the fixture."""
         result: dict[str, bytes] = {}
@@ -288,6 +305,61 @@ class BootstrapUpgradeBridgeTest(unittest.TestCase):
             "origin_main": self.main_revision, "origin_head": "refs/remotes/origin/main",
         })
         self.assertEqual(protected, {path: (self.task / path).read_bytes() for path in protected})
+
+    @unittest.skipUnless(shutil.which("just"), "just is required for launcher regression")
+    def test_installed_maintenance_check_preserves_active_receipt_paths(self) -> None:
+        upgraded = self.run_bridge()
+        self.assertEqual(0, upgraded.returncode, self.fail_text(upgraded))
+        receipt = json.loads(
+            (self.task / ".task-state/automation-maintenance.json").read_text()
+        )
+        pending_before = self.pending_paths()
+        self.assertEqual(receipt["changed_paths"], pending_before)
+        self.assertEqual([], [
+            path.relative_to(self.task).as_posix()
+            for path in (self.task / ".automation").rglob("*")
+            if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}
+        ])
+
+        fake_bin = self.top / "fake-bin"
+        fake_bin.mkdir()
+        fake_gh = fake_bin / "gh"
+        fake_gh.write_text(
+            "#!/bin/sh\nprintf '%s\\n' "
+            + shlex.quote(json.dumps(self.issue_payload, separators=(",", ":")))
+            + "\n",
+            encoding="utf-8",
+        )
+        fake_gh.chmod(0o755)
+        environment = os.environ.copy()
+        environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+        checked = subprocess.run(
+            (shutil.which("just") or "just", "automation::maintenance-check", "226"),
+            cwd=self.task,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(0, checked.returncode, self.fail_text(checked))
+        output = json.loads(checked.stdout)
+        self.assertEqual(
+            {
+                "status": "READY",
+                "mode": "maintenance",
+                "taskStatus": "initialized",
+                "stage": "applied",
+            },
+            {key: output[key] for key in ("status", "mode", "taskStatus", "stage")},
+        )
+        pending_after = self.pending_paths()
+        self.assertEqual(receipt["changed_paths"], pending_after)
+        self.assertEqual(pending_before, pending_after)
+        self.assertEqual([], [
+            path.relative_to(self.task).as_posix()
+            for path in (self.task / ".automation").rglob("*")
+            if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}
+        ])
 
     def test_historical_fixture_identity_is_explicit_and_exact(self) -> None:
         self.assertEqual(

@@ -10,6 +10,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 AUTOMATION_MODULE = ".automation/just/automation.just"
+AGENT_CORE_PYTHON_MODULES = ("agent.just", "automation.just", "integrate.just", "repository.just")
+NO_BYTECODE_PREFIX = "env PYTHONDONTWRITEBYTECODE=1 python3 -B "
 TEMPLATE_NAMES = ("agent-base", "agent-python", "agent-rust", "agent-nix", "agent-cpp-cmake")
 RECIPES = (
     ("automation::version",),
@@ -79,6 +81,25 @@ class AutomationJustPathTest(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             self.assertEqual(text.splitlines()[0], "root := justfile_directory()", path)
             self.assertNotIn("../..", text, path)
+
+    def test_all_agent_core_python_just_entrypoints_disable_bytecode(self) -> None:
+        module_dirs = [ROOT / "components" / "agent-core" / ".automation" / "just"]
+        module_dirs.extend(
+            ROOT / "templates" / name / ".automation" / "just" for name in TEMPLATE_NAMES
+        )
+        for module_dir in module_dirs:
+            for name in AGENT_CORE_PYTHON_MODULES:
+                path = module_dir / name
+                invocations = [
+                    line.strip() for line in path.read_text(encoding="utf-8").splitlines()
+                    if "python3" in line
+                ]
+                self.assertTrue(invocations, path)
+                for invocation in invocations:
+                    self.assertTrue(
+                        invocation.startswith(NO_BYTECODE_PREFIX),
+                        f"bare Agent Core Python invocation in {path}: {invocation}",
+                    )
 
     def test_source_rebind_recipe_uses_python_isolated_bridge(self) -> None:
         justfile = ROOT / "just" / "agent-core.just"
