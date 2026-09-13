@@ -13,7 +13,7 @@ import shlex
 import subprocess
 import tarfile
 import threading
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 from unittest import mock
 
@@ -518,6 +518,16 @@ mod project 'just/project/mod.just'
         )
         stack.enter_context(mock.patch.object(upgrade, "authority_exists", return_value=False))
         stack.enter_context(mock.patch.object(upgrade, "write_authority"))
+        stack.enter_context(mock.patch.object(upgrade.private_state, "prepare"))
+        stack.enter_context(
+            mock.patch.object(
+                upgrade.private_state,
+                "mutation_lock",
+                return_value=nullcontext(),
+            )
+        )
+        stack.enter_context(mock.patch.object(upgrade, "common_git_dir", return_value=repo))
+        stack.enter_context(mock.patch.object(upgrade, "worktree_admin_dir", return_value=repo))
         return stack
 
     def test_upstream_and_generated_parity(self) -> None:
@@ -565,12 +575,14 @@ mod project 'just/project/mod.just'
         recipe = (ROOT / "components" / "agent-core" / ".automation" / "just" / "automation.just").read_text()
         self.assertIn("bootstrap-receipt source expected_revision:", recipe)
         self.assertIn(
-            "python3 {{quote(script)}} upgrade --source {{quote(source)}} "
+            "env PYTHONDONTWRITEBYTECODE=1 python3 -B {{quote(script)}} "
+            "upgrade --source {{quote(source)}} "
             "--expected-source-revision {{quote(expected_revision)}}",
             recipe,
         )
         self.assertIn(
-            "python3 {{quote(script)}} bootstrap-receipt --source {{quote(source)}} "
+            "env PYTHONDONTWRITEBYTECODE=1 python3 -B {{quote(script)}} "
+            "bootstrap-receipt --source {{quote(source)}} "
             "--expected-source-revision {{quote(expected_revision)}}",
             recipe,
         )
@@ -977,19 +989,19 @@ mod project 'just/project/mod.just'
             self._init_source_git(tmp)
 
             calls: list[str] = []
-            original_copy2 = upgrade.shutil.copy2
+            original_write = upgrade._anchored_write
 
-            def _mock_copy2(src: Path, dst: Path, *args, **kwargs):
-                if Path(dst) != repo / ".automation/VERSION":
+            def _mock_write(parent_fd, name, content, mode):
+                if name != "VERSION":
                     self.assertEqual("2\n", (repo / ".automation/VERSION").read_text())
-                calls.append(str(Path(dst)))
-                return original_copy2(src, dst, *args, **kwargs)
+                calls.append(name)
+                return original_write(parent_fd, name, content, mode)
 
             with self._mock_maintenance(repo):
-                with mock.patch.object(upgrade.shutil, "copy2", side_effect=_mock_copy2):
+                with mock.patch.object(upgrade, "_anchored_write", side_effect=_mock_write):
                     upgrade.apply(repo, tmp, self._expected_source_revision(tmp))
             self.assertTrue(calls, calls)
-            self.assertEqual(calls[-1], str(repo / ".automation" / "VERSION"))
+            self.assertEqual(calls[-1], "VERSION")
             self.assertFalse((repo / ".automation/stale.py").exists())
             self.assertEqual((repo / ".automation" / "VERSION").read_text(), "3\n")
 
@@ -1220,15 +1232,172 @@ mod project 'just/project/mod.just'
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo, source = self._maintenance_fixture(root)
+            before = {
+                path: (repo / path).read_bytes()
+                for path in (".automation/VERSION", "AGENTS.md", "Justfile", "opencode.json")
+            }
+            status_before = self._git(["status", "--porcelain"], repo)
             with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False), \
                     mock.patch.object(upgrade, "write_authority", side_effect=upgrade.UpgradeError("injected authority failure")):
                 with self.assertRaisesRegex(upgrade.UpgradeError, "injected authority failure"):
                     upgrade.apply(repo, source.parents[1], self._expected_source_revision(source.parents[1]))
+            self.assertEqual(before, {path: (repo / path).read_bytes() for path in before})
+            self.assertEqual(status_before, self._git(["status", "--porcelain"], repo))
             self.assertFalse(upgrade.receipt_path(repo).exists())
             self.assertFalse(upgrade.authority_path(repo).exists())
-            recovered = self._bootstrap_receipt(repo, source.parents[1])
-            self.assertEqual("RECEIPT_BOOTSTRAPPED", recovered["status"])
-            self.assertEqual("COMMITTED", upgrade.commit(repo, "TASK-78", "maintenance")["status"])
+            with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False):
+                self.assertEqual(
+                    "APPLIED",
+                    upgrade.apply(
+                        repo,
+                        source.parents[1],
+                        self._expected_source_revision(source.parents[1]),
+                    )["status"],
+                )
+
+    def test_apply_rolls_back_when_stale_consumed_receipt_cleanup_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, source = self._maintenance_fixture(root)
+            consumed = upgrade.consumed_receipt_path(repo)
+            consumed.write_bytes(b"stale\n")
+            before = {
+                path: (repo / path).read_bytes()
+                for path in (".automation/VERSION", "AGENTS.md", "Justfile", "opencode.json")
+            }
+            original_unlink = Path.unlink
+            failed = False
+
+            def fail_once(path: Path, *args, **kwargs):
+                nonlocal failed
+                if path == consumed and not failed:
+                    failed = True
+                    raise OSError("injected stale receipt cleanup failure")
+                return original_unlink(path, *args, **kwargs)
+
+            with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False), \
+                    mock.patch.object(Path, "unlink", autospec=True, side_effect=fail_once):
+                with self.assertRaisesRegex(upgrade.UpgradeError, "cannot remove stale consumed receipt"):
+                    upgrade.apply(repo, source.parents[1], self._expected_source_revision(source.parents[1]))
+            self.assertTrue(failed)
+            self.assertEqual(
+                before,
+                {path: (repo / path).read_bytes() for path in before},
+            )
+            self.assertEqual(b"stale\n", consumed.read_bytes())
+            self.assertFalse(upgrade.receipt_path(repo).exists())
+            self.assertFalse(upgrade.authority_path(repo).exists())
+
+    def test_apply_rolls_back_when_post_apply_validation_detects_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, source = self._maintenance_fixture(root)
+            before = {
+                path: (repo / path).read_bytes()
+                for path in (".automation/VERSION", "AGENTS.md", "Justfile", "opencode.json")
+            }
+
+            def reject_post_apply() -> None:
+                raise upgrade.UpgradeError("injected target identity drift")
+
+            with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False):
+                with self.assertRaisesRegex(upgrade.UpgradeError, "target identity drift"):
+                    upgrade.apply(
+                        repo,
+                        source.parents[1],
+                        self._expected_source_revision(source.parents[1]),
+                        reject_post_apply,
+                    )
+            self.assertEqual(before, {path: (repo / path).read_bytes() for path in before})
+            self.assertFalse(upgrade.receipt_path(repo).exists())
+            self.assertFalse(upgrade.authority_path(repo).exists())
+
+    def test_apply_holds_task_state_lock_through_post_apply_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, source = self._maintenance_fixture(root)
+            events: list[str] = []
+
+            @contextmanager
+            def state_lock():
+                events.append("locked")
+                try:
+                    yield
+                finally:
+                    events.append("released")
+
+            def validate() -> None:
+                self.assertEqual(["locked"], events)
+                events.append("validated")
+
+            with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False):
+                upgrade.apply(
+                    repo,
+                    source.parents[1],
+                    self._expected_source_revision(source.parents[1]),
+                    validate,
+                    state_lock,
+                )
+            self.assertEqual(["locked", "validated", "released"], events)
+
+    def test_apply_rejects_direct_destination_symlink_race(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, source = self._maintenance_fixture(root)
+            outside = root / "outside-version"
+            outside.write_text("outside\n", encoding="utf-8")
+            original_write = upgrade._anchored_write
+            swapped = False
+
+            def swap_destination(parent_fd, name, content, mode):
+                nonlocal swapped
+                if name == "VERSION" and not swapped:
+                    swapped = True
+                    target = repo / ".automation" / name
+                    target.unlink()
+                    target.symlink_to(outside)
+                return original_write(parent_fd, name, content, mode)
+
+            with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False), \
+                    mock.patch.object(upgrade, "_anchored_write", side_effect=swap_destination):
+                with self.assertRaises(upgrade.UpgradeError):
+                    upgrade.apply(repo, source.parents[1], self._expected_source_revision(source.parents[1]))
+            self.assertTrue(swapped)
+            self.assertEqual("outside\n", outside.read_text(encoding="utf-8"))
+            self.assertEqual("2\n", (repo / ".automation/VERSION").read_text(encoding="utf-8"))
+            self.assertFalse(upgrade.authority_path(repo).exists())
+
+    def test_apply_rejects_ancestor_directory_symlink_race(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, source = self._maintenance_fixture(root)
+            self._write_file(source / ".opencode/agents/new.md", "new\n")
+            self._init_source_git(root)
+            outside = root / "outside-opencode"
+            outside.mkdir()
+            sentinel = outside / "sentinel"
+            sentinel.write_text("outside\n", encoding="utf-8")
+            original_write = upgrade._anchored_write
+            swapped = False
+
+            def swap_ancestor(parent_fd, name, content, mode):
+                nonlocal swapped
+                if name == "new.md" and not swapped:
+                    swapped = True
+                    managed_parent = repo / ".opencode"
+                    moved = repo / ".opencode-real"
+                    managed_parent.rename(moved)
+                    managed_parent.symlink_to(outside, target_is_directory=True)
+                return original_write(parent_fd, name, content, mode)
+
+            with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False), \
+                    mock.patch.object(upgrade, "_anchored_write", side_effect=swap_ancestor):
+                with self.assertRaises(upgrade.UpgradeError):
+                    upgrade.apply(repo, source.parents[1], self._expected_source_revision(source.parents[1]))
+            self.assertTrue(swapped)
+            self.assertEqual("outside\n", sentinel.read_text(encoding="utf-8"))
+            self.assertEqual("2\n", (repo / ".automation/VERSION").read_text(encoding="utf-8"))
+            self.assertFalse(upgrade.authority_path(repo).exists())
 
     def test_issue_pair_does_not_overwrite_a_concurrent_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1612,6 +1781,11 @@ mod project 'just/project/mod.just'
             self.assertFalse(marker.exists())
             self.assertEqual("Test User", self._git(["show", "-s", "--format=%an", "HEAD"], repo))
             self.assertEqual("Test User", self._git(["show", "-s", "--format=%cn", "HEAD"], repo))
+
+    def test_git_runtime_disables_optional_index_refresh_locks(self) -> None:
+        with mock.patch.dict(os.environ, {"GIT_OPTIONAL_LOCKS": "1"}, clear=False):
+            environment = upgrade.git_environment({"GIT_OPTIONAL_LOCKS": "1"})
+        self.assertEqual("0", environment["GIT_OPTIONAL_LOCKS"])
 
     def test_ordinary_task_commit_still_rejects_automation_core(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

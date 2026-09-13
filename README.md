@@ -409,7 +409,37 @@ AUTOMATION_MAINTENANCE=1 just automation::bootstrap-receipt <trusted local Templ
 Issue #97 is a compatible maintenance fix: `.automation/VERSION` remains 3,
 and #83/#85 semantics remain unchanged.
 
-It materializes only Agent Core-owned paths and preserves Adapter-owned `.automation/ADAPTER`, `.automation/INIT.fragment.md`, `.automation/adoption.toml`, `just/project/**`, local modules, and repository CI. On success it creates or replaces the ignored `.task-state/automation-maintenance.json` receipt; it does not commit, push, or merge. Inspect the diff and run:
+### Issue #136: source-side bootstrap upgrade
+
+For a pristine, registered Automation Maintenance Task whose older consumer
+Agent Core is exactly VERSION 2, the source-side bridge can perform the narrow
+2-to-3 upgrade from a clean Templates checkout:
+
+```sh
+just agent-core::bootstrap-upgrade <consumer-task-worktree> <expected-source-revision>
+```
+
+The expected revision must be the exact 40-hex clean Templates `HEAD`; tags,
+branches, abbreviations, and any other revision are rejected. The
+bridge validates the registered Task and default `main` worktree, Base
+identity, pristine `initialized` state, clean target, adapter identity bytes,
+and the canonical migration plan. It dry-runs that plan in a temporary target
+snapshot, then delegates the sole live mutation to the verified Git-object
+upgrade engine. It never commits, pushes, merges, or performs a broad reset.
+The canonical transaction keeps VERSION last, serializes private authority
+publication, and rolls managed paths and newly issued authority back when a
+checked failure occurs. Before reporting success it rechecks the exact managed
+paths, migration removals, VERSION, adapter bytes, receipt/authority, source
+and target identity, and plan convergence. A completed apply is a
+terminal operation: retrying it fails closed with a precise non-idempotent
+terminal diagnostic rather than mutating an already-upgraded target.
+
+It materializes only Agent Core-owned paths and preserves Adapter-owned
+`.automation/ADAPTER`, `.automation/INIT.fragment.md`,
+`.automation/adoption.toml`, `just/project/**`, local modules, and repository
+CI. On success it creates a new ignored
+`.task-state/automation-maintenance.json` receipt and matching private
+authority; an existing pair is rejected. Inspect the diff and run:
 
 ```sh
 git diff --check

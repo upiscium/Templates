@@ -209,16 +209,17 @@ def receipt_digest(receipt: dict) -> str:
     return hashlib.sha256(canonical_json(receipt)).hexdigest()
 
 
-def write_authority(repo: Path, receipt: dict) -> None:
-    try:
-        private_state.prepare(
-            repo,
-            admin=True,
-            common_dir=common_git_dir(repo),
-            admin_dir=worktree_admin_dir(repo),
-        )
-    except private_state.GitPrivateStateError as exc:
-        raise UpgradeError(str(exc)) from exc
+def write_authority(repo: Path, receipt: dict, *, lock_held: bool = False) -> None:
+    if not lock_held:
+        try:
+            private_state.prepare(
+                repo,
+                admin=True,
+                common_dir=common_git_dir(repo),
+                admin_dir=worktree_admin_dir(repo),
+            )
+        except private_state.GitPrivateStateError as exc:
+            raise UpgradeError(str(exc)) from exc
     _write_authority_at(
         authority_path(repo),
         {
@@ -230,6 +231,7 @@ def write_authority(repo: Path, receipt: dict) -> None:
             "receipt_sha256": receipt_digest(receipt),
         },
         admin=worktree_admin_dir(repo),
+        lock_held=lock_held,
     )
 
 
@@ -351,12 +353,15 @@ def authority_exists(repo: Path) -> bool:
     return os.path.lexists(new_path) or (legacy_path is not None and os.path.lexists(legacy_path))
 
 
-def issue_pair(repo: Path, receipt: dict) -> None:
+def issue_pair(repo: Path, receipt: dict, *, lock_held: bool = False) -> None:
     destination = receipt_path(repo)
     published: tuple[int, int] | None = None
     try:
         published = exclusive_json_write(destination, receipt)
-        write_authority(repo, receipt)
+        if lock_held:
+            write_authority(repo, receipt, lock_held=True)
+        else:
+            write_authority(repo, receipt)
     except (OSError, UpgradeError):
         if published is not None:
             try:
@@ -611,6 +616,7 @@ def git_environment(overrides: dict[str, str] | None = None) -> dict[str, str]:
     }
     if overrides:
         environment.update(overrides)
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
     return environment
 
 
@@ -1160,7 +1166,148 @@ def revalidate_source(source: Path, revision: str) -> None:
         raise UpgradeError("source changed during upgrade planning or mutation")
 
 
-def apply_plan_to_tree(tree: Path, source_core: Path, plan: dict) -> list[str]:
+def _anchored_parent(root: Path, relative: Path, *, create: bool) -> tuple[int, str]:
+    """Open a managed path's parent without following any component symlink."""
+    if not relative.parts or relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise UpgradeError(f"unsafe managed path: {relative}")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    root_fd = os.open(root, flags)
+    current = root_fd
+    try:
+        for component in relative.parts[:-1]:
+            try:
+                next_fd = os.open(component, flags, dir_fd=current)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(component, 0o755, dir_fd=current)
+                next_fd = os.open(component, flags, dir_fd=current)
+            os.close(current)
+            current = next_fd
+        return current, relative.name
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def _anchored_read(parent_fd: int, name: str) -> bytes:
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise UpgradeError(f"managed path is not a regular file: {name}")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+    finally:
+        os.close(fd)
+
+
+def _anchored_parent_unchanged(tree: Path, relative: Path, parent_fd: int) -> None:
+    check_fd, _ = _anchored_parent(tree, relative, create=False)
+    try:
+        current = os.fstat(check_fd)
+        pinned = os.fstat(parent_fd)
+        if (current.st_dev, current.st_ino) != (pinned.st_dev, pinned.st_ino):
+            raise UpgradeError(f"managed path parent changed during upgrade: {relative}")
+    finally:
+        os.close(check_fd)
+
+
+def _anchored_write(parent_fd: int, name: str, content: bytes, mode: int) -> None:
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        current = None
+    if current is not None and not stat.S_ISREG(current.st_mode):
+        raise UpgradeError(f"managed path became unsafe after planning: {name}")
+    temporary = f".{name}.upgrade-{secrets.token_hex(16)}"
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent_fd)
+    published = False
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("short managed-path write")
+            view = view[written:]
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+        os.close(fd)
+        os.rename(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        published = True
+        os.fsync(parent_fd)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        if not published:
+            try:
+                os.unlink(temporary, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+
+
+def _apply_plan_to_tree_anchored(tree: Path, source_core: Path, plan: dict) -> list[str]:
+    actionable = [item for item in plan["actions"] if item["action"] != "noop"]
+    phases = {"delete": 0, "create": 1, "replace": 2, "merge": 3}
+    ordered = sorted(
+        [item for item in actionable if item["path"] != ".automation/VERSION"],
+        key=lambda item: (phases.get(item["action"], 99), item["path"]),
+    ) + [item for item in actionable if item["path"] == ".automation/VERSION"]
+    changed: list[str] = []
+    for item in ordered:
+        relative = Path(item["path"])
+        parent_fd, name = _anchored_parent(tree, relative, create=item["action"] != "delete")
+        try:
+            if item["action"] == "delete":
+                try:
+                    metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    metadata = None
+                if metadata is not None and not (stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)):
+                    raise UpgradeError(f"delete became unsafe after planning: {item['path']}")
+                if metadata is not None:
+                    os.unlink(name, dir_fd=parent_fd)
+                    os.fsync(parent_fd)
+            else:
+                source = source_core / relative
+                if item["action"] == "merge" and item["path"] == "AGENTS.md":
+                    current = _anchored_read(parent_fd, name).decode("utf-8")
+                    merged, detail = replace_agent_rules(current, source.read_text(encoding="utf-8"))
+                    if merged is None:
+                        raise UpgradeError(f"AGENTS.md merge became unsafe: {detail}")
+                    content = merged.encode("utf-8")
+                    mode = stat.S_IMODE(
+                        os.stat(name, dir_fd=parent_fd, follow_symlinks=False).st_mode
+                    )
+                elif item["action"] == "merge" and item["path"] == "Justfile":
+                    current = _anchored_read(parent_fd, name).decode("utf-8")
+                    merged, detail = merge_just_router(current, source.read_text(encoding="utf-8"))
+                    if merged is None:
+                        raise UpgradeError(f"Justfile merge became unsafe: {detail}")
+                    content = merged.encode("utf-8")
+                    mode = stat.S_IMODE(
+                        os.stat(name, dir_fd=parent_fd, follow_symlinks=False).st_mode
+                    )
+                else:
+                    content = source.read_bytes()
+                    mode = stat.S_IMODE(source.stat().st_mode)
+                _anchored_write(parent_fd, name, content, mode)
+            _anchored_parent_unchanged(tree, relative, parent_fd)
+            changed.append(item["path"])
+        finally:
+            os.close(parent_fd)
+    return sorted(set(changed))
+
+
+def apply_plan_to_tree(tree: Path, source_core: Path, plan: dict, *, anchored: bool = False) -> list[str]:
+    if anchored:
+        return _apply_plan_to_tree_anchored(tree, source_core, plan)
     actionable = [item for item in plan["actions"] if item["action"] != "noop"]
     planned_deletes = {Path(item["path"]) for item in actionable if item["action"] == "delete"}
     blockers: list[str] = []
@@ -1225,7 +1372,42 @@ def apply_plan_to_tree(tree: Path, source_core: Path, plan: dict) -> list[str]:
     return sorted(set(changed))
 
 
-def capture_paths(tree: Path, paths: list[str]) -> dict[str, SavedPath]:
+def _capture_paths_anchored(tree: Path, paths: list[str]) -> dict[str, SavedPath]:
+    saved: dict[str, SavedPath] = {}
+    for raw_path in paths:
+        relative = Path(*raw_path.split("/"))
+        try:
+            parent_fd, name = _anchored_parent(tree, relative, create=False)
+        except FileNotFoundError:
+            saved[raw_path] = SavedPath("absent", None, None)
+            continue
+        try:
+            try:
+                metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                saved[raw_path] = SavedPath("absent", None, None)
+                continue
+            mode = stat.S_IMODE(metadata.st_mode)
+            if stat.S_ISLNK(metadata.st_mode):
+                saved[raw_path] = SavedPath("symlink", os.readlink(name, dir_fd=parent_fd), mode)
+            elif stat.S_ISREG(metadata.st_mode):
+                saved[raw_path] = SavedPath("file", _anchored_read(parent_fd, name), mode)
+            else:
+                raise UpgradeError(f"cannot snapshot unsafe upgrade destination path: {raw_path}")
+            _anchored_parent_unchanged(tree, relative, parent_fd)
+        finally:
+            os.close(parent_fd)
+    return saved
+
+
+def capture_paths(
+    tree: Path,
+    paths: list[str],
+    *,
+    anchored: bool = False,
+) -> dict[str, SavedPath]:
+    if anchored:
+        return _capture_paths_anchored(tree, paths)
     saved: dict[str, SavedPath] = {}
     for raw_path in paths:
         target = tree / Path(*raw_path.split("/"))
@@ -1244,7 +1426,42 @@ def capture_paths(tree: Path, paths: list[str]) -> dict[str, SavedPath]:
     return saved
 
 
-def restore_paths(tree: Path, saved: dict[str, SavedPath]) -> None:
+def _restore_paths_anchored(tree: Path, saved: dict[str, SavedPath]) -> None:
+    for raw_path, state in saved.items():
+        relative = Path(*raw_path.split("/"))
+        try:
+            parent_fd, name = _anchored_parent(tree, relative, create=state.kind != "absent")
+        except FileNotFoundError:
+            if state.kind == "absent":
+                continue
+            raise
+        try:
+            try:
+                metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                metadata = None
+            if metadata is not None:
+                if not (stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)):
+                    raise UpgradeError(f"cannot restore unsafe upgrade destination path: {raw_path}")
+                os.unlink(name, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            if state.kind == "absent":
+                continue
+            if state.kind == "file" and isinstance(state.content, bytes) and state.mode is not None:
+                _anchored_write(parent_fd, name, state.content, state.mode)
+            elif state.kind == "symlink" and isinstance(state.content, str):
+                os.symlink(state.content, name, dir_fd=parent_fd)
+            else:  # pragma: no cover
+                raise UpgradeError(f"invalid saved upgrade destination state: {raw_path}")
+            _anchored_parent_unchanged(tree, relative, parent_fd)
+        finally:
+            os.close(parent_fd)
+
+
+def restore_paths(tree: Path, saved: dict[str, SavedPath], *, anchored: bool = False) -> None:
+    if anchored:
+        _restore_paths_anchored(tree, saved)
+        return
     for raw_path, state in saved.items():
         target = tree / Path(*raw_path.split("/"))
         if target.is_symlink() or target.is_file():
@@ -1343,7 +1560,37 @@ def check_update(repo: Path, source_path: Path, expected_source_revision: str | 
     return plan
 
 
-def apply(repo: Path, source_path: Path, expected_source_revision: str) -> dict:
+def apply(
+    repo: Path,
+    source_path: Path,
+    expected_source_revision: str,
+    post_apply_check=None,
+    state_lock=None,
+) -> dict:
+    try:
+        private_state.prepare(
+            repo, admin=True, common_dir=common_git_dir(repo), admin_dir=worktree_admin_dir(repo)
+        )
+        with private_state.mutation_lock(repo, admin=True):
+            if state_lock is not None:
+                with state_lock():
+                    return _apply_locked(
+                        repo,
+                        source_path,
+                        expected_source_revision,
+                        post_apply_check,
+                    )
+            return _apply_locked(repo, source_path, expected_source_revision, post_apply_check)
+    except private_state.GitPrivateStateError as exc:
+        raise UpgradeError(str(exc)) from exc
+
+
+def _apply_locked(
+    repo: Path,
+    source_path: Path,
+    expected_source_revision: str,
+    post_apply_check=None,
+) -> dict:
     task_id, branch, worktree = require_maintenance(repo)
     if os.path.lexists(receipt_path(repo)) or authority_exists(repo):
         raise UpgradeError("cannot apply with an existing receipt or authority record")
@@ -1374,58 +1621,82 @@ def apply(repo: Path, source_path: Path, expected_source_revision: str) -> dict:
                 "requiredNextChecks": [],
             }
         expected_paths = sorted({item["path"] for item in actionable})
-        saved_paths = capture_paths(repo, expected_paths)
-        changed = apply_plan_to_tree(repo, source_core, plan)
-        # A source race after mutation fails closed: no receipt is issued.
+        saved_paths = capture_paths(repo, expected_paths, anchored=True)
+        consumed_path = consumed_receipt_path(repo)
+        saved_consumed = capture_paths(
+            repo,
+            [consumed_path.relative_to(repo).as_posix()],
+            anchored=True,
+        )
         try:
+            changed = apply_plan_to_tree(repo, source_core, plan, anchored=True)
+            # A source race after mutation fails closed: no receipt is issued.
             revalidate_source(source, revision)
-        except UpgradeError as source_error:
+            changed_paths = sorted(set(changed))
+            result = {
+                "status": "APPLIED",
+                "repositoryRoot": str(repo),
+                "sourceCore": str(source / "components" / "agent-core"),
+                "sourceRevision": revision,
+                "adapter": (repo / ".automation" / "ADAPTER").read_text(encoding="utf-8").strip(),
+                "changedPaths": changed_paths,
+                "commitCreated": False,
+                "pushPerformed": False,
+                "mergePerformed": False,
+                "requiredNextChecks": [
+                    "git diff --check",
+                    "just agent::doctor",
+                    "just project::check",
+                    "repository CI/smoke tests",
+                ],
+            }
+            receipt = {
+                "schema_version": 1,
+                "status": "active",
+                "task_id": task_id,
+                "branch": branch,
+                "worktree": str(worktree),
+                "source": str(source),
+                "source_revision": revision,
+                "current_version": plan["currentVersion"],
+                "upstream_version": plan["upstreamVersion"],
+                "changed_paths": changed_paths,
+                "authority_head": git_head(repo),
+                "authority_nonce": secrets.token_hex(32),
+                "path_fingerprints": {path: file_fingerprint(repo, path) for path in changed_paths},
+            }
+            issue_pair(repo, receipt, lock_held=True)
             try:
-                restore_paths(repo, saved_paths)
-            except UpgradeError as restore_error:
+                consumed_path.unlink(missing_ok=True)
+            except OSError as exc:
+                raise UpgradeError("cannot remove stale consumed receipt") from exc
+            if post_apply_check is not None:
+                post_apply_check()
+            return result
+        except Exception as failure:
+            rollback_errors: list[str] = []
+            try:
+                restore_paths(repo, saved_paths, anchored=True)
+            except Exception as rollback_error:
+                rollback_errors.append(f"destination rollback failed: {rollback_error}")
+            try:
+                for publication in (receipt_path(repo), authority_path(repo)):
+                    if os.path.lexists(publication):
+                        if publication == authority_path(repo):
+                            private_state.unlink(publication, _lock_held=True)
+                        else:
+                            publication.unlink()
+            except Exception as rollback_error:
+                rollback_errors.append(f"publication rollback failed: {rollback_error}")
+            try:
+                restore_paths(repo, saved_consumed, anchored=True)
+            except Exception as rollback_error:
+                rollback_errors.append(f"stale receipt rollback failed: {rollback_error}")
+            if rollback_errors:
                 raise UpgradeError(
-                    f"{source_error}; destination rollback failed: {restore_error}"
-                ) from restore_error
+                    f"upgrade failed and rollback failed: {'; '.join(rollback_errors)}"
+                ) from failure
             raise
-        changed_paths = sorted(set(changed))
-        result = {
-            "status": "APPLIED",
-            "repositoryRoot": str(repo),
-            "sourceCore": str(source / "components" / "agent-core"),
-            "sourceRevision": revision,
-            "adapter": (repo / ".automation" / "ADAPTER").read_text(encoding="utf-8").strip(),
-            "changedPaths": changed_paths,
-            "commitCreated": False,
-            "pushPerformed": False,
-            "mergePerformed": False,
-            "requiredNextChecks": [
-                "git diff --check",
-                "just agent::doctor",
-                "just project::check",
-                "repository CI/smoke tests",
-            ],
-        }
-        receipt = {
-            "schema_version": 1,
-            "status": "active",
-            "task_id": task_id,
-            "branch": branch,
-            "worktree": str(worktree),
-            "source": str(source),
-            "source_revision": revision,
-            "current_version": plan["currentVersion"],
-            "upstream_version": plan["upstreamVersion"],
-            "changed_paths": changed_paths,
-            "authority_head": git_head(repo),
-            "authority_nonce": secrets.token_hex(32),
-            "path_fingerprints": {path: file_fingerprint(repo, path) for path in changed_paths},
-        }
-        issue_pair(repo, receipt)
-        try:
-            consumed_receipt_path(repo).unlink(missing_ok=True)
-        except OSError as exc:
-            raise UpgradeError("cannot remove stale consumed receipt") from exc
-        return result
 
 
 def pending_paths(repo: Path) -> list[str]:

@@ -1,0 +1,10 @@
+{
+  "adapter": "cpp-cmake",
+  "agent_core_source": "16cdcf226054ccb91a0886c2e61ab406382a74be",
+  "agent_core_version": "2",
+  "broken_router_first_line": "root := justfile_directory() / \"..\" / \"..\"",
+  "historical_main": "0d022ed5140b497b5d3be886408822ecbd981dd3",
+  "maintenance_task": "226",
+  "repository": "upiscium/Terreate",
+  "repository_remote": "https://github.com/upiscium/Terreate.git"
+}

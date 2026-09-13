@@ -369,7 +369,11 @@ class InitContractTest(unittest.TestCase):
         recipes = (
             ROOT / "components" / "agent-core" / ".automation" / "just" / "agent.just"
         ).read_text(encoding="utf-8")
-        self.assertIn("preflight:\n    python3 {{quote(init)}} preflight", recipes)
+        self.assertIn(
+            "preflight:\n    env PYTHONDONTWRITEBYTECODE=1 python3 -B "
+            "{{quote(init)}} preflight",
+            recipes,
+        )
 
     def test_preflight_cli_does_not_require_git_repository_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -399,6 +403,14 @@ class InitContractTest(unittest.TestCase):
             remote = Path(directory) / "origin.git"
             self.run_fixture(Path(directory), "git", "init", "--bare", "--initial-branch=main", str(remote))
             shutil.copytree(ROOT / "templates" / "agent-base", root)
+            gitignore = root / ".gitignore"
+            gitignore.write_text(
+                gitignore.read_text(encoding="utf-8")
+                .replace("__pycache__/\n", "")
+                .replace("*.py[oc]\n", ""),
+                encoding="utf-8",
+            )
+            self.assertNotIn("pycache", gitignore.read_text(encoding="utf-8").lower())
             self.run_fixture(root, "git", "init", "-b", "main")
             self.run_fixture(root, "git", "config", "user.name", "Preflight Test")
             self.run_fixture(
@@ -416,8 +428,20 @@ class InitContractTest(unittest.TestCase):
                 "refs/remotes/origin/main",
             )
 
-            for command in ("agent::preflight", "agent::doctor", "agent::context"):
+            for command in (
+                "agent::preflight",
+                "agent::doctor",
+                "agent::context",
+                "automation::version",
+            ):
                 self.run_fixture(root, "just", command)
+            bytecode = [
+                path.relative_to(root).as_posix()
+                for path in (root / ".automation").rglob("*")
+                if path.name == "__pycache__" or path.suffix in {".pyc", ".pyo"}
+            ]
+            self.assertEqual([], bytecode)
+            self.assertEqual("", self.run_fixture(root, "git", "status", "--porcelain").stdout)
 
             self.run_fixture(root, "git", "switch", "-c", "bootstrap-adoption")
             before = self.run_fixture(root, "git", "status", "--porcelain").stdout
