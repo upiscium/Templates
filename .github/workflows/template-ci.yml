@@ -20,6 +20,10 @@ jobs:
       - name: Generated template drift
         run: python3 tools/render_templates.py check
       - uses: cachix/install-nix-action@v31
+      - name: Public maintenance launcher smoke
+        run: >-
+          nix develop --no-update-lock-file --command python3 -m unittest -v
+          tests.test_source_bootstrap_upgrade_bridge.BootstrapUpgradeBridgeTest.test_installed_maintenance_check_preserves_active_receipt_paths
       - name: Evaluate all flake systems
         run: nix flake check --all-systems --no-build --no-update-lock-file
       - name: OpencodeContract contract

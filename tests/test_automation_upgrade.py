@@ -1782,6 +1782,11 @@ mod project 'just/project/mod.just'
             self.assertEqual("Test User", self._git(["show", "-s", "--format=%an", "HEAD"], repo))
             self.assertEqual("Test User", self._git(["show", "-s", "--format=%cn", "HEAD"], repo))
 
+    def test_git_runtime_disables_optional_index_refresh_locks(self) -> None:
+        with mock.patch.dict(os.environ, {"GIT_OPTIONAL_LOCKS": "1"}, clear=False):
+            environment = upgrade.git_environment({"GIT_OPTIONAL_LOCKS": "1"})
+        self.assertEqual("0", environment["GIT_OPTIONAL_LOCKS"])
+
     def test_ordinary_task_commit_still_rejects_automation_core(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = self._task_repo(Path(directory) / "repo")

@@ -616,6 +616,7 @@ def git_environment(overrides: dict[str, str] | None = None) -> dict[str, str]:
     }
     if overrides:
         environment.update(overrides)
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
     return environment
 
 
