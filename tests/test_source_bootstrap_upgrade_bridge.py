@@ -55,7 +55,7 @@ class BootstrapUpgradeBridgeTest(unittest.TestCase):
         result = subprocess.run(("git", *args), cwd=cwd, text=True,
                                 capture_output=True, check=False, env=environment)
         if check and result.returncode:
-            self.fail(result.stderr)
+            self.fail(result.stderr or result.stdout or f"git exited {result.returncode}")
         return result.stdout.strip()
 
     def write(self, path: Path, data: str | bytes) -> None:
@@ -87,7 +87,7 @@ class BootstrapUpgradeBridgeTest(unittest.TestCase):
         self.git(ROOT, "clone", "--shared", "--no-checkout", str(ROOT), str(self.candidate))
         self.git(self.candidate, "switch", "--detach", "HEAD")
         self.configure(self.candidate)
-        # The candidate is the trusted, immutable copy of the current dirty implementation.
+        # The candidate is a distinct immutable revision of the current implementation.
         for relative in (
             "tools/automation_recovery_bridge.py",
             "components/agent-core/.automation/bin/automation_upgrade.py",
@@ -101,7 +101,13 @@ class BootstrapUpgradeBridgeTest(unittest.TestCase):
             shutil.copy2(ROOT / relative, self.candidate / relative)
         self.git(self.candidate, "add", "tools/automation_recovery_bridge.py",
                  "components/agent-core/.automation/bin")
-        self.git(self.candidate, "commit", "-m", "trusted bootstrap implementation")
+        self.git(
+            self.candidate,
+            "commit",
+            "--allow-empty",
+            "-m",
+            "trusted bootstrap implementation",
+        )
         self.implementation_revision = self.git(self.candidate, "rev-parse", "HEAD")
         self.assertEqual(SOURCE_REVISION, self.git(self.candidate, "rev-parse", SOURCE_REVISION))
 
