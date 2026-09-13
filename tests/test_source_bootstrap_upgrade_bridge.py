@@ -5,6 +5,7 @@ import hashlib
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -141,13 +142,28 @@ class BootstrapUpgradeBridgeTest(unittest.TestCase):
             self.exclude = self.task / self.exclude
         self.exclude.parent.mkdir(parents=True, exist_ok=True)
         self.exclude.write_text("/.task-state/\n", encoding="utf-8")
-        self.write(self.task / ".task-state/task.md",
-                   f"# 226\n\n## Identity\n\n- Task ID: 226\n"
-                   f"- Branch: fix/226-bootstrap-upgrade\n- Worktree: {self.task.resolve()}\n"
-                   f"- Base branch: main\n- Base revision: {self.main_revision}\n\n"
-                   "## Purpose\n\nBootstrap the historical Agent Core maintenance upgrade.\n\n"
-                   "## Scope\n\n- Upgrade Agent Core v2 to v3 only.\n\n"
-                   "## Current state\n\n- Status: initialized\n- Blockers: none\n- Unverified: Task contract\n")
+        template = (self.task / ".automation/templates/task-state.md").read_text(encoding="utf-8")
+        for marker, value in {
+            "@@TASK_ID@@": "226",
+            "@@BRANCH@@": "fix/226-bootstrap-upgrade",
+            "@@WORKTREE@@": str(self.task.resolve()),
+            "@@BASE_BRANCH@@": "main",
+            "@@BASE_REVISION@@": self.main_revision,
+        }.items():
+            template = template.replace(marker, value)
+        self.write(self.task / ".task-state/task.md", template)
+        self.issue_payload = {
+            "number": 226,
+            "html_url": "https://github.com/upiscium/Terreate/issues/226",
+            "repository_url": "https://api.github.com/repos/upiscium/Terreate",
+            "title": "Upgrade the historical Agent Core bootstrap",
+            "body": "Recover canonical Issue-backed maintenance authority, then upgrade v2 to v3.",
+            "state": "open",
+            "labels": [{"name": "maintenance"}],
+            "assignees": [],
+            "milestone": None,
+        }
+        self.hydrate_contract()
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -162,6 +178,48 @@ class BootstrapUpgradeBridgeTest(unittest.TestCase):
 
     def fail_text(self, result) -> str:
         return result.stdout + result.stderr
+
+    def hydrate_contract(self) -> None:
+        module_directory = self.candidate / "components/agent-core/.automation/bin"
+        script = (
+            "import json,sys; from pathlib import Path; "
+            "sys.path.insert(0, sys.argv[1]); import task_contract; "
+            "task_contract.hydrate_task_contract(Path(sys.argv[2]), '226', '226', "
+            "json.loads(sys.argv[3]), 'upiscium/Terreate')"
+        )
+        result = subprocess.run(
+            (sys.executable, "-I", "-c", script, str(module_directory), str(self.task),
+             json.dumps(self.issue_payload)),
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+
+    def assert_contract_rejected(self, text: str) -> None:
+        result = self.run_bridge()
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn(text, self.fail_text(result))
+        self.assertEqual("2\n", (self.task / ".automation/VERSION").read_text())
+
+    def rewrite_contract_identity(self, repository: str) -> None:
+        issue_path = self.task / ".task-state/issue.json"
+        metadata_path = self.task / ".task-state/contract.json"
+        state_path = self.task / ".task-state/task.md"
+        issue = json.loads(issue_path.read_text())
+        previous_digest = issue["sha256"]
+        issue["repository"] = repository
+        issue["payload"]["repository"] = repository
+        issue["payload"]["url"] = f"https://github.com/{repository}/issues/226"
+        digest = hashlib.sha256(
+            json.dumps(issue["payload"], sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=False).encode()
+        ).hexdigest()
+        issue["sha256"] = digest
+        metadata = json.loads(metadata_path.read_text())
+        metadata["repository"] = repository
+        metadata["sha256"] = digest
+        issue_path.write_text(json.dumps(issue, sort_keys=True) + "\n")
+        metadata_path.write_text(json.dumps(metadata, sort_keys=True) + "\n")
+        state_path.write_text(state_path.read_text().replace(previous_digest, digest))
 
     def identity_snapshot(self) -> dict[str, str]:
         return {
@@ -262,6 +320,77 @@ class BootstrapUpgradeBridgeTest(unittest.TestCase):
             FIXTURE_IDENTITY["adapter"],
             (self.task / ".automation/ADAPTER").read_text().strip(),
         )
+
+    def test_handwritten_task_state_alone_cannot_authorize_bootstrap(self) -> None:
+        (self.task / ".task-state/issue.json").unlink()
+        (self.task / ".task-state/contract.json").unlink()
+        state = (self.task / ".task-state/task.md").read_text()
+        state = state[:state.index("\n<!-- canonical-contract")]
+        (self.task / ".task-state/task.md").write_text(
+            state.replace(
+                "Authoritative source: .task-state/issue.json#title (Issue #226); "
+                "body: .task-state/issue.json#body",
+                "Bootstrap Agent Core maintenance upgrade",
+            )
+        )
+        self.assert_contract_rejected("Task State has no canonical contract marker")
+
+    def test_missing_issue_snapshot_cannot_authorize_bootstrap(self) -> None:
+        (self.task / ".task-state/issue.json").unlink()
+        self.assert_contract_rejected("canonical Issue snapshot is missing")
+
+    def test_missing_contract_metadata_cannot_authorize_bootstrap(self) -> None:
+        (self.task / ".task-state/contract.json").unlink()
+        self.assert_contract_rejected("canonical contract metadata is malformed")
+
+    def test_task_and_issue_identity_mismatch_cannot_authorize_bootstrap(self) -> None:
+        path = self.task / ".task-state/issue.json"
+        issue = json.loads(path.read_text())
+        issue["issue"] = 225
+        path.write_text(json.dumps(issue, sort_keys=True) + "\n")
+        self.assert_contract_rejected("canonical Issue snapshot Task identity mismatch")
+
+    def test_repository_mismatch_cannot_authorize_bootstrap(self) -> None:
+        self.rewrite_contract_identity("upiscium/Other")
+        self.assert_contract_rejected("repository differs from origin")
+
+    def test_issue_snapshot_digest_mismatch_cannot_authorize_bootstrap(self) -> None:
+        path = self.task / ".task-state/issue.json"
+        issue = json.loads(path.read_text())
+        issue["payload"]["body"] += " tampered"
+        path.write_text(json.dumps(issue, sort_keys=True) + "\n")
+        self.assert_contract_rejected("canonical Issue snapshot integrity check failed")
+
+    def test_contract_metadata_digest_mismatch_cannot_authorize_bootstrap(self) -> None:
+        path = self.task / ".task-state/contract.json"
+        metadata = json.loads(path.read_text())
+        metadata["sha256"] = "0" * 64
+        path.write_text(json.dumps(metadata, sort_keys=True) + "\n")
+        self.assert_contract_rejected("canonical contract metadata mismatch")
+
+    def test_canonical_section_tampering_cannot_authorize_bootstrap(self) -> None:
+        path = self.task / ".task-state/task.md"
+        path.write_text(path.read_text().replace(
+            "## Scope\n\n- Authoritative source:",
+            "## Scope\n\n- Locally fabricated authority\n\n- Authoritative source:",
+        ))
+        self.assert_contract_rejected("canonical Task State section is tampered: Scope")
+
+    def test_contract_evidence_drift_before_locked_mutation_is_rejected(self) -> None:
+        bridge = self.candidate / "tools/automation_recovery_bridge.py"
+        source = bridge.read_text()
+        needle = "    result = engine.apply(\n"
+        self.assertEqual(1, source.count(needle))
+        bridge.write_text(source.replace(
+            needle,
+            "    issue_path = target / '.task-state/issue.json'\n"
+            "    issue_path.write_bytes(issue_path.read_bytes() + b' ')\n"
+            + needle,
+        ))
+        self.git(self.candidate, "add", "tools/automation_recovery_bridge.py")
+        self.git(self.candidate, "commit", "-m", "inject contract drift for test")
+        self.implementation_revision = self.git(self.candidate, "rev-parse", "HEAD")
+        self.assert_contract_rejected("canonical Task Contract evidence drifted before locked mutation")
 
     def test_missing_canonical_transition_is_rejected_before_version_change(self) -> None:
         migration = self.candidate / "components/agent-core/.automation/migrations.toml"

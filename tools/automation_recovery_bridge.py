@@ -623,18 +623,6 @@ def _bootstrap_target_identity(engine, target: Path) -> dict:
     status = re.findall(r"(?m)^- Status: ([^\n]+)$", state_text)
     if status != ["initialized"]:
         raise BridgeError("bootstrap-upgrade requires pristine initialized Task State")
-    purpose = re.search(r"(?ms)^## Purpose\s*\n(.*?)(?=^## |\Z)", state_text)
-    scope = re.search(r"(?ms)^## Scope\s*\n(.*?)(?=^## |\Z)", state_text)
-    maintenance_text = "\n".join(
-        match.group(1).strip() if match is not None else "" for match in (purpose, scope)
-    )
-    if (
-        not purpose
-        or not scope
-        or "agent core" not in maintenance_text.lower()
-        or not re.search(r"(?i)\b(?:bootstrap|maintenance|upgrade)\b", maintenance_text)
-    ):
-        raise BridgeError("bootstrap-upgrade requires an explicit Agent Core maintenance Task contract")
     task_match = re.findall(r"(?m)^- Task ID: ([^\n]+)$", state_text)
     branch_match = re.findall(r"(?m)^- Branch: ([^\n]+)$", state_text)
     worktree_match = re.findall(r"(?m)^- Worktree: ([^\n]+)$", state_text)
@@ -654,7 +642,10 @@ def _bootstrap_target_identity(engine, target: Path) -> dict:
     except OSError as exc:
         raise BridgeError("cannot inspect bootstrap-upgrade Task State") from exc
     if not set(state_entries).issubset(
-        {"task.md", "work-units.lock", "automation-maintenance.json"}
+        {
+            "task.md", "issue.json", "contract.json", "work-units.lock",
+            "automation-maintenance.json",
+        }
     ):
         raise BridgeError("bootstrap-upgrade requires a Task with no lifecycle progress")
     records: dict[Path, tuple[str | None, str | None]] = {}
@@ -709,6 +700,42 @@ def _bootstrap_target_identity(engine, target: Path) -> dict:
     }
 
 
+def _bootstrap_contract_authority(contract, target: Path, task: str, directory_fd: int) -> dict:
+    """Validate and snapshot canonical Issue-backed authority in pinned Task State."""
+    if not re.fullmatch(r"[1-9][0-9]*", task):
+        raise BridgeError("bootstrap-upgrade requires a numeric Issue-backed Task identity")
+    try:
+        contract._assert_state_dir_binding(target, directory_fd)
+        evidence = {
+            name: contract._read_state_file(directory_fd, name)
+            for name in ("task.md", "issue.json", "contract.json")
+        }
+        validation = contract.validate_contract(target, task, require_pristine=True)
+        repository = contract.repository_identity(target)
+        confirmed_evidence = {
+            name: contract._read_state_file(directory_fd, name)
+            for name in ("task.md", "issue.json", "contract.json")
+        }
+        contract._assert_state_dir_binding(target, directory_fd)
+    except Exception as exc:
+        raise BridgeError(f"bootstrap-upgrade requires a canonical pristine Task Contract: {exc}") from exc
+    if validation.get("repository") != repository:
+        raise BridgeError("bootstrap-upgrade canonical Task Contract repository differs from origin")
+    if evidence != confirmed_evidence:
+        raise BridgeError("bootstrap-upgrade canonical Task Contract evidence changed during validation")
+    expected = {
+        "status": "READY",
+        "task": task,
+        "worktree": str(target),
+        "issue": int(task),
+        "repository": repository,
+        "sha256": validation.get("sha256"),
+    }
+    if validation != expected or any(content is None for content in evidence.values()):
+        raise BridgeError("bootstrap-upgrade canonical Task Contract identity is not exact")
+    return {"validation": validation, "evidence": evidence}
+
+
 def _live_managed_paths(engine, target: Path) -> set[str]:
     """Inventory the live managed surface without following target symlinks."""
     paths: set[str] = set()
@@ -740,12 +767,16 @@ def _live_managed_paths(engine, target: Path) -> set[str]:
     return paths
 
 
-def _bootstrap_upgrade(engine, target: Path, expected_revision: str, state_lock=None) -> dict:
+def _bootstrap_upgrade(engine, contract, target: Path, expected_revision: str) -> dict:
     identity = _bootstrap_target_identity(engine, target)
     if os.path.lexists(engine.receipt_path(target)) or engine.authority_exists(target):
         raise BridgeError(
             "bootstrap-upgrade is terminal and has already been applied; "
             "continue through the canonical automation maintenance lifecycle"
+        )
+    with contract.contract_state_lock(target) as directory_fd:
+        authority = _bootstrap_contract_authority(
+            contract, target, identity["task"], directory_fd
         )
     target_version_path = target / ".automation" / "VERSION"
     try:
@@ -812,6 +843,18 @@ def _bootstrap_upgrade(engine, target: Path, expected_revision: str, state_lock=
     if before_apply != identity:
         raise BridgeError("target HEAD, branch, worktree, main, or Task State drifted before apply")
 
+    @contextmanager
+    def mutation_authority():
+        with contract.contract_state_lock(target) as directory_fd:
+            locked_authority = _bootstrap_contract_authority(
+                contract, target, identity["task"], directory_fd
+            )
+            if locked_authority != authority:
+                raise BridgeError("canonical Task Contract evidence drifted before locked mutation")
+            if _bootstrap_target_identity(engine, target) != identity:
+                raise BridgeError("target HEAD, branch, worktree, main, or Task State drifted before locked mutation")
+            yield
+
     def validate_applied_tree() -> None:
         _clean_root(ROOT, expected_revision)
         if _bootstrap_target_identity(engine, target) != identity:
@@ -841,7 +884,7 @@ def _bootstrap_upgrade(engine, target: Path, expected_revision: str, state_lock=
         ROOT,
         expected_revision,
         validate_applied_tree,
-        state_lock,
+        mutation_authority,
     )
     if result.get("status") != "APPLIED" or sorted(result.get("changedPaths", [])) != expected:
         raise BridgeError("bootstrap-upgrade expected exactly one canonical live apply")
@@ -1706,22 +1749,15 @@ def main() -> int:
             elif args.command == "bootstrap-upgrade":
                 with _verified_modules(ROOT, revision) as modules:
                     engine = modules["automation_upgrade"]
+                    contract = modules["task_contract"]
                     if engine.git_executable().resolve() != trusted_git():
                         raise BridgeError("recovery engine selected a different Git executable")
                     _clean_root(ROOT, revision)
-
-                    @contextmanager
-                    def state_lock():
-                        contract = modules["task_contract"]
-                        with contract.contract_state_lock(target) as directory_fd:
-                            contract._assert_state_dir_binding(target, directory_fd)
-                            yield
-
                     result = _bootstrap_upgrade(
                         engine,
+                        contract,
                         target,
                         args.expected_source_revision,
-                        state_lock,
                     )
                     result["implementationRevision"] = revision
             else:
