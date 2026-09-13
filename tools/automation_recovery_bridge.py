@@ -9,16 +9,18 @@ import importlib.util
 import io
 import json
 import os
+import pwd
 import re
+import secrets
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
-from urllib.parse import quote
+from collections.abc import Mapping
 from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
-import secrets
-import subprocess
+from urllib.parse import quote
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -40,6 +42,8 @@ CANONICAL_MODULES = (
 )
 _TRUSTED_GIT: Path | None = None
 _TRUSTED_GH: Path | None = None
+_TRUSTED_GH_CONFIG_DIR: Path | None = None
+_TRUSTED_GH_TOKEN: str | None = None
 _REVISION_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _UNSAFE_LOCAL_CONFIG = re.compile(
     r"(?:include(?:if)?\..*|url\..*|http\..*|credential\..*|filter\..*|protocol\..*|"
@@ -94,13 +98,96 @@ def trusted_gh() -> Path:
     return executable
 
 
+def sanitized_environment(source: Mapping[str, str] | None = None) -> dict[str, str]:
+    values = os.environ if source is None else source
+    environment = {
+        key: values[key]
+        for key in ("NO_COLOR",)
+        if key in values
+    }
+    environment.update(
+        {
+            "LC_ALL": "C",
+            "LANG": "C",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    return environment
+
+
+def _operator_github_token() -> str:
+    for name in ("GH_TOKEN", "GITHUB_TOKEN"):
+        token = os.environ.get(name)
+        if token:
+            if any(character.isspace() for character in token) or len(token) > 4096:
+                raise BridgeError(f"{name} is not a valid bounded GitHub token")
+            return token
+
+    try:
+        account_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=True)
+        config_root = (account_home / ".config").resolve(strict=True)
+        gh_config = (config_root / "gh").resolve(strict=True)
+        metadata = gh_config.stat()
+    except (KeyError, OSError) as exc:
+        raise BridgeError(
+            "trusted GitHub authentication is unavailable; set GH_TOKEN or GITHUB_TOKEN"
+        ) from exc
+    if (
+        not gh_config.is_dir()
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise BridgeError("canonical GitHub configuration directory is unsafe")
+    environment = sanitized_environment()
+    environment.update(
+        {
+            "HOME": str(account_home),
+            "XDG_CONFIG_HOME": str(config_root),
+            "GH_CONFIG_DIR": str(gh_config),
+            "GH_HOST": "github.com",
+        }
+    )
+    result = subprocess.run(
+        [str(trusted_gh()), "auth", "token", "--hostname", "github.com"],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    token = result.stdout.strip()
+    if (
+        result.returncode
+        or not token
+        or any(character.isspace() for character in token)
+        or len(token) > 4096
+    ):
+        raise BridgeError(
+            "trusted GitHub authentication is unavailable; set GH_TOKEN or GITHUB_TOKEN"
+        )
+    return token
+
+
+def trusted_gh_environment() -> dict[str, str]:
+    global _TRUSTED_GH_TOKEN
+    if _TRUSTED_GH_CONFIG_DIR is None:
+        raise BridgeError("trusted GitHub environment is unavailable outside maintenance recovery")
+    if _TRUSTED_GH_TOKEN is None:
+        _TRUSTED_GH_TOKEN = _operator_github_token()
+    return {
+        "GH_CONFIG_DIR": str(_TRUSTED_GH_CONFIG_DIR),
+        "GH_HOST": "github.com",
+        "GH_TOKEN": _TRUSTED_GH_TOKEN,
+    }
+
+
 def trusted_gh_run(command: list[str], **kwargs):
     if not command or command[0] != "gh":
         raise BridgeError("Task Contract GitHub runner only accepts gh commands")
-    environment = dict(kwargs.pop("env", os.environ))
-    for key in list(environment):
-        if key in {"GH_REPO", "GH_HOST", "GH_ENTERPRISE_TOKEN", "GITHUB_REPOSITORY"}:
-            environment.pop(key, None)
+    environment = sanitized_environment(kwargs.pop("env", None))
+    environment.update(trusted_gh_environment())
     return subprocess.run([str(trusted_gh()), *command[1:]], env=environment, **kwargs)
 
 
@@ -190,14 +277,9 @@ def _pinned_run(command, *, cwd=None, check=True, remove_env=(), env_overrides=N
     if not command or command[0] not in {"git", "gh"}:
         raise BridgeError("verified maintenance runner accepts only Git or GitHub commands")
     executable = trusted_git() if command[0] == "git" else trusted_gh()
-    environment = {
-        key: value for key, value in os.environ.items()
-        if not key.startswith(("GIT_", "LD_", "DYLD_"))
-        and key not in {"EMAIL", "GH_REPO", "GH_HOST", "GH_ENTERPRISE_TOKEN", "GITHUB_REPOSITORY"}
-    }
-    if command[0] == "git":
-        environment.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
-                            "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"})
+    environment = sanitized_environment()
+    if command[0] == "gh":
+        environment.update(trusted_gh_environment())
     for name in remove_env:
         environment.pop(name, None)
     if env_overrides:
@@ -459,16 +541,29 @@ def _verified_engine(root: Path, revision: str):
 
 @contextmanager
 def maintenance_environment():
+    global _TRUSTED_GH_CONFIG_DIR, _TRUSTED_GH_TOKEN
     previous = dict(os.environ)
-    os.environ["AUTOMATION_MAINTENANCE"] = "1"
-    for key in list(os.environ):
-        if key.startswith("GIT_") or key in {"GH_REPO", "GH_HOST", "GH_ENTERPRISE_TOKEN", "GITHUB_REPOSITORY"}:
-            os.environ.pop(key, None)
-    try:
-        yield
-    finally:
-        os.environ.clear()
-        os.environ.update(previous)
+    previous_config = _TRUSTED_GH_CONFIG_DIR
+    previous_token = _TRUSTED_GH_TOKEN
+    with tempfile.TemporaryDirectory(prefix="automation-gh-") as directory:
+        private_config = Path(directory)
+        os.chmod(private_config, 0o700)
+        _TRUSTED_GH_CONFIG_DIR = private_config
+        _TRUSTED_GH_TOKEN = None
+        os.environ["AUTOMATION_MAINTENANCE"] = "1"
+        for key in list(os.environ):
+            if key.startswith("GIT_") or key in {
+                "GH_REPO", "GH_HOST", "GH_CONFIG_DIR", "GH_ENTERPRISE_TOKEN",
+                "GITHUB_REPOSITORY",
+            }:
+                os.environ.pop(key, None)
+        try:
+            yield
+        finally:
+            _TRUSTED_GH_TOKEN = previous_token
+            _TRUSTED_GH_CONFIG_DIR = previous_config
+            os.environ.clear()
+            os.environ.update(previous)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -498,6 +593,10 @@ def parser() -> argparse.ArgumentParser:
     publication.add_argument("target", type=Path)
     publication.add_argument("task", type=_issue_argument)
     publication.add_argument("expected_implementation_revision", type=_revision_argument)
+    publication_ready = sub.add_parser("publication-ready-recover")
+    publication_ready.add_argument("target", type=Path)
+    publication_ready.add_argument("task", type=_issue_argument)
+    publication_ready.add_argument("expected_implementation_revision", type=_revision_argument)
     return result
 
 
@@ -1130,6 +1229,178 @@ def _publication_recover(modules: dict, target: Path, task: str) -> dict:
     }
 
 
+def _source_publication_snapshot(modules: dict, target: Path, task: str) -> dict:
+    lifecycle = modules["task_lifecycle"]
+    core = modules["agent_core"]
+    contract = modules["task_contract"]
+    try:
+        if lifecycle.repo_root(target) != target:
+            raise BridgeError("target is not an exact Git worktree root")
+        current = lifecycle.current_worktree(target)
+        main = lifecycle.main_worktree(target)
+        record = lifecycle.worktree_for_task(target, task)
+        if current.path != target or record.path != target or current.path == main.path:
+            raise BridgeError("target is not the exact registered non-default Task worktree")
+        lifecycle.require_resolved_contract(record, task)
+        branch = core.ensure_task_branch(target, task)
+        if record.branch != branch:
+            raise BridgeError("registered Task branch identity changed")
+        repository = core.canonical_repository(target)
+        base = core.default_branch(target)
+        state = _state_bytes(target, "task.md", contract)
+        base_branch = re.search(rb"(?m)^- Base branch: ([^\r\n]+)$", state)
+        base_revision = re.search(rb"(?m)^- Base revision: ([0-9a-f]{40,64})$", state)
+        if not base_branch or base_branch.group(1).decode() != base or not base_revision:
+            raise BridgeError("Task base branch or revision is not canonical and stable")
+        status = lifecycle.state_status(lifecycle.state_path(target))
+        if status not in {"draft-pr-created", "integration-pending"}:
+            raise BridgeError(f"publication-ready recovery requires draft-pr-created or integration-pending; found {status}")
+        head = _target_git("rev-parse", "--verify", "HEAD^{commit}", target=target)
+        local = _target_git("rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}", target=target)
+        if head != local or record.head != head or _remote_branch_head(target, repository, branch) != head:
+            raise BridgeError("Task HEAD, local branch, and remote branch differ")
+        if _target_git("status", "--porcelain=v1", "--untracked-files=all", target=target):
+            raise BridgeError("target worktree must be clean")
+        verification = _state_bytes(target, "verification.json", contract)
+        if modules["publication_metadata"].verification_evidence(target, task, head) is None:
+            raise BridgeError("missing persisted verification evidence")
+        modules["publication_metadata"].completed_reviews(target, task)
+        changed = _target_git("diff", "--name-only", f"{base_revision.group(1).decode()}...{head}", target=target).splitlines()
+        title, body = modules["publication_metadata"].canonical_metadata(
+            target, task, head=head, changed_paths=changed
+        )
+        persisted_title, persisted_body = modules["publication_metadata"].read_and_validate_metadata(
+            target, receipt=json.loads(verification.decode("utf-8"))
+        )
+        if title != persisted_title or not modules["publication_metadata"].canonical_pr_body_matches(body, persisted_body):
+            raise BridgeError("persisted publication metadata is not canonical")
+    except BridgeError:
+        raise
+    except Exception as exc:
+        raise BridgeError(str(exc)) from exc
+    return {
+        "record": record, "head": head, "branch": branch, "repository": repository,
+        "base": base, "state": state, "status": status, "verification": verification,
+        "work_units": _state_bytes(target, "work-units.json", contract),
+        "contract": _state_bytes(target, "contract.json", contract),
+        "issue": _optional_state_bytes(target, "issue.json", contract),
+        "tree": _target_git("rev-parse", "HEAD^{tree}", target=target),
+        "title": title, "body": body,
+    }
+
+
+def _source_pr_list(target: Path, repository: str, branch: str) -> list[dict]:
+    result = _pinned_run(["gh", "pr", "list", "--repo", repository, "--head", branch,
+                          "--state", "all", "--limit", "100", "--json",
+                          "number,title,body,headRefName,baseRefName,isDraft,isCrossRepository,state,headRefOid"], cwd=target)
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise BridgeError("invalid pull request list returned by GitHub") from exc
+    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
+        raise BridgeError("GitHub pull request list is not an array of objects")
+    if len(value) != 1:
+        raise BridgeError("exactly one Task-branch pull request is required")
+    return value
+
+
+def _source_pr(core, target: Path, snapshot: dict, *, ready: bool | None) -> tuple[dict, int]:
+    listed = _source_pr_list(target, snapshot["repository"], snapshot["branch"])
+    pr = core.pr_for_branch(target, snapshot["branch"], snapshot["repository"])
+    if not isinstance(pr, dict) or pr.get("number") != listed[0].get("number"):
+        raise BridgeError("canonical pull request resolution disagrees with the unique source listing")
+    number = pr.get("number")
+    if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+        raise BridgeError("pull request number must be a positive non-bool integer")
+    is_draft = pr.get("isDraft")
+    if not isinstance(is_draft, bool):
+        raise BridgeError("pull request Draft state is invalid")
+    expected_draft = is_draft if ready is None else not ready
+    try:
+        core._validate_live_pr(pr, branch=snapshot["branch"], base=snapshot["base"],
+                               head=snapshot["head"], title=snapshot["title"],
+                               body=snapshot["body"], draft=expected_draft)
+    except Exception as exc:
+        raise BridgeError(str(exc)) from exc
+    if pr.get("isCrossRepository") is not False:
+        raise BridgeError("cross-repository pull requests are not valid recovery targets")
+    return pr, number
+
+
+def _publication_ready_recover(modules: dict, target: Path, task: str) -> dict:
+    before = _source_publication_snapshot(modules, target, task)
+    try:
+        if _read_publication_recovery_receipt(modules, target) is not None:
+            raise BridgeError("publication-recovery receipt exists; refusing to proceed")
+    except BridgeError:
+        raise
+    except Exception as exc:
+        raise BridgeError(str(exc)) from exc
+    expected_ready = True if before["status"] == "integration-pending" else None
+    pr, number = _source_pr(modules["agent_core"], target, before, ready=expected_ready)
+    if before["status"] == "integration-pending":
+        terminal = _source_publication_snapshot(modules, target, task)
+        if terminal != before:
+            raise BridgeError("Ready recovery terminal subject changed during validation")
+        if _read_publication_recovery_receipt(modules, target) is not None:
+            raise BridgeError("publication-recovery receipt appeared during terminal validation")
+        final, final_number = _source_pr(
+            modules["agent_core"], target, terminal, ready=True
+        )
+        if final_number != number:
+            raise BridgeError("Ready recovery pull request identity changed during terminal validation")
+        return {"status": "INTEGRATION_PENDING", "task": task, "pullRequest": final,
+                "branch": before["branch"], "head": before["head"], "repository": before["repository"]}
+    # Re-read every guarded input immediately before the sole canonical mutation.
+    latest = _source_publication_snapshot(modules, target, task)
+    if any(latest[key] != before[key] for key in ("record", "head", "branch", "repository", "base", "state", "verification", "work_units", "contract", "issue", "tree", "title", "body")):
+        raise BridgeError("Ready recovery subject changed before canonical pr_ready")
+    _, latest_number = _source_pr(modules["agent_core"], target, latest, ready=None)
+    if latest_number != number:
+        raise BridgeError("pull request identity changed before canonical pr_ready")
+    core = modules["agent_core"]
+    original_verify = core.verify
+
+    def exact_verify(root: Path, requested_task: str) -> None:
+        if root.resolve() != target or requested_task != task:
+            raise BridgeError("Ready recovery verification target changed")
+        _validate_target_git_configuration(target)
+        current = _source_publication_snapshot(modules, target, task)
+        protected = (
+            "record", "head", "branch", "repository", "base", "state", "status",
+            "verification", "work_units", "contract", "issue", "tree", "title", "body",
+        )
+        if any(current[name] != before[name] for name in protected):
+            raise BridgeError("Ready recovery subject changed inside canonical pr_ready")
+        if _read_publication_recovery_receipt(modules, target) is not None:
+            raise BridgeError("publication-recovery receipt appeared before Ready mutation")
+    try:
+        core.verify = exact_verify
+        core.pr_ready(target, task, expected_pr_number=number)
+    finally:
+        core.verify = original_verify
+    after = _source_publication_snapshot(modules, target, task)
+    if after["status"] != "integration-pending":
+        raise BridgeError("Ready recovery canonical pr_ready did not reach integration-pending")
+    if any(after[key] != before[key] for key in ("record", "head", "branch", "repository", "base", "verification", "work_units", "contract", "issue", "tree")):
+        raise BridgeError("Ready recovery changed protected evidence or product content")
+    if _target_git("status", "--porcelain=v1", "--untracked-files=all", target=target):
+        raise BridgeError("Ready recovery changed tracked product content")
+    if _read_publication_recovery_receipt(modules, target) is not None:
+        raise BridgeError("Ready recovery receipt appeared after canonical pr_ready")
+    expected_state = re.sub(
+        rb"(?m)^- Status: draft-pr-created$", b"- Status: integration-pending",
+        before["state"], count=1,
+    )
+    if expected_state == before["state"] or after["state"] != expected_state:
+        raise BridgeError("Ready recovery changed Task State beyond draft-pr-created -> integration-pending")
+    final, final_number = _source_pr(core, target, after, ready=True)
+    if final_number != number:
+        raise BridgeError("Ready recovery pull request identity changed after canonical pr_ready")
+    return {"status": "INTEGRATION_PENDING", "task": task, "pullRequest": final,
+            "branch": before["branch"], "head": before["head"], "repository": before["repository"]}
+
+
 def main() -> int:
     revision = None
     failure = None
@@ -1140,14 +1411,14 @@ def main() -> int:
         revision = _clean_root(
             ROOT,
             args.expected_implementation_revision
-            if args.command in {"maintenance-finalize", "publication-recover"} else None,
+            if args.command in {"maintenance-finalize", "publication-ready-recover", "publication-recover"} else None,
         )
         _verify_bootstrap(ROOT, revision)
         _clean_root(ROOT, revision)
         target = args.target.resolve()
-        if args.command in {"maintenance-finalize", "publication-recover"} and target == ROOT:
+        if args.command in {"maintenance-finalize", "publication-ready-recover", "publication-recover"} and target == ROOT:
             raise BridgeError(f"{args.command} target must not be the source root")
-        if args.command in {"maintenance-finalize", "publication-recover"}:
+        if args.command in {"maintenance-finalize", "publication-ready-recover", "publication-recover"}:
             _validate_target_git_configuration(target)
         with maintenance_environment():
             if args.command in {"recover-task-contract-from-issue", "resume-contract-check"}:
@@ -1166,6 +1437,11 @@ def main() -> int:
                     value = modules["maintenance_lifecycle"].maintenance_finalize(
                         target, args.task, int(args.pr)
                     )
+                    result = {**value, "implementationRevision": revision}
+            elif args.command == "publication-ready-recover":
+                with _verified_modules(ROOT, revision) as modules:
+                    _clean_root(ROOT, revision)
+                    value = _publication_ready_recover(modules, target, args.task)
                     result = {**value, "implementationRevision": revision}
             elif args.command == "publication-recover":
                 with _verified_modules(ROOT, revision) as modules:

@@ -416,6 +416,13 @@ def _validate_live_pr(pr: dict, *, branch: str, base: str, head: str, title: str
         raise AutomationError("live pull request metadata is stale or inconsistent: " + ", ".join(mismatches))
 
 
+def _validated_pr_number(pr: dict) -> int:
+    number = pr.get("number")
+    if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+        raise AutomationError("pull request identity is invalid")
+    return number
+
+
 def _validate_edit_target(pr: dict, *, branch: str, base: str, head: str) -> None:
     expected = {
         "headRefName": branch, "baseRefName": base, "headRefOid": head,
@@ -528,7 +535,16 @@ def pr_edit(root: Path, task: str, expected_pr_number: int | None = None) -> Non
     print(f"updated PR #{pr['number']}")
 
 
-def pr_ready(root: Path, task: str) -> None:
+def pr_ready(root: Path, task: str, expected_pr_number: int | None = None) -> None:
+    if (
+        expected_pr_number is not None
+        and (
+            not isinstance(expected_pr_number, int)
+            or isinstance(expected_pr_number, bool)
+            or expected_pr_number < 1
+        )
+    ):
+        raise AutomationError("expected pull request number is invalid")
     verify(root, task)
     branch, context, head = _publication_context(root, task)
     if context["status"] != "draft-pr-created":
@@ -538,24 +554,64 @@ def pr_ready(root: Path, task: str) -> None:
     pr = pr_for_branch(root, branch, repository)
     if not pr:
         raise AutomationError(f"no pull request for {branch}")
+    number = pr["number"]
+    base = None
+    if expected_pr_number is not None:
+        number = _validated_pr_number(pr)
+        if number != expected_pr_number:
+            raise AutomationError("pull request identity changed before mutation")
+        base = default_branch(root)
+
+    def require_guarded_context() -> None:
+        verify(root, task)
+        guarded_branch, guarded_context, guarded_head = _publication_context(root, task)
+        if (
+            guarded_branch != branch
+            or guarded_head != head
+            or guarded_context["repository"].casefold() != repository.casefold()
+            or guarded_context["status"] != context["status"]
+            or guarded_context["record"] != context["record"]
+        ):
+            raise AutomationError("Task publication context changed during guarded readiness")
+        guarded_base = default_branch(root)
+        if guarded_base != base:
+            raise AutomationError("repository default branch changed during guarded readiness")
+        guarded_title, _, guarded_body = _validated_local_metadata(root, task, guarded_head)
+        if guarded_title != title or not publication.canonical_pr_body_matches(body, guarded_body):
+            raise AutomationError("local publication metadata changed during guarded readiness")
+
     if pr.get("isDraft"):
-        _validate_live_pr(pr, branch=branch, base=default_branch(root), head=head, title=title, body=body, draft=True)
-        gh("pr", "ready", str(pr["number"]), "--repo", repository, cwd=root)
+        _validate_live_pr(pr, branch=branch, base=base or default_branch(root), head=head, title=title, body=body, draft=True)
+        if expected_pr_number is not None:
+            require_guarded_context()
+            before_ready = pr_for_branch(root, branch, repository)
+            if not before_ready or _validated_pr_number(before_ready) != number:
+                raise AutomationError("pull request identity changed before mutation")
+            _validate_live_pr(before_ready, branch=branch, base=base, head=head, title=title, body=body, draft=True)
+        gh("pr", "ready", str(number), "--repo", repository, cwd=root)
         if canonical_repository(root).casefold() != repository.casefold():
             raise AutomationError("repository identity changed while marking pull request ready")
         ready = pr_for_branch(root, branch, repository)
-        if not ready or ready.get("number") != pr.get("number"):
+        if not ready or ready.get("number") != number:
             raise AutomationError("pull request identity changed while marking ready")
-        _validate_live_pr(ready, branch=branch, base=default_branch(root), head=head, title=title, body=body, draft=False)
+        if expected_pr_number is not None:
+            _validated_pr_number(ready)
+        _validate_live_pr(ready, branch=branch, base=base or default_branch(root), head=head, title=title, body=body, draft=False)
     else:
         # Reconcile an earlier successful GitHub readiness write whose local
         # lifecycle transition was interrupted.
-        _validate_live_pr(pr, branch=branch, base=default_branch(root), head=head, title=title, body=body, draft=False)
+        _validate_live_pr(pr, branch=branch, base=base or default_branch(root), head=head, title=title, body=body, draft=False)
+    if expected_pr_number is not None:
+        require_guarded_context()
+        before_transition = pr_for_branch(root, branch, repository)
+        if not before_transition or _validated_pr_number(before_transition) != number:
+            raise AutomationError("pull request identity changed before lifecycle transition")
+        _validate_live_pr(before_transition, branch=branch, base=base, head=head, title=title, body=body, draft=False)
     try:
         lifecycle.mark_task_publication_state(context["record"], task, "draft-pr-created", "integration-pending")
     except lifecycle.LifecycleError as exc:
         raise AutomationError(str(exc)) from exc
-    print(f"PR #{pr['number']} marked ready")
+    print(f"PR #{number} marked ready")
 
 
 def cleanup(root: Path, task: str) -> None:
