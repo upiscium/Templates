@@ -2,6 +2,7 @@
 description: Read-only repository exploration and reference tracing
 mode: subagent
 model: openai/gpt-5.6-luna
+reasoningEffort: max
 permission:
   edit: deny
   task: deny
