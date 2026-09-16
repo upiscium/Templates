@@ -68,7 +68,9 @@ class OpencodeContractIntegrationTest(unittest.TestCase):
         core = ROOT / "components" / "agent-core" / ".automation"
         self.assertEqual("3\n", (core / "VERSION").read_text(encoding="utf-8"))
         self.assertEqual(
-            "https://github.com/upiscium/Templates.git\n",
+            'repository = "github:upiscium/Templates"\n'
+            'ref = "main"\n'
+            'component = "components/agent-core"\n',
             (core / "UPSTREAM").read_text(encoding="utf-8"),
         )
 
