@@ -1,0 +1,149 @@
+name: One-shot Luna Max consumer migration
+
+on:
+  push:
+    branches: [feat/luna-max-reasoning]
+    paths:
+      - .github/workflows/luna-max-migration.yml
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: feat/luna-max-reasoning
+          fetch-depth: 0
+
+      - uses: cachix/install-nix-action@v31
+
+      - name: Migrate Agent Core model assignments
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path('.')
+          agents = root / 'components' / 'agent-core' / '.opencode' / 'agents'
+          migration = {
+              'plan': 'openai/gpt-5.6-sol',
+              'reviewer': 'openai/gpt-5.6-terra',
+              'investigator': 'openai/gpt-5.6-terra',
+              'task-orchestrator': 'openai/gpt-5.6-sol',
+          }
+
+          for role, old_model in migration.items():
+              path = agents / f'{role}.md'
+              text = path.read_text(encoding='utf-8')
+              old = f'model: {old_model}\n'
+              new = 'model: openai/gpt-5.6-luna\nreasoningEffort: max\n'
+              if old not in text:
+                  raise SystemExit(f'missing expected model line in {path}: {old_model}')
+              if 'reasoningEffort: max' in text:
+                  raise SystemExit(f'unexpected pre-existing max reasoning in {path}')
+              path.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          contract_test = root / 'tests' / 'test_opencode_contract.py'
+          text = contract_test.read_text(encoding='utf-8')
+
+          replacements = [
+              ('"plan.md": "openai/gpt-5.6-sol",', '"plan.md": "openai/gpt-5.6-luna",'),
+              ('"task-orchestrator.md": "openai/gpt-5.6-sol",', '"task-orchestrator.md": "openai/gpt-5.6-luna",'),
+              ('"reviewer.md": "openai/gpt-5.6-terra",', '"reviewer.md": "openai/gpt-5.6-luna",'),
+              ('"investigator.md": "openai/gpt-5.6-terra",', '"investigator.md": "openai/gpt-5.6-luna",'),
+              ('self.assertIn("model: openai/gpt-5.6-sol", front)', 'self.assertIn("model: openai/gpt-5.6-luna", front)'),
+              ('self.assertEqual(data["model"], {"providerID": "openai", "modelID": "gpt-5.6-sol"})',
+               'self.assertEqual(data["model"], {"providerID": "openai", "modelID": "gpt-5.6-luna"})'),
+              (
+                  '''            {\n                "build.md",\n                "plan.md",\n                "task-orchestrator.md",\n                "maintenance-orchestrator.md",\n                "architect.md",\n            },''',
+                  '''            {\n                "build.md",\n                "maintenance-orchestrator.md",\n                "architect.md",\n            },''',
+              ),
+              (
+                  'self.assertEqual(luna_agents, {"general.md", "explore.md", "verifier.md", "scout.md"})',
+                  'self.assertEqual(luna_agents, {"plan.md", "task-orchestrator.md", "general.md", "explore.md", "verifier.md", "reviewer.md", "investigator.md", "scout.md"})',
+              ),
+              (
+                  'self.assertEqual(terra_agents, {"reviewer.md", "investigator.md", "security-reviewer.md"})',
+                  'self.assertEqual(terra_agents, {"security-reviewer.md"})',
+              ),
+          ]
+          for old, new in replacements:
+              if old not in text:
+                  raise SystemExit(f'missing expected test contract fragment: {old[:100]!r}')
+              text = text.replace(old, new, 1)
+          contract_test.write_text(text, encoding='utf-8')
+
+          reasoning_test = root / 'tests' / 'test_luna_reasoning_contract.py'
+          text = reasoning_test.read_text(encoding='utf-8')
+          old = 'LUNA_AGENTS = {"general", "explore", "verifier", "scout"}'
+          new = 'LUNA_AGENTS = {"plan", "task-orchestrator", "general", "explore", "verifier", "reviewer", "investigator", "scout"}'
+          if old not in text:
+              raise SystemExit('missing Luna reasoning role set')
+          reasoning_test.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          docs = root / 'docs' / 'agent-template-architecture.md'
+          text = docs.read_text(encoding='utf-8')
+          doc_replacements = [
+              ('| Main Orchestrator / planning / architecture | GPT-5.6 Sol | decomposition, orchestration, integration decisions |',
+               '| Main Orchestrator / architecture | GPT-5.6 Sol | repository-wide orchestration, integration, consequential architecture decisions |'),
+              ('| Task Orchestrator | GPT-5.6 Sol | bounded Task orchestration |',
+               '| Task Orchestrator / plan | GPT-5.6 Luna (max) | high-frequency Task coordination and read-only planning |'),
+              ('| general / explore | GPT-5.6 Luna | implementation and discovery |',
+               '| general / explore | GPT-5.6 Luna (max) | bounded implementation and discovery |'),
+              ('| verifier / scout | GPT-5.6 Luna | deterministic verification and lightweight external research |',
+               '| verifier / scout | GPT-5.6 Luna (max) | deterministic verification and lightweight external research |'),
+              ('| reviewer / investigator / security-reviewer | GPT-5.6 Terra | analysis, diagnosis, review |',
+               '| reviewer / investigator | GPT-5.6 Luna (max) | correctness review and root-cause investigation |\n| security-reviewer | GPT-5.6 Terra | security-boundary and attack-path review |'),
+              ('This split assigns Sol to orchestration and architecture, Luna to bounded implementation/reconnaissance/verification/research, and Terra to review/investigation/security.',
+               'This split keeps Sol on repository-wide orchestration and consequential architecture, uses Luna Max for high-frequency Task coordination plus bounded planning/implementation/reconnaissance/verification/research/review/investigation, and keeps Terra on security review.'),
+          ]
+          for old, new in doc_replacements:
+              if old in text:
+                  text = text.replace(old, new, 1)
+          docs.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Regenerate templates
+        run: python3 tools/render_templates.py render-all
+
+      - name: Update OpencodeContract lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          nix flake update opencodeContract
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          expected = '8c718bfebd835e3b2192b8c675319fe655c6ebce'
+          lock = json.loads(Path('flake.lock').read_text(encoding='utf-8'))
+          actual = lock['nodes']['opencodeContract']['locked']['rev']
+          if actual != expected:
+              raise SystemExit(f'OpencodeContract revision mismatch: expected {expected}, got {actual}')
+          PY
+
+      - name: Verify generated state
+        run: |
+          python3 tools/render_templates.py check
+          python3 -m unittest tests.test_luna_reasoning_contract -v
+          python3 -m unittest \
+            tests.test_opencode_contract.OpenCodeContractTest.test_model_assignment_is_exact \
+            tests.test_opencode_contract.OpenCodeContractTest.test_fixed_model_groups_are_exact \
+            tests.test_opencode_contract.OpenCodeContractTest.test_plan_agent_repository_local_read_only_contract \
+            tests.test_opencode_contract.OpenCodeContractTest.test_opencode_debug_agent_plan_effective_policy_when_cli_available \
+            -v
+
+      - name: Commit migration and remove one-shot workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/luna-max-migration.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git diff --cached --check
+          git commit -m 'refactor: migrate Agent Core roles to Luna Max'
+          git push origin HEAD:feat/luna-max-reasoning
