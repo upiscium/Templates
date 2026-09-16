@@ -1,7 +1,8 @@
 ---
 description: Read-only correctness and maintainability reviewer
 mode: subagent
-model: openai/gpt-5.6-terra
+model: openai/gpt-5.6-luna
+reasoningEffort: max
 permission:
   edit: deny
   task: deny

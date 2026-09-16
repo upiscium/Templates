@@ -13,7 +13,7 @@ TEMPLATES = (
     "agent-nix",
     "agent-cpp-cmake",
 )
-LUNA_AGENTS = {"general", "explore", "verifier", "scout"}
+LUNA_AGENTS = {"plan", "task-orchestrator", "general", "explore", "verifier", "reviewer", "investigator", "scout"}
 
 
 def frontmatter(path: Path) -> str:
