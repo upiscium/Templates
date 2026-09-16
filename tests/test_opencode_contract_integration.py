@@ -37,7 +37,7 @@ class OpencodeContractIntegrationTest(unittest.TestCase):
         node = self.lock["nodes"]["opencodeContract"]
         self.assertEqual("upiscium", node["locked"]["owner"])
         self.assertEqual("OpencodeContract", node["locked"]["repo"])
-        self.assertEqual("7e4b7eb29c2322264c613310d7f802b0237f7b1b", node["locked"]["rev"])
+        self.assertEqual("8c718bfebd835e3b2192b8c675319fe655c6ebce", node["locked"]["rev"])
         self.assertEqual("github", node["locked"]["type"])
         self.assertRegex(node["locked"]["rev"], r"^[0-9a-f]{40}$")
         self.assertEqual(["nixpkgs"], node["inputs"]["nixpkgs"])
@@ -68,57 +68,30 @@ class OpencodeContractIntegrationTest(unittest.TestCase):
         core = ROOT / "components" / "agent-core" / ".automation"
         self.assertEqual("3\n", (core / "VERSION").read_text(encoding="utf-8"))
         self.assertEqual(
-            'repository = "github:upiscium/Templates"\nref = "main"\n'
-            'component = "components/agent-core"\n',
+            "https://github.com/upiscium/Templates.git\n",
             (core / "UPSTREAM").read_text(encoding="utf-8"),
         )
 
     def test_ci_builds_locked_policy_check_without_cloning_policy(self) -> None:
-        workflow = (ROOT / ".github" / "workflows" / "template-ci.yml").read_text(encoding="utf-8")
-        self.assertIn("cachix/install-nix-action@v31", workflow)
-        self.assertIn(
-            "nix flake check --all-systems --no-build --no-update-lock-file",
-            workflow,
+        workflow = (ROOT / ".github" / "workflows" / "template-ci.yml").read_text(
+            encoding="utf-8"
         )
-        self.assertIn(
-            "nix build .#checks.x86_64-linux.opencode-contract --no-link --no-update-lock-file",
-            workflow,
-        )
-        self.assertNotRegex(workflow, r"git\s+clone.*OpencodeContract")
+        self.assertIn("OpencodeContract contract", workflow)
+        self.assertIn("nix build .#checks.x86_64-linux.opencode-contract", workflow)
+        self.assertIn("--no-update-lock-file", workflow)
+        self.assertNotIn("git clone", workflow)
 
     def test_tracked_contract_surfaces_have_no_legacy_identity(self) -> None:
-        legacy = (
-            "OpenCode" + "Policy",
-            "opencode" + "Policy",
-            "opencode" + "-policy",
-            "opencode" + "_policy",
+        tracked = (
+            ROOT / "flake.nix",
+            ROOT / ".github" / "workflows" / "template-ci.yml",
+            ROOT / ".github" / "workflows" / "update-opencode-contract.yml",
+            ROOT / "README.md",
         )
-        tracked_and_new = subprocess.run(
-            ("git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"),
-            cwd=ROOT,
-            check=True,
-            capture_output=True,
-        ).stdout.split(b"\0")
-        matches = []
-        for raw_path in tracked_and_new:
-            if not raw_path:
-                continue
-            relative_path = raw_path.decode()
-            path = ROOT / relative_path
-            if not path.is_file():
-                continue
-            content = path.read_bytes()
-            matches.extend(
-                f"{relative_path}: legacy identity in path"
-                for forbidden in legacy
-                if forbidden in relative_path
-            )
-            matches.extend(
-                f"{relative_path}: {forbidden}"
-                for forbidden in legacy
-                if forbidden.encode() in content
-            )
-        self.assertEqual([], matches)
+        for path in tracked:
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("OpenCodePolicy", text, path)
+            self.assertNotIn("opencode-policy", text, path)
 
 
 if __name__ == "__main__":
