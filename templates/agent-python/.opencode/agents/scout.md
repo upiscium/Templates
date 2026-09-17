@@ -2,6 +2,7 @@
 description: External primary-source research specialist
 mode: subagent
 model: openai/gpt-5.6-luna
+reasoningEffort: max
 permission:
   edit: deny
   task: deny
