@@ -123,15 +123,46 @@ class AdoptRepositoryTest(unittest.TestCase):
         self.assertTrue((repo / ".automation" / "VERSION").is_file())
 
     def test_repository_owned_path_policy_is_consistent_across_adapters(self) -> None:
-        for adapter in ("base", "cpp-cmake", "python", "rust", "nix"):
+        for adapter in ("base", "cpp-cmake", "python", "rust", "nix", "typescript-node"):
             with self.subTest(adapter=adapter):
                 policy = adopt_repository.load_policy(ROOT, adapter)
                 self.assertIn("README.md", policy["preserve_existing"])
 
-        for adapter in ("cpp-cmake", "python", "rust", "nix"):
+        for adapter in ("cpp-cmake", "python", "rust", "nix", "typescript-node"):
             with self.subTest(adapter=adapter):
                 policy = adopt_repository.load_policy(ROOT, adapter)
                 self.assertIn(".envrc", policy["preserve_existing"])
+
+    def test_typescript_node_discode_shaped_plan_is_collision_safe(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        owned = {
+            "package.json": '{"name":"discode","engines":{"node":">=22 <23"},"scripts":{"lint":"eslint ."}}\n',
+            "package-lock.json": '{"name":"discode","lockfileVersion":3,"packages":{"":{"name":"discode"}}}\n',
+            "flake.nix": "{ outputs = { self }: {}; }\n",
+            ".github/workflows/ci.yml": "name: CI\n",
+            "scripts/repository-check.mjs": "// repository-owned\n",
+            "src/index.ts": "export const value: number = 1;\n",
+        }
+        for relative, content in owned.items():
+            path = repo / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        self.commit_all(repo)
+
+        plan = adopt_repository.build_plan(ROOT, repo, "auto")
+        actions = {action["path"]: action for action in plan["actions"]}
+
+        self.assertEqual(plan["selectedAdapter"], "typescript-node")
+        for relative in ("package.json", "package-lock.json", "flake.nix"):
+            self.assertEqual(actions[relative]["action"], "preserve")
+        self.assertNotIn(".github/workflows/ci.yml", actions)
+        self.assertNotIn("scripts/repository-check.mjs", actions)
+        self.assertTrue(plan["canApply"], plan["blockers"])
+
+        adopt_repository.apply_plan(ROOT, repo, "typescript-node")
+        for relative, content in owned.items():
+            self.assertEqual((repo / relative).read_text(encoding="utf-8"), content)
 
     def test_plan_reports_preserved_old_just_environment_prerequisite(self) -> None:
         temporary, repo = self.make_repo()
@@ -169,6 +200,24 @@ class AdoptRepositoryTest(unittest.TestCase):
 
         self.assertFalse(plan["canApply"])
         self.assertTrue(any("opencode.json" in blocker for blocker in plan["blockers"]))
+
+    def test_symlinked_destination_ancestor_blocks_apply(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        outside = repo.parent / f"{repo.name}-outside"
+        outside.mkdir()
+        self.addCleanup(outside.rmdir)
+        (repo / "package.json").write_text("{}\n", encoding="utf-8")
+        (repo / ".automation").symlink_to(outside, target_is_directory=True)
+        self.commit_all(repo)
+
+        plan = adopt_repository.build_plan(ROOT, repo, "typescript-node")
+
+        self.assertFalse(plan["canApply"])
+        self.assertTrue(any("traverses symlink" in blocker for blocker in plan["blockers"]))
+        with self.assertRaisesRegex(adopt_repository.AdoptionError, "adoption blocked"):
+            adopt_repository.apply_plan(ROOT, repo, "typescript-node")
+        self.assertEqual(list(outside.iterdir()), [])
 
     def test_dirty_repository_cannot_apply(self) -> None:
         temporary, repo = self.make_repo()

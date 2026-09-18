@@ -1,0 +1,23 @@
+version = 1
+
+preserve_existing = [
+  "README.md",
+  ".envrc",
+  "package.json",
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "bun.lock",
+  "bun.lockb",
+  "flake.nix",
+  "flake.lock",
+  ".github/workflows/**",
+  "scripts/**",
+]
+
+[line_merge]
+".gitignore" = ["/.worktrees/"]
+
+[structured_merge]
+Justfile = "agent-module-router"
+"AGENTS.md" = "agent-rules-block"

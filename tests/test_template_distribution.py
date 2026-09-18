@@ -27,6 +27,7 @@ class TemplateDistributionTest(unittest.TestCase):
                 "upiscium/Template-Agent-Nix",
                 "upiscium/Template-Agent-Python",
                 "upiscium/Template-Agent-Rust",
+                "upiscium/Template-Agent-TypeScript-Node",
             },
         )
         self.assertEqual(set(excluded), {"agent-base"})
