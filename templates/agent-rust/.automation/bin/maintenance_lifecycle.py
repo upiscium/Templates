@@ -100,7 +100,7 @@ def _validate_active_receipt(record: lifecycle.WorktreeRecord, task: str) -> dic
         or receipt.get("worktree") != str(record.path)
     ):
         raise MaintenanceError("active maintenance receipt identity mismatch")
-    if upgrade.consumed_receipt_path(record.path).exists():
+    if os.path.lexists(upgrade.consumed_receipt_path(record.path)):
         raise MaintenanceError("active and consumed maintenance receipts coexist")
     head = upgrade.git_head(record.path)
     if receipt.get("authority_head") != head or record.head != head:
@@ -131,7 +131,7 @@ def _validate_active_receipt(record: lifecycle.WorktreeRecord, task: str) -> dic
 def _validate_consumed_receipt(
     record: lifecycle.WorktreeRecord, task: str
 ) -> dict:
-    if upgrade.receipt_path(record.path).exists():
+    if os.path.lexists(upgrade.receipt_path(record.path)):
         raise MaintenanceError("active maintenance receipt still exists after commit")
     path = upgrade.consumed_receipt_path(record.path)
     value = _read_json_regular(path, "consumed maintenance receipt")
@@ -339,7 +339,7 @@ def _maintenance_stage(
 
     active = upgrade.receipt_path(record.path)
     consumed = upgrade.consumed_receipt_path(record.path)
-    if active.exists():
+    if os.path.lexists(active):
         receipt = _validate_active_receipt(record, task)
         return {
             **contract,
@@ -349,7 +349,7 @@ def _maintenance_stage(
             "stage": "applied",
             "sourceRevision": receipt["source_revision"],
         }
-    if consumed.exists():
+    if os.path.lexists(consumed):
         receipt = _validate_consumed_receipt(record, task)
         commit = receipt["commit_sha"]
         remote = _remote_head(record)
@@ -399,6 +399,278 @@ def _maintenance_stage(
 def maintenance_check(root_path: Path, task: str) -> dict:
     record, contract = _validated_contract(root_path, task)
     return _maintenance_stage(record, task, contract)
+
+
+def _optional_regular_bytes(path: Path, description: str) -> bytes | None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise MaintenanceError(f"{description} is unavailable or unsafe") from exc
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise MaintenanceError(f"{description} is unavailable or unsafe")
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        raise MaintenanceError(f"{description} is unavailable or unsafe") from exc
+
+
+def _require_no_refresh_evidence(record: lifecycle.WorktreeRecord, task: str) -> bytes | None:
+    units = lifecycle.read_work_units(record, task)
+    if units.get("units"):
+        raise MaintenanceError("Task Contract refresh requires no Work Units")
+    state = lifecycle.state_path(record.path).read_text(encoding="utf-8")
+    empty_fragments = (
+        "## Work Units\n\nNone yet.",
+        "### Changed files\n\nNone yet.",
+        "### Commands\n\nNone yet.",
+        "### Reviews\n\nNone yet.",
+        "- Commit: none",
+        "- Remote branch: none",
+        "- Pull request: none",
+        "- Published head SHA: none",
+    )
+    if any(state.count(fragment) != 1 for fragment in empty_fragments) or "### Maintenance publication" in state:
+        raise MaintenanceError("Task Contract refresh requires no review or publication evidence")
+    state_dir = record.path / ".task-state"
+    for name in ("verification.json", "pr-title.txt", "pr-body.md"):
+        if _optional_regular_bytes(state_dir / name, name) is not None:
+            raise MaintenanceError("Task Contract refresh requires no verification or publication evidence")
+    return _optional_regular_bytes(state_dir / "work-units.json", "Work Unit state")
+
+
+def _git_refresh_value(record: lifecycle.WorktreeRecord, *arguments: str) -> str:
+    try:
+        return lifecycle.run(["git", *arguments], cwd=record.path).stdout
+    except lifecycle.LifecycleError as exc:
+        raise MaintenanceError(str(exc)) from exc
+
+
+def _refresh_index_bytes(record: lifecycle.WorktreeRecord) -> bytes:
+    raw = _git_refresh_value(record, "rev-parse", "--git-path", "index").strip()
+    if not raw:
+        raise MaintenanceError("cannot resolve the Task worktree index")
+    path = Path(raw)
+    if not path.is_absolute():
+        path = record.path / path
+    value = _optional_regular_bytes(path, "Task worktree index")
+    if value is None:
+        raise MaintenanceError("Task worktree index is unavailable or unsafe")
+    return value
+
+
+def _refresh_identity(record: lifecycle.WorktreeRecord, task: str) -> dict:
+    text = lifecycle.state_path(record.path).read_text(encoding="utf-8")
+    values: dict[str, str] = {}
+    for label in ("Task ID", "Branch", "Worktree", "Base branch", "Base revision"):
+        matches = re.findall(rf"(?m)^- {re.escape(label)}: ([^\r\n]+)$", text)
+        if len(matches) != 1 or not matches[0].strip():
+            raise MaintenanceError(f"Task Contract refresh identity is ambiguous: {label}")
+        values[label] = matches[0].strip()
+    if (
+        values["Task ID"] != task
+        or values["Branch"] != record.branch
+        or Path(values["Worktree"]).resolve() != record.path
+    ):
+        raise MaintenanceError("Task Contract refresh Task/branch/worktree identity mismatch")
+    try:
+        default = lifecycle.default_branch(record.path)
+    except lifecycle.LifecycleError as exc:
+        raise MaintenanceError(str(exc)) from exc
+    if values["Base branch"] != default or re.fullmatch(
+        r"(?:[0-9a-f]{40}|[0-9a-f]{64})", values["Base revision"]
+    ) is None:
+        raise MaintenanceError("Task Contract refresh base identity mismatch")
+    return values
+
+
+def _refresh_protected_snapshot(
+    record: lifecycle.WorktreeRecord, task: str, stage: str, receipt: dict | None
+) -> dict:
+    fresh = lifecycle.worktree_for_task(record.path, task)
+    if fresh.path != record.path or fresh.branch != record.branch:
+        raise MaintenanceError("maintenance Task worktree identity changed")
+    if lifecycle.state_status(lifecycle.state_path(record.path)) != "initialized":
+        raise MaintenanceError("Task Contract refresh requires initialized Task State")
+    work_units = _require_no_refresh_evidence(record, task)
+    identity = _refresh_identity(record, task)
+    active_path = upgrade.receipt_path(record.path)
+    consumed_path = upgrade.consumed_receipt_path(record.path)
+    if os.path.lexists(consumed_path):
+        raise MaintenanceError("Task Contract refresh rejects a consumed maintenance receipt")
+    active = _optional_regular_bytes(active_path, "active maintenance receipt")
+    canonical_authority, legacy_authority = upgrade._authority_locations(record.path)
+    authority_paths = tuple(
+        dict.fromkeys(
+            path for path in (canonical_authority, legacy_authority) if path is not None
+        )
+    )
+    provenance_paths = tuple(
+        dict.fromkeys(
+            [upgrade.source_recovery_proof_path(record.path)]
+            + [path.parent / upgrade.SOURCE_RECOVERY_PROOF_NAME for path in authority_paths]
+        )
+    )
+    authorities = {
+        str(path): _optional_regular_bytes(path, "maintenance authority")
+        for path in authority_paths
+    }
+    provenances = {
+        str(path): _optional_regular_bytes(path, "maintenance provenance")
+        for path in provenance_paths
+    }
+    pending: list[str] = []
+    fingerprints: dict = {}
+    if stage == "applied":
+        validated = _validate_active_receipt(record, task)
+        if receipt is not None and validated != receipt:
+            raise MaintenanceError("active maintenance receipt changed during refresh")
+        paths = upgrade.receipt_paths(record.path, validated)
+        pending = upgrade.pending_paths(record.path)
+        fingerprints = {
+            path: upgrade.file_fingerprint(record.path, path) for path in paths
+        }
+        actual_authority = upgrade.validate_authority(record.path, validated)
+        if active is None or authorities.get(str(actual_authority)) is None:
+            raise MaintenanceError("applied maintenance authority is incomplete")
+        if identity["Base revision"] != validated.get("authority_head"):
+            raise MaintenanceError("applied maintenance receipt does not match Task Base revision")
+    elif stage == "pristine":
+        if (
+            active is not None
+            or any(value is not None for value in authorities.values())
+            or any(value is not None for value in provenances.values())
+        ):
+            raise MaintenanceError("pristine refresh rejects maintenance receipt or authority state")
+        base = identity["Base revision"]
+        head = _git_refresh_value(record, "rev-parse", "--verify", "HEAD^{commit}").strip()
+        if not base or head != base or _git_refresh_value(
+            record, "status", "--porcelain=v1", "--untracked-files=all"
+        ):
+            raise MaintenanceError("pristine refresh requires clean Task Base content")
+    else:  # pragma: no cover - internal callers provide the two allowed stages
+        raise MaintenanceError(f"unsupported Task Contract refresh stage: {stage}")
+    return {
+        "record": fresh,
+        "identity": identity,
+        "status": "initialized",
+        "head": _git_refresh_value(record, "rev-parse", "--verify", "HEAD^{commit}").strip(),
+        "head_tree": _git_refresh_value(record, "rev-parse", "HEAD^{tree}").strip(),
+        "branch_head": _git_refresh_value(
+            record, "rev-parse", "--verify", f"refs/heads/{record.branch}^{{commit}}"
+        ).strip(),
+        "refs": _git_refresh_value(record, "show-ref"),
+        "index": _refresh_index_bytes(record),
+        "index_diff": _git_refresh_value(record, "diff", "--cached", "--binary", "--no-ext-diff"),
+        "worktree_diff": _git_refresh_value(record, "diff", "--binary", "--no-ext-diff"),
+        "status_porcelain": _git_refresh_value(
+            record, "status", "--porcelain=v1", "--untracked-files=all"
+        ),
+        "work_units": work_units,
+        "receipt": active,
+        "authorities": authorities,
+        "provenances": provenances,
+        "pending_paths": pending,
+        "path_fingerprints": fingerprints,
+    }
+
+
+def _refresh_eligibility(
+    root_path: Path, task: str
+) -> tuple[lifecycle.WorktreeRecord, dict, str, dict | None, dict]:
+    record, contract = _stored_contract(root_path, task)
+    if lifecycle.state_status(lifecycle.state_path(record.path)) != "initialized":
+        raise MaintenanceError("Task Contract refresh requires initialized Task State")
+    if os.path.lexists(upgrade.consumed_receipt_path(record.path)):
+        raise MaintenanceError("Task Contract refresh rejects committed-or-later maintenance")
+    active = upgrade.receipt_path(record.path)
+    receipt = _validate_active_receipt(record, task) if active.exists() else None
+    stage = "applied" if receipt is not None else "pristine"
+    snapshot = _refresh_protected_snapshot(record, task, stage, receipt)
+    return record, contract, stage, receipt, snapshot
+
+
+def _require_exact_refresh_target(
+    root_path: Path, record: lifecycle.WorktreeRecord
+) -> None:
+    current = lifecycle.current_worktree(root_path)
+    if root_path.resolve() != record.path or current.path != record.path:
+        raise MaintenanceError(
+            "Task Contract refresh target must be the exact registered Task worktree"
+        )
+
+
+def maintenance_contract_refresh_inspect(
+    root_path: Path,
+    task: str,
+    expected_old_digest: str,
+    expected_new_digest: str,
+    *,
+    runner=None,
+) -> dict:
+    record, _, stage, _, before = _refresh_eligibility(root_path, task)
+    _require_exact_refresh_target(root_path, record)
+    try:
+        result = task_contract.inspect_task_contract_refresh(
+            record.path,
+            task,
+            expected_old_digest,
+            expected_new_digest,
+            runner=runner,
+        )
+    except task_contract.ContractError as exc:
+        raise MaintenanceError(str(exc)) from exc
+    after = _refresh_protected_snapshot(record, task, stage, None)
+    if after != before:
+        raise MaintenanceError("protected maintenance state changed during refresh inspection")
+    return {**result, "mode": "maintenance", "stage": stage}
+
+
+def maintenance_contract_refresh(
+    root_path: Path,
+    task: str,
+    expected_old_digest: str,
+    expected_new_digest: str,
+    *,
+    runner=None,
+    validate_external: Callable[[], None] | None = None,
+) -> dict:
+    record = lifecycle.worktree_for_task(root_path, task)
+    _require_exact_refresh_target(root_path, record)
+    try:
+        with upgrade.private_state.mutation_lock(record.path, admin=True):
+            locked_record, _, stage, receipt, before = _refresh_eligibility(
+                root_path, task
+            )
+            if locked_record != record:
+                raise MaintenanceError(
+                    "maintenance Task identity changed before Task Contract refresh"
+                )
+
+            def unchanged() -> None:
+                if validate_external is not None:
+                    validate_external()
+                current = _refresh_protected_snapshot(record, task, stage, receipt)
+                if current != before:
+                    raise MaintenanceError(
+                        "protected maintenance state changed during Task Contract refresh"
+                    )
+
+            result = task_contract.refresh_task_contract(
+                record.path,
+                task,
+                expected_old_digest,
+                expected_new_digest,
+                runner=runner,
+                validate_before_mutation=unchanged,
+                validate_after_mutation=unchanged,
+            )
+    except task_contract.ContractError as exc:
+        raise MaintenanceError(str(exc)) from exc
+    except upgrade.private_state.GitPrivateStateError as exc:
+        raise MaintenanceError(str(exc)) from exc
+    return {**result, "mode": "maintenance", "stage": stage}
 
 
 def _completed_role(
@@ -1033,6 +1305,14 @@ def parser() -> argparse.ArgumentParser:
     sub = value.add_subparsers(dest="command", required=True)
     check = sub.add_parser("check")
     check.add_argument("task")
+    refresh_inspect = sub.add_parser("contract-refresh-inspect")
+    refresh_inspect.add_argument("task")
+    refresh_inspect.add_argument("expected_old_digest")
+    refresh_inspect.add_argument("expected_new_digest")
+    refresh = sub.add_parser("contract-refresh")
+    refresh.add_argument("task")
+    refresh.add_argument("expected_old_digest")
+    refresh.add_argument("expected_new_digest")
     create = sub.add_parser("pr-create")
     create.add_argument("task")
     review = sub.add_parser("review-record")
@@ -1051,6 +1331,20 @@ def main() -> int:
         root_path = root()
         if args.command == "check":
             result = maintenance_check(root_path, args.task)
+        elif args.command == "contract-refresh-inspect":
+            result = maintenance_contract_refresh_inspect(
+                root_path,
+                args.task,
+                args.expected_old_digest,
+                args.expected_new_digest,
+            )
+        elif args.command == "contract-refresh":
+            result = maintenance_contract_refresh(
+                root_path,
+                args.task,
+                args.expected_old_digest,
+                args.expected_new_digest,
+            )
         elif args.command == "pr-create":
             result = maintenance_pr_create(root_path, args.task)
         elif args.command == "review-record":

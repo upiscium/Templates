@@ -23,6 +23,8 @@ permission:
     "just agent::contract-check *": allow
     "just agent::contract-resume-check *": allow
     "just automation::maintenance-check *": allow
+    "just automation::maintenance-contract-refresh-inspect *": allow
+    "just automation::maintenance-contract-refresh *": allow
     "just automation::maintenance-review-record *": allow
     "just automation::maintenance-pr-create *": deny
     "just automation::maintenance-finalize *": allow

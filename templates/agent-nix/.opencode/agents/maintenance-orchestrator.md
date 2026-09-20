@@ -15,6 +15,8 @@ permission:
     "just project::doctor": allow
     "just project::check": allow
     "just automation::maintenance-check *": allow
+    "just automation::maintenance-contract-refresh-inspect *": allow
+    "just automation::maintenance-contract-refresh *": deny
     "just automation::check-update *": allow
     "just automation::upgrade *": ask
     "just automation::commit *": allow
