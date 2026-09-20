@@ -28,7 +28,7 @@ WORK_UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _UNSAFE_NETWORK_GIT_CONFIG = re.compile(
     r"(?:include(?:if)?\..*|url\..*|http\..*|credential\..*|protocol\..*|"
     r"core\.(?:gitproxy|sshcommand)|"
-    r"remote\.origin\.(?:proxy|proxyauthmethod|receivepack|uploadpack))",
+    r"remote\.origin\.(?:proxy|proxyauthmethod|receivepack|uploadpack|vcs))",
     re.IGNORECASE,
 )
 _GITHUB_CLI_EXECUTABLE: Path | None = None
@@ -178,7 +178,11 @@ def _is_standard_github_https_origin(remote: str) -> bool:
 
 
 def _validate_network_git_configuration(root: Path) -> None:
-    def reject_unsafe(scope: str, label: str) -> None:
+    def reject_unsafe(
+        scope: str,
+        label: str,
+        additionally_unsafe: tuple[str, ...] = (),
+    ) -> None:
         result = run(
             ["git", "config", scope, "--no-includes", "--null", "--name-only", "--list"],
             cwd=root,
@@ -190,7 +194,11 @@ def _validate_network_git_configuration(root: Path) -> None:
         unsafe = sorted(
             name
             for name in result.stdout.split("\0")
-            if name and _UNSAFE_NETWORK_GIT_CONFIG.fullmatch(name)
+            if name
+            and (
+                _UNSAFE_NETWORK_GIT_CONFIG.fullmatch(name)
+                or name.casefold() in additionally_unsafe
+            )
         )
         if unsafe:
             raise LifecycleError(
@@ -218,7 +226,11 @@ def _validate_network_git_configuration(root: Path) -> None:
         if enabled.stdout.strip() not in {"true", "false"}:
             raise LifecycleError("extensions.worktreeConfig is not a valid boolean")
         if enabled.stdout.strip() == "true":
-            reject_unsafe("--worktree", "worktree-local")
+            reject_unsafe(
+                "--worktree",
+                "worktree-local",
+                additionally_unsafe=("remote.origin.url",),
+            )
 
 
 def _network_git_command(root: Path, args: list[str]) -> tuple[list[str], bool, Path | None]:
