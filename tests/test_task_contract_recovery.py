@@ -195,6 +195,10 @@ class TaskContractRecoveryTest(unittest.TestCase):
                         Path(loaded.__file__).resolve(), bridge.MAINTENANCE_PATH.resolve()
                     )
                     self.assertIs(sys.modules["maintenance_lifecycle"], loaded)
+                    self.assertEqual(
+                        modules["task_lifecycle"]._GITHUB_CLI_EXECUTABLE,
+                        Path("/usr/bin/gh"),
+                    )
             self.assertEqual(sys.path, old_path)
             self.assertIs(sys.modules["maintenance_lifecycle"], sentinel)
         finally:
