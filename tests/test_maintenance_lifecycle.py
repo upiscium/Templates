@@ -125,6 +125,33 @@ class MaintenanceLifecycleTest(unittest.TestCase):
             self.assertEqual(result["stage"], "applied")
             self.assertEqual(result["taskStatus"], "initialized")
 
+    def test_maintenance_stage_rejects_dangling_receipt_symlinks(self) -> None:
+        for kind in ("active", "consumed"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                record = self._record(root)
+                active = root / "active.json"
+                consumed = root / "consumed.json"
+                selected = active if kind == "active" else consumed
+                selected.symlink_to(root / "missing-receipt.json")
+                with (
+                    mock.patch.object(
+                        maintenance.lifecycle, "state_status", return_value="initialized"
+                    ),
+                    mock.patch.object(
+                        maintenance.upgrade, "receipt_path", return_value=active
+                    ),
+                    mock.patch.object(
+                        maintenance.upgrade,
+                        "consumed_receipt_path",
+                        return_value=consumed,
+                    ),
+                    self.assertRaises(maintenance.MaintenanceError),
+                ):
+                    maintenance._maintenance_stage(
+                        record, "21", self._contract(root)
+                    )
+
     def test_consumed_receipt_resumes_when_remote_is_old_ancestor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -980,6 +1007,12 @@ class MaintenanceLifecycleTest(unittest.TestCase):
         )
         bash = config["permission"]["bash"]
         self.assertEqual(bash["just automation::maintenance-check *"], "allow")
+        self.assertEqual(
+            bash["just automation::maintenance-contract-refresh-inspect *"], "allow"
+        )
+        self.assertEqual(
+            bash["just automation::maintenance-contract-refresh *"], "deny"
+        )
         self.assertEqual(bash["just automation::maintenance-review-record *"], "deny")
         self.assertEqual(bash["just automation::maintenance-pr-create *"], "deny")
         self.assertEqual(bash["just automation::maintenance-finalize *"], "deny")
@@ -990,6 +1023,7 @@ class MaintenanceLifecycleTest(unittest.TestCase):
             ROOT / "components" / "agent-core" / ".opencode" / "agents" / "build.md"
         ).read_text(encoding="utf-8")
         self.assertIn('"just automation::maintenance-review-record *": allow', build)
+        self.assertIn('"just automation::maintenance-contract-refresh *": allow', build)
         self.assertIn('"just automation::maintenance-pr-create *": deny', build)
         self.assertIn('"just automation::maintenance-finalize *": allow', build)
         command = (
@@ -1012,6 +1046,7 @@ class MaintenanceLifecycleTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("model: openai/gpt-5.6-sol", agent)
         self.assertIn('"just automation::maintenance-review-record *": deny', agent)
+        self.assertIn('"just automation::maintenance-contract-refresh *": deny', agent)
         self.assertIn('"just automation::maintenance-pr-create *": allow', agent)
         self.assertIn('"just automation::maintenance-finalize *": deny', agent)
         self.assertNotIn("reviewer: allow", agent)

@@ -75,6 +75,8 @@
       "just automation::rebind-maintenance-provenance *": "ask",
       "just automation::commit *": "allow",
       "just automation::maintenance-check *": "allow",
+      "just automation::maintenance-contract-refresh-inspect *": "allow",
+      "just automation::maintenance-contract-refresh *": "deny",
       "just automation::maintenance-review-record *": "deny",
       "just automation::maintenance-pr-create *": "deny",
       "just automation::maintenance-finalize *": "deny",

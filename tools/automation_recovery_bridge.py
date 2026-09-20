@@ -584,6 +584,13 @@ def parser() -> argparse.ArgumentParser:
     resume = sub.add_parser("resume-contract-check")
     resume.add_argument("target", type=Path)
     resume.add_argument("task", type=_issue_argument)
+    for name in ("maintenance-contract-refresh-inspect", "maintenance-contract-refresh"):
+        refresh = sub.add_parser(name)
+        refresh.add_argument("target", type=Path)
+        refresh.add_argument("task", type=_issue_argument)
+        refresh.add_argument("expected_old_digest", type=_digest_argument)
+        refresh.add_argument("expected_new_digest", type=_digest_argument)
+        refresh.add_argument("expected_implementation_revision", type=_revision_argument)
     finalize = sub.add_parser("maintenance-finalize")
     finalize.add_argument("target", type=Path)
     finalize.add_argument("task", type=_issue_argument)
@@ -906,6 +913,12 @@ def _issue_argument(value: str) -> str:
 def _revision_argument(value: str) -> str:
     if not _REVISION_RE.fullmatch(value):
         raise BridgeError("source revision must be a full lowercase immutable Git object ID")
+    return value
+
+
+def _digest_argument(value: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise BridgeError("Task Contract digest must be exactly 64 lowercase hexadecimal characters")
     return value
 
 
@@ -1701,6 +1714,7 @@ def _publication_ready_recover(modules: dict, target: Path, task: str) -> dict:
 def main() -> int:
     revision = None
     failure = None
+    completed_target_mutation = False
     try:
         args = parser().parse_args()
         if Path(__file__).resolve() != BOOTSTRAP_PATH:
@@ -1708,15 +1722,21 @@ def main() -> int:
         revision = _clean_root(
             ROOT,
             args.expected_implementation_revision
-            if args.command in {"maintenance-finalize", "publication-ready-recover", "publication-recover"}
+            if args.command in {
+                "maintenance-finalize",
+                "publication-ready-recover",
+                "publication-recover",
+                "maintenance-contract-refresh-inspect",
+                "maintenance-contract-refresh",
+            }
             else args.expected_source_revision if args.command == "bootstrap-upgrade" else None,
         )
         _verify_bootstrap(ROOT, revision)
         _clean_root(ROOT, revision)
         target = args.target.resolve()
-        if args.command in {"maintenance-finalize", "publication-ready-recover", "publication-recover", "bootstrap-upgrade"} and target == ROOT:
+        if args.command in {"maintenance-finalize", "publication-ready-recover", "publication-recover", "bootstrap-upgrade", "maintenance-contract-refresh-inspect", "maintenance-contract-refresh"} and target == ROOT:
             raise BridgeError(f"{args.command} target must not be the source root")
-        if args.command in {"maintenance-finalize", "publication-ready-recover", "publication-recover", "bootstrap-upgrade"}:
+        if args.command in {"maintenance-finalize", "publication-ready-recover", "publication-recover", "bootstrap-upgrade", "maintenance-contract-refresh-inspect", "maintenance-contract-refresh"}:
             _validate_target_git_configuration(target)
         with maintenance_environment():
             if args.command in {"recover-task-contract-from-issue", "resume-contract-check"}:
@@ -1736,6 +1756,30 @@ def main() -> int:
                         target, args.task, int(args.pr)
                     )
                     result = {**value, "implementationRevision": revision}
+            elif args.command in {"maintenance-contract-refresh-inspect", "maintenance-contract-refresh"}:
+                with _verified_modules(ROOT, revision) as modules:
+                    _clean_root(ROOT, revision)
+                    maintenance = modules["maintenance_lifecycle"]
+                    operation = (
+                        maintenance.maintenance_contract_refresh_inspect
+                        if args.command == "maintenance-contract-refresh-inspect"
+                        else maintenance.maintenance_contract_refresh
+                    )
+                    value = operation(
+                        target,
+                        args.task,
+                        args.expected_old_digest,
+                        args.expected_new_digest,
+                        runner=trusted_gh_run,
+                        **(
+                            {"validate_external": lambda: _clean_root(ROOT, revision)}
+                            if args.command == "maintenance-contract-refresh"
+                            else {}
+                        ),
+                    )
+                    result = {**value, "implementationRevision": revision}
+                    if args.command == "maintenance-contract-refresh":
+                        completed_target_mutation = True
             elif args.command == "publication-ready-recover":
                 with _verified_modules(ROOT, revision) as modules:
                     _clean_root(ROOT, revision)
@@ -1780,7 +1824,7 @@ def main() -> int:
     except Exception as exc:
         failure = exc
     finally:
-        if revision is not None:
+        if revision is not None and not completed_target_mutation:
             try:
                 _clean_root(ROOT, revision)
             except Exception as exc:

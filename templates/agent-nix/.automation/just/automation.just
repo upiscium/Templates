@@ -31,6 +31,14 @@ maintenance-check task:
     env PYTHONDONTWRITEBYTECODE=1 python3 -B {{quote(maintenance)}} check {{quote(task)}}
 
 [working-directory: root]
+maintenance-contract-refresh-inspect task expected_old_digest expected_new_digest:
+    env PYTHONDONTWRITEBYTECODE=1 python3 -B {{quote(maintenance)}} contract-refresh-inspect {{quote(task)}} {{quote(expected_old_digest)}} {{quote(expected_new_digest)}}
+
+[working-directory: root]
+maintenance-contract-refresh task expected_old_digest expected_new_digest:
+    env PYTHONDONTWRITEBYTECODE=1 python3 -B {{quote(maintenance)}} contract-refresh {{quote(task)}} {{quote(expected_old_digest)}} {{quote(expected_new_digest)}}
+
+[working-directory: root]
 maintenance-pr-create task:
     env PYTHONDONTWRITEBYTECODE=1 python3 -B {{quote(maintenance)}} pr-create {{quote(task)}}
 

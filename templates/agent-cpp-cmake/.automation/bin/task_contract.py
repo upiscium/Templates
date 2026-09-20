@@ -12,6 +12,7 @@ import stat
 import subprocess
 import importlib.util
 from contextlib import contextmanager
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -40,6 +41,18 @@ RESUMABLE_STATES = {
     "draft-pr-created",
     "blocked",
 }
+CANONICAL_HEADINGS = (
+    "Purpose",
+    "Scope",
+    "Prohibited changes",
+    "Dependencies",
+    "Acceptance criteria",
+    "Test plan",
+    "Stop conditions",
+    "Coordination surfaces",
+    "External resources",
+)
+DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class ContractError(lifecycle.LifecycleError):
@@ -298,6 +311,24 @@ def _canonical_state(text: str, issue: int, digest: str) -> str:
     text = re.sub(r"(?m)^- Unverified:.*$", "- Unverified: none; canonical Issue contract", text)
     text += f"\n<!-- canonical-contract sha256={digest} issue={issue} -->\n"
     return text
+
+
+def _refreshed_state(root: Path, state: str, issue: int, old_digest: str, new_digest: str) -> str:
+    expected = _canonical_state(_placeholder_state(root, state), issue, new_digest)
+    result = state
+    for heading in CANONICAL_HEADINGS:
+        pattern = rf"(?ms)(^## {re.escape(heading)}\n\n).*?(?=^## |\Z)"
+        wanted = re.search(pattern, expected)
+        if wanted is None:
+            raise ContractError(f"cannot derive canonical Task State section: {heading}")
+        result, count = re.subn(pattern, wanted.group(0), result, count=1)
+        if count != 1:
+            raise ContractError(f"Task State missing required section: {heading}")
+    marker = f"<!-- canonical-contract sha256={old_digest} issue={issue} -->"
+    replacement = f"<!-- canonical-contract sha256={new_digest} issue={issue} -->"
+    if result.count(marker) != 1:
+        raise ContractError("Task State canonical contract marker changed during refresh")
+    return result.replace(marker, replacement, 1)
 
 
 def _placeholder_state(root: Path, state_text: str | None = None) -> str:
@@ -572,3 +603,192 @@ def check_resume_contract(root: Path, task: str | None = None, *, runner=None) -
     result["mode"] = "resume"
     result["taskStatus"] = status
     return result
+
+
+def _expected_digest(value: str, description: str) -> str:
+    if DIGEST_RE.fullmatch(value) is None:
+        raise ContractError(f"{description} must be exactly 64 lowercase hexadecimal characters")
+    return value
+
+
+def _contract_refresh_inspection(
+    root: Path,
+    task: str,
+    expected_old_digest: str,
+    expected_new_digest: str,
+    *,
+    runner=None,
+) -> tuple[dict, dict]:
+    old_digest = _expected_digest(expected_old_digest, "expected old digest")
+    new_digest = _expected_digest(expected_new_digest, "expected new digest")
+    current = validate_contract(root, task)
+    if repository_identity(root) != current["repository"]:
+        raise ContractError("live repository identity mismatch")
+    if current["sha256"] != old_digest:
+        raise ContractError("expected old digest does not match the canonical Task Contract")
+    identity, live = fetch_issue(root, task, runner)
+    if identity != current["repository"]:
+        raise ContractError("live Issue repository identity mismatch")
+    payload = authoritative_payload(live, int(task), identity)
+    digest = _digest(payload)
+    if digest != new_digest:
+        raise ContractError("expected new digest does not match the authoritative Issue")
+    try:
+        old_value = json.loads((root / SNAPSHOT).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:  # validate_contract normally catches this
+        raise ContractError("canonical Issue snapshot is malformed") from exc
+    old_payload = old_value["payload"]
+    changed = sorted(
+        name for name in old_payload if old_payload.get(name) != payload.get(name)
+    )
+    result = {
+        "status": "NO_CHANGE" if not changed else "REFRESH_AVAILABLE",
+        "task": task,
+        "worktree": str(root.resolve()),
+        "issue": int(task),
+        "repository": identity,
+        "oldSha256": old_digest,
+        "newSha256": new_digest,
+        "changedFields": changed,
+        "changes": {
+            name: {"old": old_payload.get(name), "new": payload.get(name)}
+            for name in changed
+        },
+    }
+    before = {
+        name: (root / ".task-state" / name).read_bytes()
+        for name in ("issue.json", "contract.json", "task.md")
+    }
+    return result, {"result": result, "payload": payload, "before": before}
+
+
+def inspect_task_contract_refresh(
+    root: Path,
+    task: str,
+    expected_old_digest: str,
+    expected_new_digest: str,
+    *,
+    runner=None,
+) -> dict:
+    """Inspect an intentional authoritative Issue update without mutation."""
+    result, _ = _contract_refresh_inspection(
+        root, task, expected_old_digest, expected_new_digest, runner=runner
+    )
+    return result
+
+
+def refresh_task_contract(
+    root: Path,
+    task: str,
+    expected_old_digest: str,
+    expected_new_digest: str,
+    *,
+    runner=None,
+    validate_before_mutation: Callable[[], None] | None = None,
+    validate_after_mutation: Callable[[], None] | None = None,
+) -> dict:
+    """Atomically refresh only the three canonical ignored contract files."""
+    inspection, plan = _contract_refresh_inspection(
+        root, task, expected_old_digest, expected_new_digest, runner=runner
+    )
+    with contract_state_lock(root) as directory_fd:
+        mutation_started = False
+        try:
+            _assert_state_dir_binding(root, directory_fd)
+            current = {
+                name: _read_state_file(directory_fd, name)
+                for name in ("issue.json", "contract.json", "task.md")
+            }
+            if current != plan["before"]:
+                raise ContractError("canonical Task Contract changed after inspection")
+            # Revalidate local identity and the authoritative Issue immediately
+            # before the first mutation while the Task State lock is held.
+            local = validate_contract(root, task)
+            if local["sha256"] != expected_old_digest:
+                raise ContractError("canonical Task Contract changed before refresh")
+            identity, live = fetch_issue(root, task, runner)
+            payload = authoritative_payload(live, int(task), identity)
+            if identity != local["repository"] or _digest(payload) != expected_new_digest:
+                raise ContractError("authoritative Issue changed before refresh mutation")
+            if payload != plan["payload"]:
+                raise ContractError("authoritative Issue payload changed before refresh mutation")
+            if validate_before_mutation is not None:
+                validate_before_mutation()
+
+            if expected_old_digest == expected_new_digest:
+                if inspection["changedFields"]:
+                    raise ContractError("unchanged digest has changed canonical Issue fields")
+                values = current
+            else:
+                state = current["task.md"]
+                assert state is not None
+                refreshed_state = _refreshed_state(
+                    root,
+                    state.decode("utf-8"),
+                    int(task),
+                    expected_old_digest,
+                    expected_new_digest,
+                ).encode()
+                snapshot = {
+                    "schema_version": 1,
+                    "issue": int(task),
+                    "repository": identity,
+                    "sha256": expected_new_digest,
+                    "payload": payload,
+                }
+                values = {
+                    "issue.json": (json.dumps(snapshot, sort_keys=True) + "\n").encode(),
+                    "contract.json": (
+                        json.dumps(
+                            {
+                                "schema_version": 1,
+                                "issue": int(task),
+                                "repository": identity,
+                                "snapshot": SNAPSHOT,
+                                "sha256": expected_new_digest,
+                            },
+                            sort_keys=True,
+                        )
+                        + "\n"
+                    ).encode(),
+                    "task.md": refreshed_state,
+                }
+            for name, content in values.items():
+                if current[name] != content:
+                    mutation_started = True
+                    _write_state_file(directory_fd, name, content)
+            _assert_state_dir_binding(root, directory_fd)
+            verified = validate_contract(root, task)
+            if verified["sha256"] != expected_new_digest:
+                raise ContractError("refreshed canonical Task Contract failed validation")
+            if validate_after_mutation is not None:
+                validate_after_mutation()
+        except Exception as failure:
+            if not mutation_started:
+                raise
+            rollback_errors = []
+            for name, content in plan["before"].items():
+                try:
+                    _restore_state_file(directory_fd, name, content)
+                except Exception as exc:  # keep restoring the remaining files
+                    rollback_errors.append(f"{name}: {exc}")
+            try:
+                restored = {
+                    name: _read_state_file(directory_fd, name)
+                    for name in plan["before"]
+                }
+                _assert_state_dir_binding(root, directory_fd)
+                if restored != plan["before"]:
+                    rollback_errors.append("restored Task Contract bytes do not match")
+            except Exception as exc:
+                rollback_errors.append(str(exc))
+            if rollback_errors:
+                raise ContractError(
+                    "Task Contract refresh failed and rollback was incomplete: "
+                    + "; ".join(rollback_errors)
+                ) from failure
+            raise
+    return {
+        **inspection,
+        "status": "NO_CHANGE" if expected_old_digest == expected_new_digest else "REFRESHED",
+    }
