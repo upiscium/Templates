@@ -207,7 +207,12 @@ class DefaultBranchSynchronizationTest(RepositoryFixture):
         self.assertIn("credential.interactive=false", argv)
         self.assertEqual(
             argv[-4:],
-            ["--no-tags", "origin", "refs/heads/main:refs/remotes/origin/main"],
+            [
+                "fetch",
+                "--no-tags",
+                "origin",
+                "refs/heads/main:refs/remotes/origin/main",
+            ],
         )
 
     def test_github_https_auth_rejects_unsafe_repository_local_network_config(self) -> None:
