@@ -167,6 +167,303 @@ class DefaultBranchSynchronizationTest(RepositoryFixture):
         self.assertEqual(result["revision"], expected)
         self.assertFalse(marker.exists())
 
+    def test_github_https_network_git_uses_only_command_scoped_gh_helper(self) -> None:
+        original = command("git", "remote", "get-url", "origin", cwd=self.repo)
+        command(
+            "git",
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/upiscium/private-fixture.git",
+            cwd=self.repo,
+        )
+        try:
+            trusted_gh = Path("/nix/store/example-gh/bin/gh")
+            with mock.patch.object(
+                lifecycle, "_github_cli_executable", return_value=trusted_gh
+            ):
+                argv, github_https, helper = lifecycle._network_git_command(
+                    self.repo,
+                    [
+                        "fetch",
+                        "--no-tags",
+                        "origin",
+                        "refs/heads/main:refs/remotes/origin/main",
+                    ],
+                )
+        finally:
+            command("git", "remote", "set-url", "origin", original, cwd=self.repo)
+
+        self.assertTrue(github_https)
+        self.assertEqual(helper, trusted_gh)
+        self.assertEqual(argv[0], "git")
+        self.assertIn("credential.helper=", argv)
+        self.assertIn("credential.https://github.com.helper=", argv)
+        self.assertIn(
+            "credential.https://github.com.helper="
+            "!/nix/store/example-gh/bin/gh auth git-credential",
+            argv,
+        )
+        self.assertIn("credential.interactive=false", argv)
+        self.assertEqual(
+            argv[-4:],
+            [
+                "fetch",
+                "--no-tags",
+                "origin",
+                "refs/heads/main:refs/remotes/origin/main",
+            ],
+        )
+
+    def test_github_https_auth_rejects_unsafe_repository_local_network_config(self) -> None:
+        original = command("git", "remote", "get-url", "origin", cwd=self.repo)
+        command(
+            "git",
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/upiscium/private-fixture.git",
+            cwd=self.repo,
+        )
+        command(
+            "git",
+            "config",
+            "url.https://attacker.invalid/.insteadOf",
+            "https://github.com/",
+            cwd=self.repo,
+        )
+        try:
+            with self.assertRaisesRegex(
+                lifecycle.LifecycleError,
+                "unsafe local Git network configuration",
+            ):
+                lifecycle._network_git_command(self.repo, ["fetch", "origin"])
+        finally:
+            command(
+                "git",
+                "config",
+                "--unset-all",
+                "url.https://attacker.invalid/.insteadOf",
+                cwd=self.repo,
+            )
+            command("git", "remote", "set-url", "origin", original, cwd=self.repo)
+
+    def test_github_https_auth_rejects_unsafe_worktree_network_config(self) -> None:
+        original = command("git", "remote", "get-url", "origin", cwd=self.repo)
+        command(
+            "git",
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/upiscium/private-fixture.git",
+            cwd=self.repo,
+        )
+        command("git", "config", "extensions.worktreeConfig", "true", cwd=self.repo)
+        command(
+            "git",
+            "config",
+            "--worktree",
+            "url.https://attacker.invalid/.insteadOf",
+            "https://github.com/",
+            cwd=self.repo,
+        )
+        try:
+            with self.assertRaisesRegex(
+                lifecycle.LifecycleError,
+                "unsafe worktree-local Git network configuration",
+            ):
+                lifecycle._network_git_command(self.repo, ["fetch", "origin"])
+        finally:
+            command(
+                "git",
+                "config",
+                "--worktree",
+                "--unset-all",
+                "url.https://attacker.invalid/.insteadOf",
+                cwd=self.repo,
+            )
+            command(
+                "git",
+                "config",
+                "--unset-all",
+                "extensions.worktreeConfig",
+                cwd=self.repo,
+            )
+            command("git", "remote", "set-url", "origin", original, cwd=self.repo)
+
+    def test_github_https_auth_rejects_custom_origin_vcs_transport(self) -> None:
+        original = command("git", "remote", "get-url", "origin", cwd=self.repo)
+        command(
+            "git",
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/upiscium/private-fixture.git",
+            cwd=self.repo,
+        )
+        command("git", "config", "remote.origin.vcs", "attacker", cwd=self.repo)
+        try:
+            with self.assertRaisesRegex(
+                lifecycle.LifecycleError,
+                "unsafe local Git network configuration",
+            ):
+                lifecycle._network_git_command(self.repo, ["fetch", "origin"])
+        finally:
+            command(
+                "git",
+                "config",
+                "--unset-all",
+                "remote.origin.vcs",
+                cwd=self.repo,
+            )
+            command("git", "remote", "set-url", "origin", original, cwd=self.repo)
+
+    def test_github_https_auth_rejects_worktree_origin_override(self) -> None:
+        original = command("git", "remote", "get-url", "origin", cwd=self.repo)
+        command(
+            "git",
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/upiscium/private-fixture.git",
+            cwd=self.repo,
+        )
+        command("git", "config", "extensions.worktreeConfig", "true", cwd=self.repo)
+        command(
+            "git",
+            "config",
+            "--worktree",
+            "remote.origin.url",
+            "https://attacker.invalid/repository.git",
+            cwd=self.repo,
+        )
+        try:
+            with self.assertRaisesRegex(
+                lifecycle.LifecycleError,
+                "unsafe worktree-local Git network configuration",
+            ):
+                lifecycle._network_git_command(self.repo, ["fetch", "origin"])
+        finally:
+            command(
+                "git",
+                "config",
+                "--worktree",
+                "--unset-all",
+                "remote.origin.url",
+                cwd=self.repo,
+            )
+            command(
+                "git",
+                "config",
+                "--unset-all",
+                "extensions.worktreeConfig",
+                cwd=self.repo,
+            )
+            command("git", "remote", "set-url", "origin", original, cwd=self.repo)
+
+    def test_ssh_operation_rejects_worktree_origin_override(self) -> None:
+        original = command("git", "remote", "get-url", "origin", cwd=self.repo)
+        command(
+            "git",
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:upiscium/private-fixture.git",
+            cwd=self.repo,
+        )
+        command("git", "config", "extensions.worktreeConfig", "true", cwd=self.repo)
+        command(
+            "git",
+            "config",
+            "--worktree",
+            "remote.origin.url",
+            "ssh://attacker.invalid/repository.git",
+            cwd=self.repo,
+        )
+        try:
+            with self.assertRaisesRegex(
+                lifecycle.LifecycleError,
+                "unsafe worktree-local Git network configuration",
+            ):
+                lifecycle._network_git_command(self.repo, ["fetch", "origin"])
+        finally:
+            command(
+                "git",
+                "config",
+                "--worktree",
+                "--unset-all",
+                "remote.origin.url",
+                cwd=self.repo,
+            )
+            command(
+                "git",
+                "config",
+                "--unset-all",
+                "extensions.worktreeConfig",
+                cwd=self.repo,
+            )
+            command("git", "remote", "set-url", "origin", original, cwd=self.repo)
+
+    def test_public_git_operation_can_succeed_without_github_cli_helper(self) -> None:
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(
+            lifecycle,
+            "_network_git_command",
+            return_value=(["git", "fetch", "origin"], True, None),
+        ), mock.patch.object(lifecycle, "run", return_value=completed) as run:
+            self.assertIs(
+                lifecycle.network_git("fetch", "origin", cwd=self.repo),
+                completed,
+            )
+        run.assert_called_once_with(
+            ["git", "fetch", "origin"],
+            cwd=self.repo,
+            check=False,
+        )
+
+    def test_private_git_failure_without_github_cli_helper_is_explicit(self) -> None:
+        failed = mock.Mock(
+            returncode=128,
+            stdout="",
+            stderr="fatal: could not read Username for 'https://github.com'",
+        )
+        with mock.patch.object(
+            lifecycle,
+            "_network_git_command",
+            return_value=(["git", "fetch", "origin"], True, None),
+        ), mock.patch.object(lifecycle, "run", return_value=failed), self.assertRaisesRegex(
+            lifecycle.LifecycleError,
+            "GitHub CLI credential helper is unavailable",
+        ):
+            lifecycle.network_git("fetch", "origin", cwd=self.repo)
+
+    def test_invalid_github_cli_auth_is_reported_without_token_exposure(self) -> None:
+        failed = mock.Mock(returncode=128, stdout="", stderr="authentication failed")
+        auth_failed = mock.Mock(returncode=1, stdout="", stderr="not logged in")
+        helper = Path("/nix/store/example-gh/bin/gh")
+        with mock.patch.object(
+            lifecycle,
+            "_network_git_command",
+            return_value=(["git", "fetch", "origin"], True, helper),
+        ), mock.patch.object(
+            lifecycle,
+            "run",
+            side_effect=[failed, auth_failed],
+        ) as run, self.assertRaisesRegex(
+            lifecycle.LifecycleError,
+            "GitHub HTTPS authentication is unavailable",
+        ):
+            lifecycle.network_git("fetch", "origin", cwd=self.repo)
+
+        self.assertEqual(
+            run.call_args_list[1].args[0],
+            ["gh", "auth", "status", "--hostname", "github.com"],
+        )
+        self.assertEqual(
+            run.call_args_list[1].kwargs["remove_env"],
+            ("GH_REPO", "GH_HOST", "GH_ENTERPRISE_TOKEN"),
+        )
+
     def test_github_default_branch_fallback_scrubs_repository_override(self) -> None:
         responses = [
             mock.Mock(returncode=1, stdout="", stderr=""),

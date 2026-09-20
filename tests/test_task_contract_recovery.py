@@ -19,6 +19,37 @@ spec.loader.exec_module(bridge)
 
 
 class TaskContractRecoveryTest(unittest.TestCase):
+    def test_pinned_git_scopes_trusted_auth_to_github_cli_helper(self) -> None:
+        git = Path("/nix/store/example-git/bin/git")
+        gh = Path("/nix/store/example-gh/bin/gh")
+        credential_name = "GH_" + "TOKEN"
+        credential_value = str(object())
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        helper = (
+            "credential.https://github.com.helper="
+            f"!{gh} auth git-credential"
+        )
+        with mock.patch.object(bridge, "trusted_git", return_value=git), \
+             mock.patch.object(bridge, "trusted_gh", return_value=gh), \
+             mock.patch.object(bridge, "sanitized_environment", side_effect=lambda: {}), \
+             mock.patch.object(
+                 bridge,
+                 "trusted_gh_environment",
+                 return_value={credential_name: credential_value},
+             ), \
+             mock.patch.object(
+                 bridge.subprocess,
+                 "run",
+                 return_value=completed,
+             ) as subprocess_run:
+            bridge._pinned_run(["git", "-c", helper, "fetch", "origin"])
+            helper_environment = subprocess_run.call_args.kwargs["env"]
+            bridge._pinned_run(["git", "status"])
+            ordinary_environment = subprocess_run.call_args.kwargs["env"]
+
+        self.assertEqual(helper_environment[credential_name], credential_value)
+        self.assertNotIn(credential_name, ordinary_environment)
+
     def test_parser_keeps_maintenance_commands_and_accepts_numeric_argument(self) -> None:
         self.assertEqual(
             bridge.parser().parse_args(["recover-maintenance-authority", "/tmp/task"]).command,
@@ -257,6 +288,10 @@ class TaskContractRecoveryTest(unittest.TestCase):
                         Path(loaded.__file__).resolve(), bridge.MAINTENANCE_PATH.resolve()
                     )
                     self.assertIs(sys.modules["maintenance_lifecycle"], loaded)
+                    self.assertEqual(
+                        modules["task_lifecycle"]._GITHUB_CLI_EXECUTABLE,
+                        Path("/usr/bin/gh"),
+                    )
             self.assertEqual(sys.path, old_path)
             self.assertIs(sys.modules["maintenance_lifecycle"], sentinel)
         finally:

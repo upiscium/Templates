@@ -9,11 +9,14 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -22,6 +25,13 @@ import git_private_state as private_state
 TASK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 WORK_UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_UNSAFE_NETWORK_GIT_CONFIG = re.compile(
+    r"(?:include(?:if)?\..*|url\..*|http\..*|credential\..*|protocol\..*|"
+    r"core\.(?:gitproxy|sshcommand)|"
+    r"remote\.origin\.(?:proxy|proxyauthmethod|receivepack|uploadpack|vcs))",
+    re.IGNORECASE,
+)
+_GITHUB_CLI_EXECUTABLE: Path | None = None
 WORK_UNIT_ROLES = {"general", "explore", "verifier", "reviewer", "investigator", "security-reviewer", "scout"}
 WORK_UNIT_STATES = {"in-flight", "failed", "completed", "blocked", "needs-approval", "needs-decision"}
 WORK_UNIT_TRANSITIONS = {
@@ -123,6 +133,168 @@ def git(*args: str, cwd: Path, check: bool = True) -> str:
 
 def gh(*args: str, cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
     return run(["gh", *args], cwd=cwd, check=check, remove_env=("GH_REPO",))
+
+
+def _github_cli_executable() -> Path | None:
+    if _GITHUB_CLI_EXECUTABLE is not None:
+        return _GITHUB_CLI_EXECUTABLE
+    candidate = shutil.which("gh")
+    if not candidate:
+        return None
+    try:
+        executable = Path(candidate).resolve(strict=True)
+        metadata = executable.stat()
+    except OSError:
+        return None
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        return None
+    return executable
+
+
+def _origin_fetch_url(root: Path) -> str:
+    result = run(
+        ["git", "config", "--local", "--no-includes", "--get-all", "remote.origin.url"],
+        cwd=root,
+        check=False,
+    )
+    if result.returncode not in {0, 1}:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        raise LifecycleError(f"cannot inspect origin URL safely: {detail}")
+    values = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if len(values) != 1:
+        raise LifecycleError("origin must have exactly one directly configured fetch URL")
+    return values[0]
+
+
+def _is_standard_github_https_origin(remote: str) -> bool:
+    parsed = urlparse(remote.removesuffix(".git"))
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc.casefold() == "github.com"
+        and parsed.username is None
+        and parsed.password is None
+        and bool(parsed.path.strip("/"))
+    )
+
+
+def _validate_network_git_configuration(root: Path) -> None:
+    def reject_unsafe(
+        scope: str,
+        label: str,
+        additionally_unsafe: tuple[str, ...] = (),
+    ) -> None:
+        result = run(
+            ["git", "config", scope, "--no-includes", "--null", "--name-only", "--list"],
+            cwd=root,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            raise LifecycleError(f"cannot validate {label} Git network configuration: {detail}")
+        unsafe = sorted(
+            name
+            for name in result.stdout.split("\0")
+            if name
+            and (
+                _UNSAFE_NETWORK_GIT_CONFIG.fullmatch(name)
+                or name.casefold() in additionally_unsafe
+            )
+        )
+        if unsafe:
+            raise LifecycleError(
+                f"repository has unsafe {label} Git network configuration: "
+                + ", ".join(unsafe)
+            )
+
+    reject_unsafe("--local", "local")
+    enabled = run(
+        [
+            "git",
+            "config",
+            "--local",
+            "--no-includes",
+            "--bool",
+            "--get",
+            "extensions.worktreeConfig",
+        ],
+        cwd=root,
+        check=False,
+    )
+    if enabled.returncode not in {0, 1}:
+        raise LifecycleError("cannot validate worktree Git network configuration")
+    if enabled.returncode == 0:
+        if enabled.stdout.strip() not in {"true", "false"}:
+            raise LifecycleError("extensions.worktreeConfig is not a valid boolean")
+        if enabled.stdout.strip() == "true":
+            reject_unsafe(
+                "--worktree",
+                "worktree-local",
+                additionally_unsafe=("remote.origin.url",),
+            )
+
+
+def _network_git_command(root: Path, args: list[str]) -> tuple[list[str], bool, Path | None]:
+    remote = _origin_fetch_url(root)
+    _validate_network_git_configuration(root)
+    if not _is_standard_github_https_origin(remote):
+        return ["git", *args], False, None
+
+    executable = _github_cli_executable()
+    if executable is None:
+        return ["git", *args], True, None
+
+    helper = f"!{shlex.quote(str(executable))} auth git-credential"
+    return (
+        [
+            "git",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "credential.https://github.com.helper=",
+            "-c",
+            f"credential.https://github.com.helper={helper}",
+            "-c",
+            "credential.interactive=false",
+            *args,
+        ],
+        True,
+        executable,
+    )
+
+
+def network_git(
+    *args: str,
+    cwd: Path,
+    check: bool = True,
+    allowed_returncodes: tuple[int, ...] = (),
+) -> subprocess.CompletedProcess[str]:
+    command, github_https, helper = _network_git_command(cwd, list(args))
+    result = run(command, cwd=cwd, check=False)
+    if result.returncode == 0 or result.returncode in allowed_returncodes:
+        return result
+
+    if github_https:
+        if helper is None:
+            raise LifecycleError(
+                "GitHub HTTPS Git operation failed and the GitHub CLI credential helper "
+                "is unavailable; install/authenticate gh or use a supported SSH origin"
+            )
+        auth = run(
+            ["gh", "auth", "status", "--hostname", "github.com"],
+            cwd=cwd,
+            check=False,
+            remove_env=("GH_REPO", "GH_HOST", "GH_ENTERPRISE_TOKEN"),
+        )
+        if auth.returncode != 0:
+            raise LifecycleError(
+                "GitHub HTTPS authentication is unavailable; authenticate GitHub CLI "
+                "for github.com before retrying"
+            )
+
+    if check:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        raise LifecycleError(f"git {' '.join(args)}: {detail}")
+    return result
 
 
 def repo_root(cwd: Path | None = None) -> Path:
@@ -253,14 +425,11 @@ def synchronize_default_branch(root: Path) -> dict:
     remote_ref = f"refs/remotes/origin/{base}"
     local_before = git("rev-parse", "--verify", local_ref, cwd=root)
     remote_before = git("rev-parse", "--verify", remote_ref, cwd=root, check=False)
-    run(
-        [
-            "git",
-            "fetch",
-            "--no-tags",
-            "origin",
-            f"refs/heads/{base}:{remote_ref}",
-        ],
+    network_git(
+        "fetch",
+        "--no-tags",
+        "origin",
+        f"refs/heads/{base}:{remote_ref}",
         cwd=root,
     )
     fetched = git("rev-parse", "--verify", remote_ref, cwd=root)
@@ -1138,17 +1307,15 @@ def extract_identity_value(path: Path, label: str) -> str | None:
 def remote_branch_head(record: WorktreeRecord) -> str | None:
     """Resolve the live origin branch, distinguishing deletion from failures."""
     assert record.branch is not None
-    result = run(
-        [
-            "git",
-            "ls-remote",
-            "--exit-code",
-            "--heads",
-            "origin",
-            f"refs/heads/{record.branch}",
-        ],
+    result = network_git(
+        "ls-remote",
+        "--exit-code",
+        "--heads",
+        "origin",
+        f"refs/heads/{record.branch}",
         cwd=record.path,
         check=False,
+        allowed_returncodes=(2,),
     )
     if result.returncode == 2 and not result.stdout.strip():
         return None
