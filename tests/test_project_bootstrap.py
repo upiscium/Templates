@@ -57,6 +57,22 @@ class ProjectBootstrapTest(unittest.TestCase):
             self.assertIn("bootstrap name=''", project_mod)
             self.assertIn("project_bootstrap.py", project_mod)
 
+    def test_agent_base_explicitly_has_no_bootstrap_contract(self) -> None:
+        source = ROOT / "components" / "adapters" / "base"
+        generated = ROOT / "templates" / "agent-base"
+        for root in (source, generated):
+            project_mod = (root / "just" / "project" / "mod.just").read_text(
+                encoding="utf-8"
+            )
+            readme = (root / "README.md").read_text(encoding="utf-8")
+            self.assertNotIn("bootstrap name=", project_mod)
+            self.assertIn("intentionally bootstrap-free", readme)
+            self.assertIn("does not expose `project::bootstrap`", readme)
+
+        root_readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("`agent-base` is intentionally different", root_readme)
+        self.assertIn("do not run the bootstrap command above", root_readme)
+
     def test_direnv_does_not_mutate_project_files(self) -> None:
         for adapter in ("python", "rust"):
             text = (ROOT / "components" / "adapters" / adapter / ".envrc").read_text(encoding="utf-8")
