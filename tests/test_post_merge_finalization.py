@@ -361,6 +361,49 @@ class DefaultBranchSynchronizationTest(RepositoryFixture):
             )
             command("git", "remote", "set-url", "origin", original, cwd=self.repo)
 
+    def test_ssh_operation_rejects_worktree_origin_override(self) -> None:
+        original = command("git", "remote", "get-url", "origin", cwd=self.repo)
+        command(
+            "git",
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:upiscium/private-fixture.git",
+            cwd=self.repo,
+        )
+        command("git", "config", "extensions.worktreeConfig", "true", cwd=self.repo)
+        command(
+            "git",
+            "config",
+            "--worktree",
+            "remote.origin.url",
+            "ssh://attacker.invalid/repository.git",
+            cwd=self.repo,
+        )
+        try:
+            with self.assertRaisesRegex(
+                lifecycle.LifecycleError,
+                "unsafe worktree-local Git network configuration",
+            ):
+                lifecycle._network_git_command(self.repo, ["fetch", "origin"])
+        finally:
+            command(
+                "git",
+                "config",
+                "--worktree",
+                "--unset-all",
+                "remote.origin.url",
+                cwd=self.repo,
+            )
+            command(
+                "git",
+                "config",
+                "--unset-all",
+                "extensions.worktreeConfig",
+                cwd=self.repo,
+            )
+            command("git", "remote", "set-url", "origin", original, cwd=self.repo)
+
     def test_public_git_operation_can_succeed_without_github_cli_helper(self) -> None:
         completed = mock.Mock(returncode=0, stdout="", stderr="")
         with mock.patch.object(

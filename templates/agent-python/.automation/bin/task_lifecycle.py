@@ -235,10 +235,10 @@ def _validate_network_git_configuration(root: Path) -> None:
 
 def _network_git_command(root: Path, args: list[str]) -> tuple[list[str], bool, Path | None]:
     remote = _origin_fetch_url(root)
+    _validate_network_git_configuration(root)
     if not _is_standard_github_https_origin(remote):
         return ["git", *args], False, None
 
-    _validate_network_git_configuration(root)
     executable = _github_cli_executable()
     if executable is None:
         return ["git", *args], True, None
