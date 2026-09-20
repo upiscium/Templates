@@ -93,6 +93,67 @@ class AdoptRepositoryTest(unittest.TestCase):
         self.assertFalse(result["pushPerformed"])
         self.assertFalse(result["mergePerformed"])
 
+    def test_adoption_creates_canonical_license_when_repository_has_none(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        (repo / ".keep").write_text("tracked\n", encoding="utf-8")
+        self.commit_all(repo)
+
+        plan = adopt_repository.build_plan(ROOT, repo, "base")
+        actions = {action["path"]: action for action in plan["actions"]}
+        self.assertEqual(actions["LICENSE"]["action"], "create")
+        self.assertTrue(plan["canApply"], plan["blockers"])
+
+        adopt_repository.apply_plan(ROOT, repo, "base")
+
+        self.assertEqual(
+            (repo / "LICENSE").read_bytes(),
+            (ROOT / "components" / "agent-core" / "LICENSE").read_bytes(),
+        )
+
+    def test_adoption_preserves_existing_canonical_license(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        existing = "Custom repository license\n"
+        (repo / "LICENSE").write_text(existing, encoding="utf-8")
+        self.commit_all(repo)
+
+        plan = adopt_repository.build_plan(ROOT, repo, "base")
+        actions = {action["path"]: action for action in plan["actions"]}
+        self.assertEqual(actions["LICENSE"]["action"], "preserve")
+        self.assertTrue(plan["canApply"], plan["blockers"])
+
+        adopt_repository.apply_plan(ROOT, repo, "base")
+        self.assertEqual((repo / "LICENSE").read_text(encoding="utf-8"), existing)
+
+    def test_adoption_blocks_second_license_when_alias_exists(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        (repo / "LICENSE.md").write_text("Existing license\n", encoding="utf-8")
+        self.commit_all(repo)
+
+        plan = adopt_repository.build_plan(ROOT, repo, "base")
+        actions = {action["path"]: action for action in plan["actions"]}
+
+        self.assertEqual(actions["LICENSE"]["action"], "blocked")
+        self.assertFalse(plan["canApply"])
+        self.assertTrue(
+            any(
+                "LICENSE.md" in blocker and "second generated LICENSE" in blocker
+                for blocker in plan["blockers"]
+            )
+        )
+        with self.assertRaisesRegex(
+            adopt_repository.AdoptionError,
+            "existing repository license",
+        ):
+            adopt_repository.apply_plan(ROOT, repo, "base")
+        self.assertFalse((repo / "LICENSE").exists())
+        self.assertEqual(
+            (repo / "LICENSE.md").read_text(encoding="utf-8"),
+            "Existing license\n",
+        )
+
     def test_cpp_cmake_apply_preserves_repository_readme_and_envrc(self) -> None:
         temporary, repo = self.make_repo()
         self.addCleanup(temporary.cleanup)
