@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import tempfile
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -63,6 +64,108 @@ class PublicationReadyRecoveryBridgeTests(unittest.TestCase):
             "GH_REPO", "PATH", "HOME", "XDG_CONFIG_HOME", "GH_TOKEN",
         ):
             self.assertNotIn(key, environment)
+
+    def test_trusted_gh_environment_uses_only_validated_git_parent(self):
+        trusted_git = Path("/nix/store/trusted-git/bin/git")
+        with mock.patch.object(bridge, "trusted_git", return_value=trusted_git):
+            environment = bridge._trusted_gh_subprocess_environment(
+                {
+                    "PATH": "/tmp/attacker-bin",
+                    "GH_TOKEN": "attacker-token",
+                    "NO_COLOR": "1",
+                }
+            )
+
+        self.assertEqual(environment["PATH"], str(trusted_git.parent))
+        self.assertEqual(environment["NO_COLOR"], "1")
+        self.assertNotIn("GH_TOKEN", environment)
+        self.assertNotIn("/tmp/attacker-bin", environment["PATH"])
+
+    def test_trusted_gh_run_can_resolve_only_the_validated_git_lane(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trusted = root / "trusted"
+            malicious = root / "malicious"
+            trusted.mkdir()
+            malicious.mkdir()
+
+            trusted_git = trusted / "git"
+            trusted_git.write_text(
+                "#!/bin/sh\nprintf 'trusted-git\\n'\n",
+                encoding="utf-8",
+            )
+            trusted_git.chmod(0o755)
+
+            malicious_git = malicious / "git"
+            malicious_git.write_text(
+                "#!/bin/sh\nprintf 'malicious-git\\n'\n",
+                encoding="utf-8",
+            )
+            malicious_git.chmod(0o755)
+
+            fake_gh = root / "gh"
+            fake_gh.write_text(
+                "#!/bin/sh\nexec git\n",
+                encoding="utf-8",
+            )
+            fake_gh.chmod(0o755)
+
+            with mock.patch.object(bridge, "trusted_git", return_value=trusted_git), \
+                 mock.patch.object(bridge, "trusted_gh", return_value=fake_gh), \
+                 mock.patch.object(
+                     bridge,
+                     "trusted_gh_environment",
+                     return_value={
+                         "GH_CONFIG_DIR": str(root / "gh-config"),
+                         "GH_HOST": "github.com",
+                         "GH_TOKEN": "token",
+                     },
+                 ):
+                result = bridge.trusted_gh_run(
+                    ["gh"],
+                    env={"PATH": str(malicious)},
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.strip(), "trusted-git")
+
+    def test_pinned_gh_runner_reasserts_trusted_path_after_environment_overrides(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        trusted_git = Path("/nix/store/trusted-git/bin/git")
+        with mock.patch.object(bridge, "trusted_git", return_value=trusted_git), \
+             mock.patch.object(
+                 bridge,
+                 "trusted_gh",
+                 return_value=Path("/nix/store/trusted-gh/bin/gh"),
+             ), \
+             mock.patch.object(
+                 bridge,
+                 "trusted_gh_environment",
+                 return_value={
+                     "GH_CONFIG_DIR": "/tmp/private-gh",
+                     "GH_HOST": "github.com",
+                     "GH_TOKEN": "token",
+                 },
+             ), \
+             mock.patch.object(bridge.subprocess, "run", return_value=completed) as run:
+            self.assertIs(
+                bridge._pinned_run(
+                    ["gh", "pr", "view", "1"],
+                    env_overrides={
+                        "PATH": "/tmp/attacker-bin",
+                        "EXPLICIT_SAFE_VALUE": "kept",
+                    },
+                ),
+                completed,
+            )
+
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual(environment["PATH"], str(trusted_git.parent))
+        self.assertEqual(environment["EXPLICIT_SAFE_VALUE"], "kept")
+        self.assertNotIn("/tmp/attacker-bin", environment["PATH"])
 
     def test_maintenance_uses_private_gh_config_with_explicit_token_only(self):
         with mock.patch.dict(
