@@ -36,6 +36,19 @@ class TemplateDistributionTest(unittest.TestCase):
             self.assertEqual(target.default_branch, "main")
             self.assertIn("do not edit directly", target.description)
 
+    def test_all_generated_templates_use_canonical_bsd3_license(self) -> None:
+        canonical = (ROOT / "components" / "agent-core" / "LICENSE").read_bytes()
+        text = canonical.decode("utf-8")
+        self.assertTrue(text.startswith("BSD 3-Clause License\n\n"))
+        self.assertIn("Copyright (c) 2026 upiscium", text)
+
+        for template in sorted(distribution.load_template_names(ROOT)):
+            with self.subTest(template=template):
+                self.assertEqual(
+                    (ROOT / "templates" / template / "LICENSE").read_bytes(),
+                    canonical,
+                )
+
     def test_matrix_is_derived_from_manifest(self) -> None:
         targets, _ = distribution.load_distribution(ROOT)
         expected = {
@@ -71,6 +84,10 @@ class TemplateDistributionTest(unittest.TestCase):
             self.assertFalse((destination / "stale.txt").exists())
             self.assertFalse((destination / ".stale-dotfile").exists())
             self.assertTrue((destination / ".gitignore").is_file())
+            self.assertEqual(
+                (destination / "LICENSE").read_bytes(),
+                (ROOT / "components" / "agent-core" / "LICENSE").read_bytes(),
+            )
 
             source_mode = (ROOT / "templates" / "agent-python" / ".automation" / "bin" / "agent_core.py").stat().st_mode
             target_mode = (destination / ".automation" / "bin" / "agent_core.py").stat().st_mode
