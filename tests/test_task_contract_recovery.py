@@ -154,6 +154,68 @@ class TaskContractRecoveryTest(unittest.TestCase):
                 self.assertNotEqual(Path(contract.__file__).resolve(), bridge.CONTRACT_PATH.resolve())
                 self.assertTrue(hasattr(contract, "recover_task_from_issue"))
 
+    def test_verified_engine_wraps_only_load_failures(self) -> None:
+        blobs = {
+            "engine": b"raise RuntimeError('top-level boom')\n",
+            "private": b"_GIT_EXECUTABLE = None\n",
+        }
+
+        def tree_blob(_root: Path, _revision: str, relative: str):
+            if relative.endswith("automation_upgrade.py"):
+                return "engine", 0o100644
+            if relative.endswith("git_private_state.py"):
+                return "private", 0o100644
+            raise AssertionError(relative)
+
+        with mock.patch.object(bridge, "_tree_blob", side_effect=tree_blob), \
+             mock.patch.object(bridge, "_blob", side_effect=lambda _root, oid: blobs[oid]), \
+             mock.patch.object(bridge, "_clean_root"), \
+             self.assertRaisesRegex(
+                 bridge.BridgeError,
+                 "cannot load verified recovery engine: top-level boom",
+             ):
+            with bridge._verified_engine(ROOT, "0" * 40):
+                self.fail("engine load failure must not yield")
+
+    def test_verified_engine_preserves_caller_error_and_restores_process_state(self) -> None:
+        blobs = {
+            "engine": b"import git_private_state\nVALUE = 1\n",
+            "private": b"_GIT_EXECUTABLE = None\n",
+        }
+
+        def tree_blob(_root: Path, _revision: str, relative: str):
+            if relative.endswith("automation_upgrade.py"):
+                return "engine", 0o100644
+            if relative.endswith("git_private_state.py"):
+                return "private", 0o100644
+            raise AssertionError(relative)
+
+        old_path = list(sys.path)
+        old_bytecode = sys.dont_write_bytecode
+        previous_private = sys.modules.get("git_private_state")
+        sentinel = mock.Mock(name="previous-private-state")
+        sys.modules["git_private_state"] = sentinel
+        try:
+            with mock.patch.object(bridge, "_tree_blob", side_effect=tree_blob), \
+                 mock.patch.object(bridge, "_blob", side_effect=lambda _root, oid: blobs[oid]), \
+                 mock.patch.object(bridge, "_clean_root"), \
+                 mock.patch.object(
+                     bridge, "trusted_git", return_value=Path("/usr/bin/git")
+                 ), \
+                 self.assertRaisesRegex(RuntimeError, "target validation failed"):
+                with bridge._verified_engine(ROOT, "0" * 40) as engine:
+                    self.assertEqual(engine.VALUE, 1)
+                    raise RuntimeError("target validation failed")
+
+            self.assertEqual(sys.path, old_path)
+            self.assertEqual(sys.dont_write_bytecode, old_bytecode)
+            self.assertIs(sys.modules.get("git_private_state"), sentinel)
+        finally:
+            if previous_private is None:
+                sys.modules.pop("git_private_state", None)
+            else:
+                sys.modules["git_private_state"] = previous_private
+
     def test_maintenance_dispatch_uses_verified_modules_and_reports_revision(self) -> None:
         maintenance = mock.Mock()
         maintenance.maintenance_finalize.return_value = {"status": "FINALIZED"}

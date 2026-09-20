@@ -28,6 +28,14 @@ JUST_COMPATIBILITY_PREREQUISITE = (
     "the target repository environment so `just` is at least the required version."
 )
 
+LICENSE_ALIASES = (
+    "LICENSE.md",
+    "LICENSE.txt",
+    "COPYING",
+    "COPYING.md",
+    "COPYING.txt",
+)
+
 
 @dataclass(frozen=True)
 class Action:
@@ -483,11 +491,37 @@ def build_plan(source: Path, target: Path, requested_adapter: str) -> dict:
             continue
 
         if not destination.exists() and not destination.is_symlink():
+            if rel == "LICENSE":
+                existing_aliases = [
+                    name
+                    for name in LICENSE_ALIASES
+                    if (root / name).exists() or (root / name).is_symlink()
+                ]
+                if existing_aliases:
+                    detail = (
+                        "existing repository license file(s) "
+                        + ", ".join(existing_aliases)
+                        + " prevent adding a second generated LICENSE"
+                    )
+                    blockers.append(f"{rel}: {detail}")
+                    actions.append(Action(rel, "blocked", "repository", detail))
+                    continue
             actions.append(Action(rel, "create", owner, "path does not exist"))
             continue
 
         if destination.is_file() and entry.source.is_file() and bytes_equal(destination, entry.source):
             actions.append(Action(rel, "noop", owner, "existing content is identical"))
+            continue
+
+        if rel == "LICENSE" and destination.is_file():
+            actions.append(
+                Action(
+                    rel,
+                    "preserve",
+                    "repository",
+                    "existing repository license is preserved",
+                )
+            )
             continue
 
         if (
