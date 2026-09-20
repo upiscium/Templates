@@ -531,18 +531,21 @@ def _verified_engine(root: Path, revision: str):
         try:
             sys.path.insert(0, directory)
             sys.modules.pop("git_private_state", None)
-            spec = importlib.util.spec_from_file_location(name, path)
-            if spec is None or spec.loader is None:
-                raise BridgeError("cannot create specification for verified recovery engine")
-            engine = importlib.util.module_from_spec(spec)
-            sys.modules[name] = engine
-            spec.loader.exec_module(engine)
-            sys.modules["git_private_state"]._GIT_EXECUTABLE = str(trusted_git())
+            try:
+                spec = importlib.util.spec_from_file_location(name, path)
+                if spec is None or spec.loader is None:
+                    raise BridgeError(
+                        "cannot create specification for verified recovery engine"
+                    )
+                engine = importlib.util.module_from_spec(spec)
+                sys.modules[name] = engine
+                spec.loader.exec_module(engine)
+                sys.modules["git_private_state"]._GIT_EXECUTABLE = str(trusted_git())
+            except Exception as exc:
+                raise BridgeError(
+                    f"cannot load verified recovery engine: {exc}"
+                ) from exc
             yield engine
-        except BridgeError:
-            raise
-        except Exception as exc:
-            raise BridgeError(f"cannot load verified recovery engine: {exc}") from exc
         finally:
             sys.modules.pop(name, None)
             if previous_private_state is None:
