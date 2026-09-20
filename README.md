@@ -38,11 +38,13 @@ rust   -> agent-rust
 
 Every Agent-ready repository contains the shared Agent Core plus exactly one Project Adapter. Adapter-less repositories are not supported; unknown projects use `base` as the minimum contract.
 
-After instantiating a generated non-Python language/toolchain template, run the one-time project bootstrap before the first validation or development session:
+For the Rust, Nix, C++/CMake, and TypeScript/Node templates, run the one-time project bootstrap before the first validation or development session:
 
 ```sh
 nix develop --command just project::bootstrap
 ```
+
+`agent-base` is intentionally different: it is a minimal fallback/composition contract with no Nix devShell and no `project::bootstrap` recipe. It owns no project-name placeholders, lockfiles, dependency installation, or other project state that needs one-time materialization. After instantiating `agent-base`, do not run the bootstrap command above; provide the Agent Core runtime tools from the surrounding repository/host environment and proceed to the normal read-only initialization checks. For a new standalone language/toolchain repository, prefer a concrete adapter template.
 
 For the Python template, prevent the outer Nix invocation from writing `flake.lock`; the Python Adapter bootstrap owns explicit materialization of missing `flake.lock` and `uv.lock` files:
 
@@ -97,13 +99,18 @@ Generated files under `templates/<name>/` are artifacts. Edit `components/agent-
 
 ## Initialization
 
-Bootstrap, GitHub repository policy setup, and session initialization are intentionally separate:
+Bootstrap, GitHub repository policy setup, and session initialization are intentionally separate. Concrete language/toolchain adapters use the bootstrap step; `agent-base` skips it because it has no bootstrap-owned project state:
 
 ```text
 nix flake init ...
-  -> just project::bootstrap          # one-time, state-changing project setup
+  -> just project::bootstrap          # concrete adapters only; one-time project setup
   -> just repository::policy-apply    # optional explicit GitHub repository setup
   -> /init                            # every-session, read-only validation
+
+agent-base:
+nix flake init ...
+  -> just repository::policy-apply    # optional, when repository policy should be applied
+  -> /init                            # runtime tools must already be available
 ```
 
 `/init` is read-only. It validates Agent Core version, Adapter identity, branch/worktree/Task State, tools, project doctor, HEAD, and Git status. It never bootstraps, repairs, installs packages, changes Task State, rewrites `AGENTS.md`, or mutates GitHub repository settings.
