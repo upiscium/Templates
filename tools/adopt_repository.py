@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import fnmatch
 import json
 import os
-import shutil
+import re
+import stat
 import subprocess
 import sys
 import tomllib
+from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -93,6 +97,7 @@ def detect_adapter(target: Path, adapters: set[str]) -> tuple[str, str, list[str
         ("cpp-cmake", "CMakeLists.txt"),
         ("python", "pyproject.toml"),
         ("rust", "Cargo.toml"),
+        ("typescript-node", "package.json"),
     ]
     primary = [
         (adapter, marker)
@@ -196,6 +201,197 @@ def materialized_bytes(source_path: Path) -> bytes:
     return source_path.read_bytes()
 
 
+def unsafe_destination_reason(root: Path, destination: Path) -> str | None:
+    try:
+        relative = destination.relative_to(root)
+    except ValueError:
+        return "destination path is outside repository root"
+    current = root
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return f"destination path traverses symlink: {current.relative_to(root)}"
+    try:
+        destination.parent.resolve(strict=False).relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return "destination parent resolves outside repository root"
+    return None
+
+
+def open_parent_directory(root: Path, relative: Path, *, create: bool) -> int:
+    if relative.is_absolute() or ".." in relative.parts or not relative.name:
+        raise AdoptionError(f"unsafe adoption destination: {relative}")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(root, flags)
+    try:
+        for part in relative.parent.parts:
+            try:
+                child = os.open(part, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(part, mode=0o755, dir_fd=descriptor)
+                child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except (OSError, RuntimeError) as exc:
+        os.close(descriptor)
+        raise AdoptionError(f"unsafe adoption destination {relative}: {exc}") from exc
+
+
+@contextmanager
+def exclusive_adoption_lock(root: Path):
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise AdoptionError("another adoption apply is active for this repository") from exc
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def create_regular_file(root: Path, relative: Path, source: Path) -> None:
+    if source.is_symlink() or not source.is_file():
+        raise AdoptionError(f"unsupported adoption source: {source}")
+    mode = stat.S_IMODE(source.stat(follow_symlinks=False).st_mode)
+    payload = source.read_bytes()
+    parent = open_parent_directory(root, relative, create=True)
+    descriptor: int | None = None
+    temporary = f".adoption-{os.getpid()}-{relative.name}.tmp"
+    installed = False
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            mode,
+            dir_fd=parent,
+        )
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written == 0:
+                raise AdoptionError(f"short write while creating adoption destination: {relative}")
+            view = view[written:]
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+        os.link(
+            temporary,
+            relative.name,
+            src_dir_fd=parent,
+            dst_dir_fd=parent,
+            follow_symlinks=False,
+        )
+        installed = True
+        os.unlink(temporary, dir_fd=parent)
+        os.fsync(parent)
+    except (OSError, AdoptionError) as exc:
+        try:
+            os.unlink(temporary, dir_fd=parent)
+        except FileNotFoundError:
+            pass
+        if installed:
+            try:
+                os.unlink(relative.name, dir_fd=parent)
+            except FileNotFoundError:
+                pass
+        if isinstance(exc, AdoptionError):
+            raise
+        raise AdoptionError(
+            f"adoption destination became unsafe or occupied for {relative}: {exc}"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent)
+
+
+def read_regular_file(root: Path, relative: Path) -> bytes:
+    parent = open_parent_directory(root, relative, create=False)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(relative.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise AdoptionError(f"adoption destination is not a regular file: {relative}")
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except OSError as exc:
+        raise AdoptionError(f"adoption destination became unsafe for {relative}: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent)
+
+
+def merge_regular_text(
+    root: Path,
+    relative: Path,
+    merge: Callable[[str], tuple[str | None, str]],
+) -> None:
+    parent = open_parent_directory(root, relative, create=False)
+    descriptor: int | None = None
+    temporary = f".adoption-{os.getpid()}-{relative.name}.tmp"
+    try:
+        descriptor = os.open(
+            relative.name,
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=parent,
+        )
+        original_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(original_stat.st_mode):
+            raise AdoptionError(f"adoption merge destination is not a regular file: {relative}")
+        with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as handle:
+            current = handle.read()
+        updated, detail = merge(current)
+        if updated is None:
+            raise AdoptionError(f"merge became unsafe for {relative}: {detail}")
+        temporary_descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            stat.S_IMODE(original_stat.st_mode),
+            dir_fd=parent,
+        )
+        try:
+            payload = updated.encode("utf-8")
+            view = memoryview(payload)
+            while view:
+                written = os.write(temporary_descriptor, view)
+                if written == 0:
+                    raise AdoptionError(f"short write while merging adoption destination: {relative}")
+                view = view[written:]
+            os.fchmod(temporary_descriptor, stat.S_IMODE(original_stat.st_mode))
+            os.fsync(temporary_descriptor)
+        finally:
+            os.close(temporary_descriptor)
+        current_stat = os.stat(relative.name, dir_fd=parent, follow_symlinks=False)
+        if (current_stat.st_dev, current_stat.st_ino) != (original_stat.st_dev, original_stat.st_ino):
+            raise AdoptionError(f"adoption merge destination changed during apply: {relative}")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        latest_chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            latest_chunks.append(chunk)
+        if b"".join(latest_chunks) != current.encode("utf-8"):
+            raise AdoptionError(f"adoption merge destination changed during apply: {relative}")
+        os.replace(temporary, relative.name, src_dir_fd=parent, dst_dir_fd=parent)
+        os.fsync(parent)
+    except (OSError, UnicodeError, AdoptionError) as exc:
+        try:
+            os.unlink(temporary, dir_fd=parent)
+        except FileNotFoundError:
+            pass
+        if isinstance(exc, AdoptionError):
+            raise
+        raise AdoptionError(f"adoption merge destination became unsafe for {relative}: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent)
+
+
 def build_plan(source: Path, target: Path, requested_adapter: str) -> dict:
     root = repository_root(target)
     adapter, reason, detected = select_adapter(source, root, requested_adapter)
@@ -208,10 +404,83 @@ def build_plan(source: Path, target: Path, requested_adapter: str) -> dict:
 
     actions: list[Action] = []
     blockers: list[str] = []
+    if adapter == "typescript-node":
+        for required in ("package.json", "package-lock.json"):
+            if not (root / required).is_file():
+                blockers.append(
+                    f"{required}: existing npm metadata is required for TypeScript/Node adoption"
+                )
+        foreign_locks = [
+            name
+            for name in ("pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb")
+            if (root / name).exists()
+        ]
+        if foreign_locks:
+            blockers.append(
+                "unsupported package-manager lockfiles are present: "
+                + ", ".join(foreign_locks)
+            )
+        package_path = root / "package.json"
+        lock_path = root / "package-lock.json"
+        package: dict | None = None
+        lock: dict | None = None
+        if package_path.is_file():
+            try:
+                raw_package = json.loads(package_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                blockers.append(f"package.json: malformed npm metadata: {exc}")
+            else:
+                if not isinstance(raw_package, dict):
+                    blockers.append("package.json: npm metadata must be an object")
+                else:
+                    package = raw_package
+                    manager = package.get("packageManager")
+                    npm_version = r"(?:0|[1-9]\d{0,5})(?:\.(?:0|[1-9]\d{0,5})){0,2}"
+                    if manager is not None and (
+                        not isinstance(manager, str)
+                        or re.fullmatch(rf"npm@{npm_version}", manager) is None
+                    ):
+                        blockers.append("package.json: packageManager must select canonical npm")
+                    engines = package.get("engines")
+                    if not isinstance(engines, dict) or not isinstance(engines.get("node"), str):
+                        blockers.append("package.json: engines.node is required")
+        if lock_path.is_file():
+            try:
+                raw_lock = json.loads(lock_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                blockers.append(f"package-lock.json: malformed npm metadata: {exc}")
+            else:
+                if not isinstance(raw_lock, dict):
+                    blockers.append("package-lock.json: npm metadata must be an object")
+                else:
+                    lock = raw_lock
+        if package is not None and lock is not None:
+            packages = lock.get("packages")
+            lock_root = packages.get("") if isinstance(packages, dict) else None
+            if lock.get("lockfileVersion") not in (2, 3) or not isinstance(lock_root, dict):
+                blockers.append("package-lock.json: npm lockfile root identity is required")
+            else:
+                for field in ("name", "version"):
+                    identity = package.get(field)
+                    if (
+                        not isinstance(identity, str)
+                        or not identity
+                        or lock.get(field) != identity
+                        or lock_root.get(field) != identity
+                    ):
+                        blockers.append(
+                            f"package-lock.json: root {field} must match package.json"
+                        )
     for relative, entry in sorted(entries.items(), key=lambda item: item[0].as_posix()):
         rel = relative.as_posix()
         destination = root / relative
         owner = entry.component
+
+        unsafe = unsafe_destination_reason(root, destination)
+        if unsafe:
+            blockers.append(f"{rel}: {unsafe}")
+            actions.append(Action(rel, "blocked", owner, unsafe))
+            continue
 
         if not destination.exists() and not destination.is_symlink():
             actions.append(Action(rel, "create", owner, "path does not exist"))
@@ -221,7 +490,11 @@ def build_plan(source: Path, target: Path, requested_adapter: str) -> dict:
             actions.append(Action(rel, "noop", owner, "existing content is identical"))
             continue
 
-        if owner.startswith("adapter:") and matches(rel, policy["preserve_existing"]):
+        if (
+            owner.startswith("adapter:")
+            and matches(rel, policy["preserve_existing"])
+            and destination.is_file()
+        ):
             actions.append(Action(rel, "preserve", "repository", "adapter adoption policy preserves existing repository-owned file"))
             continue
 
@@ -274,6 +547,12 @@ def build_plan(source: Path, target: Path, requested_adapter: str) -> dict:
 
 
 def apply_plan(source: Path, target: Path, requested_adapter: str) -> dict:
+    root = repository_root(target)
+    with exclusive_adoption_lock(root):
+        return apply_plan_locked(source, root, requested_adapter)
+
+
+def apply_plan_locked(source: Path, target: Path, requested_adapter: str) -> dict:
     plan = build_plan(source, target, requested_adapter)
     if plan["workingTreeDirty"]:
         raise AdoptionError("adoption refused: target working tree is dirty")
@@ -290,30 +569,62 @@ def apply_plan(source: Path, target: Path, requested_adapter: str) -> dict:
         rel = relative.as_posix()
         destination = root / relative
         action = action_by_path[rel]["action"]
-        if action in {"noop", "preserve"}:
-            continue
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if action == "create":
-            if entry.source.is_symlink():
-                os.symlink(os.readlink(entry.source), destination)
+        unsafe = unsafe_destination_reason(root, destination)
+        if unsafe:
+            raise AdoptionError(f"adoption destination became unsafe for {rel}: {unsafe}")
+        if action == "noop":
+            current = read_regular_file(root, relative)
+            if action_by_path[rel]["reason"] == "existing content is identical":
+                valid = current == entry.source.read_bytes()
             else:
-                shutil.copy2(entry.source, destination, follow_symlinks=False)
+                try:
+                    text = current.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise AdoptionError(f"adoption no-op destination changed during apply: {rel}") from exc
+                if rel in policy["line_merge"]:
+                    _, missing = line_merge(text, policy["line_merge"][rel])
+                    valid = not missing
+                else:
+                    strategy = policy["structured_merge"].get(rel)
+                    if strategy == "agent-module-router":
+                        merged, _ = just_router_merge(text)
+                    elif strategy == "agent-rules-block":
+                        merged, _ = agent_rules_merge(
+                            text,
+                            entry.source.read_text(encoding="utf-8"),
+                        )
+                    else:
+                        merged = None
+                    valid = merged == text
+            if not valid:
+                raise AdoptionError(f"adoption no-op destination changed during apply: {rel}")
+            continue
+        if action == "preserve":
+            read_regular_file(root, relative)
+            continue
+        if action == "create":
+            create_regular_file(root, relative, entry.source)
             continue
         if action == "merge":
             if rel in policy["line_merge"]:
-                merged, _ = line_merge(destination.read_text(encoding="utf-8"), policy["line_merge"][rel])
-                destination.write_text(merged, encoding="utf-8")
+                merge_regular_text(
+                    root,
+                    relative,
+                    lambda current: (
+                        line_merge(current, policy["line_merge"][rel])[0],
+                        "line merge",
+                    ),
+                )
                 continue
             strategy = policy["structured_merge"].get(rel)
             if strategy == "agent-module-router":
-                merged, detail = just_router_merge(destination.read_text(encoding="utf-8"))
+                merger = just_router_merge
             elif strategy == "agent-rules-block":
-                merged, detail = agent_rules_merge(destination.read_text(encoding="utf-8"), entry.source.read_text(encoding="utf-8"))
+                core_rules = entry.source.read_text(encoding="utf-8")
+                merger = lambda current: agent_rules_merge(current, core_rules)
             else:
                 raise AdoptionError(f"unexpected merge action for {rel}")
-            if merged is None:
-                raise AdoptionError(f"merge became unsafe for {rel}: {detail}")
-            destination.write_text(merged, encoding="utf-8")
+            merge_regular_text(root, relative, merger)
             continue
         raise AdoptionError(f"unexpected action {action!r} for {rel}")
 

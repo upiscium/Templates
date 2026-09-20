@@ -39,6 +39,7 @@ jobs:
           - agent-rust
           - agent-nix
           - agent-cpp-cmake
+          - agent-typescript-node
     steps:
       - uses: actions/checkout@v6
       - uses: cachix/install-nix-action@v31

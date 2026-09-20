@@ -1061,6 +1061,7 @@ class MaintenanceLifecycleTest(unittest.TestCase):
             "agent-rust",
             "agent-nix",
             "agent-cpp-cmake",
+            "agent-typescript-node",
         ):
             generated = ROOT / "templates" / template
             for relative in (

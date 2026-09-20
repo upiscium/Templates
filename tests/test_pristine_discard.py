@@ -397,6 +397,7 @@ class PristineDiscardTest(unittest.TestCase):
             "agent-nix",
             "agent-python",
             "agent-rust",
+            "agent-typescript-node",
         ):
             generated = (
                 ROOT

@@ -46,6 +46,7 @@ LEAF_CONTRACT_TEMPLATES = (
     "agent-rust",
     "agent-nix",
     "agent-cpp-cmake",
+    "agent-typescript-node",
 )
 READ_ONLY_GIT_COMMANDS = {
     "git status",
@@ -633,6 +634,7 @@ class OpenCodeContractTest(unittest.TestCase):
             "agent-rust",
             "agent-nix",
             "agent-cpp-cmake",
+            "agent-typescript-node",
         ):
             generated = ROOT / "templates" / template
             self.assertFalse(list((generated / ".opencode" / "agents").glob("*-fallback.md")), template)
