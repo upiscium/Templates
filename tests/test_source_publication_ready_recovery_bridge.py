@@ -1,6 +1,11 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
+import pwd as account_database
+import secrets
+import shutil
+import tempfile
 import unittest
 from unittest import mock
 
@@ -63,6 +68,89 @@ class PublicationReadyRecoveryBridgeTests(unittest.TestCase):
             "GH_REPO", "PATH", "HOME", "XDG_CONFIG_HOME", "GH_TOKEN",
         ):
             self.assertNotIn(key, environment)
+
+    def test_trusted_gh_environment_exposes_only_verified_git_directory(self):
+        with mock.patch.object(
+            bridge, "trusted_git", return_value=Path("/trusted/git/bin/git")
+        ):
+            environment = bridge.trusted_gh_process_environment(
+                {"PATH": "/attacker/bin:/usr/bin", "HTTPS_PROXY": "attacker"}
+            )
+        self.assertEqual(environment["PATH"], "/trusted/git/bin")
+        self.assertNotIn("HTTPS_PROXY", environment)
+
+    def test_trusted_gh_run_uses_verified_git_path(self):
+        completed = mock.Mock(returncode=0)
+        with mock.patch.object(bridge, "trusted_git", return_value=Path("/trusted/bin/git")), \
+             mock.patch.object(bridge, "trusted_gh", return_value=Path("/trusted/bin/gh")), \
+             mock.patch.object(bridge, "trusted_gh_environment", return_value={}), \
+             mock.patch.object(bridge.subprocess, "run", return_value=completed) as run:
+            self.assertIs(bridge.trusted_gh_run(["gh", "version"]), completed)
+        self.assertEqual(run.call_args.kwargs["env"]["PATH"], "/trusted/bin")
+        self.assertEqual(run.call_args.args[0], ["/trusted/bin/gh", "version"])
+
+    def test_pinned_gh_run_uses_verified_git_path(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(bridge, "trusted_git", return_value=Path("/trusted/bin/git")), \
+             mock.patch.object(bridge, "trusted_gh", return_value=Path("/trusted/bin/gh")), \
+             mock.patch.object(bridge, "trusted_gh_environment", return_value={}), \
+             mock.patch.object(bridge.subprocess, "run", return_value=completed) as run:
+            self.assertIs(
+                bridge._pinned_run(
+                    ["gh", "version"], env_overrides={"PATH": "/attacker/bin"}
+                ),
+                completed,
+            )
+        self.assertEqual(run.call_args.kwargs["env"]["PATH"], "/trusted/bin")
+        self.assertEqual(run.call_args.args[0], ["/trusted/bin/gh", "version"])
+
+    def test_gh_child_resolves_verified_git_not_ambient_fake(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            attacker = root / "attacker"
+            attacker.mkdir()
+            fake_git = attacker / "git"
+            fake_git.write_text("#!/bin/sh\nprintf 'MALICIOUS\\n'\n", encoding="utf-8")
+            fake_git.chmod(0o755)
+            fake_gh = root / "gh"
+            fake_gh.write_text("#!/bin/sh\nexec git --version\n", encoding="utf-8")
+            fake_gh.chmod(0o755)
+            verified_git = Path(shutil.which("git") or "").resolve()
+            self.assertTrue(verified_git.is_file())
+            with mock.patch.dict(
+                bridge.os.environ,
+                {"PATH": f"{attacker}{os.pathsep}{verified_git.parent}"},
+                clear=True,
+            ), mock.patch.object(
+                bridge, "trusted_git", return_value=verified_git
+            ), mock.patch.object(
+                bridge, "trusted_gh", return_value=fake_gh
+            ), mock.patch.object(
+                bridge, "trusted_gh_environment", return_value={}
+            ):
+                result = bridge.trusted_gh_run(
+                    ["gh"], text=True, capture_output=True, check=False
+                )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("git version", result.stdout)
+            self.assertNotIn("MALICIOUS", result.stdout)
+
+    def test_operator_token_lookup_uses_verified_git_path(self):
+        expected = secrets.token_hex(16)
+        completed = mock.Mock(returncode=0, stdout=expected + "\n", stderr="")
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            gh_config = home / ".config" / "gh"
+            gh_config.mkdir(parents=True, mode=0o700)
+            user_record = mock.Mock(pw_dir=str(home))
+            user_lookup = mock.Mock(return_value=user_record)
+            with mock.patch.dict(bridge.os.environ, {}, clear=True), \
+                 mock.patch.object(account_database, "getpwuid", new=user_lookup), \
+                 mock.patch.object(bridge, "trusted_git", return_value=Path("/trusted/bin/git")), \
+                 mock.patch.object(bridge, "trusted_gh", return_value=Path("/trusted/bin/gh")), \
+                 mock.patch.object(bridge.subprocess, "run", return_value=completed) as run:
+                self.assertEqual(bridge._operator_github_token(), expected)
+        self.assertEqual(run.call_args.kwargs["env"]["PATH"], "/trusted/bin")
 
     def test_maintenance_uses_private_gh_config_with_explicit_token_only(self):
         with mock.patch.dict(
