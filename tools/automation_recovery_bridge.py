@@ -391,6 +391,7 @@ def _verified_modules(root: Path, revision: str):
             for module in (loaded["task_lifecycle"], loaded["agent_core"],
                            loaded["automation_upgrade"]):
                 module.run = _pinned_run
+            loaded["task_lifecycle"]._GITHUB_CLI_EXECUTABLE = gh
             loaded["automation_upgrade"]._GIT_EXECUTABLE = git
             loaded["automation_upgrade"].git_executable = lambda: git
             loaded["git_private_state"]._GIT_EXECUTABLE = str(git)
