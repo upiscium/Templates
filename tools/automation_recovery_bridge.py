@@ -12,6 +12,7 @@ import os
 import pwd
 import re
 import secrets
+import shlex
 import shutil
 import stat
 import subprocess
@@ -291,6 +292,11 @@ def _pinned_run(command, *, cwd=None, check=True, remove_env=(), env_overrides=N
         else sanitized_environment()
     )
     if command[0] == "gh":
+        environment.update(trusted_gh_environment())
+    elif (
+        f"credential.https://github.com.helper="
+        f"!{shlex.quote(str(trusted_gh()))} auth git-credential"
+    ) in command:
         environment.update(trusted_gh_environment())
     for name in remove_env:
         environment.pop(name, None)

@@ -248,6 +248,49 @@ class DefaultBranchSynchronizationTest(RepositoryFixture):
             )
             command("git", "remote", "set-url", "origin", original, cwd=self.repo)
 
+    def test_github_https_auth_rejects_unsafe_worktree_network_config(self) -> None:
+        original = command("git", "remote", "get-url", "origin", cwd=self.repo)
+        command(
+            "git",
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/upiscium/private-fixture.git",
+            cwd=self.repo,
+        )
+        command("git", "config", "extensions.worktreeConfig", "true", cwd=self.repo)
+        command(
+            "git",
+            "config",
+            "--worktree",
+            "url.https://attacker.invalid/.insteadOf",
+            "https://github.com/",
+            cwd=self.repo,
+        )
+        try:
+            with self.assertRaisesRegex(
+                lifecycle.LifecycleError,
+                "unsafe worktree-local Git network configuration",
+            ):
+                lifecycle._network_git_command(self.repo, ["fetch", "origin"])
+        finally:
+            command(
+                "git",
+                "config",
+                "--worktree",
+                "--unset-all",
+                "url.https://attacker.invalid/.insteadOf",
+                cwd=self.repo,
+            )
+            command(
+                "git",
+                "config",
+                "--unset-all",
+                "extensions.worktreeConfig",
+                cwd=self.repo,
+            )
+            command("git", "remote", "set-url", "origin", original, cwd=self.repo)
+
     def test_public_git_operation_can_succeed_without_github_cli_helper(self) -> None:
         completed = mock.Mock(returncode=0, stdout="", stderr="")
         with mock.patch.object(

@@ -178,23 +178,47 @@ def _is_standard_github_https_origin(remote: str) -> bool:
 
 
 def _validate_network_git_configuration(root: Path) -> None:
-    result = run(
-        ["git", "config", "--local", "--no-includes", "--null", "--name-only", "--list"],
+    def reject_unsafe(scope: str, label: str) -> None:
+        result = run(
+            ["git", "config", scope, "--no-includes", "--null", "--name-only", "--list"],
+            cwd=root,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+            raise LifecycleError(f"cannot validate {label} Git network configuration: {detail}")
+        unsafe = sorted(
+            name
+            for name in result.stdout.split("\0")
+            if name and _UNSAFE_NETWORK_GIT_CONFIG.fullmatch(name)
+        )
+        if unsafe:
+            raise LifecycleError(
+                f"repository has unsafe {label} Git network configuration: "
+                + ", ".join(unsafe)
+            )
+
+    reject_unsafe("--local", "local")
+    enabled = run(
+        [
+            "git",
+            "config",
+            "--local",
+            "--no-includes",
+            "--bool",
+            "--get",
+            "extensions.worktreeConfig",
+        ],
         cwd=root,
         check=False,
     )
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
-        raise LifecycleError(f"cannot validate local Git network configuration: {detail}")
-    unsafe = sorted(
-        name
-        for name in result.stdout.split("\0")
-        if name and _UNSAFE_NETWORK_GIT_CONFIG.fullmatch(name)
-    )
-    if unsafe:
-        raise LifecycleError(
-            "repository has unsafe local Git network configuration: " + ", ".join(unsafe)
-        )
+    if enabled.returncode not in {0, 1}:
+        raise LifecycleError("cannot validate worktree Git network configuration")
+    if enabled.returncode == 0:
+        if enabled.stdout.strip() not in {"true", "false"}:
+            raise LifecycleError("extensions.worktreeConfig is not a valid boolean")
+        if enabled.stdout.strip() == "true":
+            reject_unsafe("--worktree", "worktree-local")
 
 
 def _network_git_command(root: Path, args: list[str]) -> tuple[list[str], bool, Path | None]:
