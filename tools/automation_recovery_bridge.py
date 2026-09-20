@@ -118,6 +118,15 @@ def sanitized_environment(source: Mapping[str, str] | None = None) -> dict[str, 
     return environment
 
 
+def _trusted_gh_subprocess_environment(
+    source: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return a scrubbed gh environment with only the validated Git directory on PATH."""
+    environment = sanitized_environment(source)
+    environment["PATH"] = str(trusted_git().parent)
+    return environment
+
+
 def _operator_github_token() -> str:
     for name in ("GH_TOKEN", "GITHUB_TOKEN"):
         token = os.environ.get(name)
@@ -141,7 +150,7 @@ def _operator_github_token() -> str:
         or stat.S_IMODE(metadata.st_mode) & 0o022
     ):
         raise BridgeError("canonical GitHub configuration directory is unsafe")
-    environment = sanitized_environment()
+    environment = _trusted_gh_subprocess_environment()
     environment.update(
         {
             "HOME": str(account_home),
@@ -186,7 +195,7 @@ def trusted_gh_environment() -> dict[str, str]:
 def trusted_gh_run(command: list[str], **kwargs):
     if not command or command[0] != "gh":
         raise BridgeError("Task Contract GitHub runner only accepts gh commands")
-    environment = sanitized_environment(kwargs.pop("env", None))
+    environment = _trusted_gh_subprocess_environment(kwargs.pop("env", None))
     environment.update(trusted_gh_environment())
     return subprocess.run([str(trusted_gh()), *command[1:]], env=environment, **kwargs)
 
@@ -277,13 +286,20 @@ def _pinned_run(command, *, cwd=None, check=True, remove_env=(), env_overrides=N
     if not command or command[0] not in {"git", "gh"}:
         raise BridgeError("verified maintenance runner accepts only Git or GitHub commands")
     executable = trusted_git() if command[0] == "git" else trusted_gh()
-    environment = sanitized_environment()
+    environment = (
+        _trusted_gh_subprocess_environment()
+        if command[0] == "gh"
+        else sanitized_environment()
+    )
     if command[0] == "gh":
         environment.update(trusted_gh_environment())
     for name in remove_env:
         environment.pop(name, None)
     if env_overrides:
         environment.update(env_overrides)
+    if command[0] == "gh":
+        # env_overrides may be supplied by verified modules; PATH remains bridge-owned.
+        environment["PATH"] = str(trusted_git().parent)
     argv = [str(executable), *command[1:]]
     if command[0] == "git":
         argv = [
