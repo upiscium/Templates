@@ -12,7 +12,13 @@ assert SPEC and SPEC.loader
 bootstrap = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bootstrap)
 
-TEMPLATES = ("agent-python", "agent-rust", "agent-nix", "agent-cpp-cmake")
+TEMPLATES = (
+    "agent-python",
+    "agent-rust",
+    "agent-nix",
+    "agent-cpp-cmake",
+    "agent-typescript-node",
+)
 
 
 class ProjectBootstrapTest(unittest.TestCase):

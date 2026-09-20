@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / "tools"
@@ -123,15 +124,78 @@ class AdoptRepositoryTest(unittest.TestCase):
         self.assertTrue((repo / ".automation" / "VERSION").is_file())
 
     def test_repository_owned_path_policy_is_consistent_across_adapters(self) -> None:
-        for adapter in ("base", "cpp-cmake", "python", "rust", "nix"):
+        for adapter in ("base", "cpp-cmake", "python", "rust", "nix", "typescript-node"):
             with self.subTest(adapter=adapter):
                 policy = adopt_repository.load_policy(ROOT, adapter)
                 self.assertIn("README.md", policy["preserve_existing"])
 
-        for adapter in ("cpp-cmake", "python", "rust", "nix"):
+        for adapter in ("cpp-cmake", "python", "rust", "nix", "typescript-node"):
             with self.subTest(adapter=adapter):
                 policy = adopt_repository.load_policy(ROOT, adapter)
                 self.assertIn(".envrc", policy["preserve_existing"])
+
+    def test_typescript_node_discode_shaped_plan_is_collision_safe(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        owned = {
+            "package.json": '{"name":"discode","version":"1.0.0","engines":{"node":">=22 <23"},"scripts":{"lint":"eslint ."}}\n',
+            "package-lock.json": '{"name":"discode","version":"1.0.0","lockfileVersion":3,"packages":{"":{"name":"discode","version":"1.0.0"}}}\n',
+            "flake.nix": "{ outputs = { self }: {}; }\n",
+            ".github/workflows/ci.yml": "name: CI\n",
+            "scripts/repository-check.mjs": "// repository-owned\n",
+            "src/index.ts": "export const value: number = 1;\n",
+        }
+        for relative, content in owned.items():
+            path = repo / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        self.commit_all(repo)
+
+        plan = adopt_repository.build_plan(ROOT, repo, "auto")
+        actions = {action["path"]: action for action in plan["actions"]}
+
+        self.assertEqual(plan["selectedAdapter"], "typescript-node")
+        for relative in ("package.json", "package-lock.json", "flake.nix"):
+            self.assertEqual(actions[relative]["action"], "preserve")
+        self.assertNotIn(".github/workflows/ci.yml", actions)
+        self.assertNotIn("scripts/repository-check.mjs", actions)
+        self.assertTrue(plan["canApply"], plan["blockers"])
+
+        adopt_repository.apply_plan(ROOT, repo, "typescript-node")
+        for relative, content in owned.items():
+            self.assertEqual((repo / relative).read_text(encoding="utf-8"), content)
+
+    def test_typescript_node_adoption_requires_existing_npm_lock_identity(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        (repo / "package.json").write_text(
+            '{"name":"fixture","version":"1.0.0","packageManager":"npm@10"}\n',
+            encoding="utf-8",
+        )
+        self.commit_all(repo)
+
+        plan = adopt_repository.build_plan(ROOT, repo, "auto")
+
+        self.assertEqual(plan["selectedAdapter"], "typescript-node")
+        self.assertFalse(plan["canApply"])
+        self.assertTrue(any("package-lock.json" in blocker for blocker in plan["blockers"]))
+
+    def test_typescript_node_adoption_rejects_foreign_package_manager(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        (repo / "package.json").write_text(
+            '{"name":"fixture","version":"1.0.0","packageManager":"pnpm@10"}\n',
+            encoding="utf-8",
+        )
+        (repo / "package-lock.json").write_text("{}\n", encoding="utf-8")
+        (repo / "pnpm-lock.yaml").write_text("lockfileVersion: 9\n", encoding="utf-8")
+        self.commit_all(repo)
+
+        plan = adopt_repository.build_plan(ROOT, repo, "auto")
+
+        self.assertFalse(plan["canApply"])
+        self.assertTrue(any("packageManager must select canonical npm" in blocker for blocker in plan["blockers"]))
+        self.assertTrue(any("pnpm-lock.yaml" in blocker for blocker in plan["blockers"]))
 
     def test_plan_reports_preserved_old_just_environment_prerequisite(self) -> None:
         temporary, repo = self.make_repo()
@@ -170,6 +234,18 @@ class AdoptRepositoryTest(unittest.TestCase):
         self.assertFalse(plan["canApply"])
         self.assertTrue(any("opencode.json" in blocker for blocker in plan["blockers"]))
 
+    def test_preserved_file_path_directory_collision_blocks_apply(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        (repo / "package.json").mkdir()
+        (repo / "package.json" / ".keep").write_text("directory collision\n", encoding="utf-8")
+        self.commit_all(repo)
+
+        plan = adopt_repository.build_plan(ROOT, repo, "typescript-node")
+
+        self.assertFalse(plan["canApply"])
+        self.assertTrue(any("package.json" in blocker for blocker in plan["blockers"]))
+
     def test_dirty_repository_cannot_apply(self) -> None:
         temporary, repo = self.make_repo()
         self.addCleanup(temporary.cleanup)
@@ -183,6 +259,85 @@ class AdoptRepositoryTest(unittest.TestCase):
         self.assertFalse(plan["canApply"])
         with self.assertRaisesRegex(adopt_repository.AdoptionError, "working tree is dirty"):
             adopt_repository.apply_plan(ROOT, repo, "base")
+
+    def test_symlinked_destination_ancestor_blocks_plan_and_apply(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        outside = repo.parent / f"{repo.name}-outside"
+        outside.mkdir()
+        self.addCleanup(outside.rmdir)
+        (repo / "package.json").write_text("{}\n", encoding="utf-8")
+        (repo / ".automation").symlink_to(outside, target_is_directory=True)
+        self.commit_all(repo)
+
+        plan = adopt_repository.build_plan(ROOT, repo, "typescript-node")
+
+        self.assertFalse(plan["canApply"])
+        self.assertTrue(any("traverses symlink" in blocker for blocker in plan["blockers"]))
+        with self.assertRaisesRegex(adopt_repository.AdoptionError, "adoption blocked"):
+            adopt_repository.apply_plan(ROOT, repo, "typescript-node")
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_apply_revalidates_destination_ancestor_safety(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        (repo / "package.json").write_text(
+            '{"name":"fixture","version":"1.0.0","engines":{"node":">=22 <23"}}\n',
+            encoding="utf-8",
+        )
+        (repo / "package-lock.json").write_text(
+            '{"name":"fixture","version":"1.0.0","lockfileVersion":3,"packages":{"":{"name":"fixture","version":"1.0.0"}}}\n',
+            encoding="utf-8",
+        )
+        self.commit_all(repo)
+        original_build_plan = adopt_repository.build_plan
+        plan = original_build_plan(ROOT, repo, "typescript-node")
+        self.assertTrue(plan["canApply"], plan["blockers"])
+        outside = repo.parent / f"{repo.name}-outside"
+        outside.mkdir()
+        self.addCleanup(outside.rmdir)
+
+        def replace_automation(*args: object, **kwargs: object) -> dict:
+            (repo / ".automation").symlink_to(outside, target_is_directory=True)
+            return plan
+
+        with patch.object(adopt_repository, "build_plan", side_effect=replace_automation), self.assertRaisesRegex(
+            adopt_repository.AdoptionError, "became unsafe"
+        ):
+            adopt_repository.apply_plan(ROOT, repo, "typescript-node")
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_atomic_create_failure_leaves_no_partial_destination(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        source = repo / "source"
+        source.write_text("complete content\n", encoding="utf-8")
+
+        with patch.object(adopt_repository.os, "write", side_effect=OSError("disk full")), self.assertRaisesRegex(
+            adopt_repository.AdoptionError, "became unsafe"
+        ):
+            adopt_repository.create_regular_file(repo, Path("destination"), source)
+
+        self.assertFalse((repo / "destination").exists())
+        self.assertEqual(list(repo.glob(".adoption-*.tmp")), [])
+
+    def test_atomic_merge_failure_preserves_original_destination(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        destination = repo / "Justfile"
+        destination.write_text("original\n", encoding="utf-8")
+
+        with patch.object(adopt_repository.os, "write", side_effect=OSError("disk full")), self.assertRaisesRegex(
+            adopt_repository.AdoptionError, "became unsafe"
+        ):
+            adopt_repository.merge_regular_text(
+                repo,
+                Path("Justfile"),
+                lambda _: ("replacement\n", "test merge"),
+            )
+
+        self.assertEqual(destination.read_text(encoding="utf-8"), "original\n")
+        self.assertEqual(list(repo.glob(".adoption-*.tmp")), [])
 
     def test_conflicting_just_module_blocks_safe_merge(self) -> None:
         existing = "mod agent 'custom/agent.just'\n"

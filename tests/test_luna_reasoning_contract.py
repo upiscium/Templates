@@ -12,6 +12,7 @@ TEMPLATES = (
     "agent-rust",
     "agent-nix",
     "agent-cpp-cmake",
+    "agent-typescript-node",
 )
 LUNA_AGENTS = {
     "plan",

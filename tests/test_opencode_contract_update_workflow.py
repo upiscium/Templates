@@ -95,7 +95,7 @@ class OpencodeContractUpdateWorkflowTest(unittest.TestCase):
         self.assertNotRegex(self.publish, r"git push[^\n]*(?:--force|\s-f(?:\s|$))")
 
     def test_updater_does_not_duplicate_generated_runtime_matrix(self) -> None:
-        for template in ("agent-python", "agent-rust", "agent-nix", "agent-cpp-cmake"):
+        for template in ("agent-python", "agent-rust", "agent-nix", "agent-cpp-cmake", "agent-typescript-node"):
             self.assertNotIn(template, self.workflow)
 
 

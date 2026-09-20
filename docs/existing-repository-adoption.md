@@ -16,7 +16,12 @@ nix develop --command just template::adapter-migrate-plan /path/to/repository cp
 
 `adopt-plan` is read-only. It reports the selected Adapter, selection reason, Agent Core version, dirty-state status, planned file actions, and blockers.
 
-`adopt-apply` performs no commit, push, or merge. It refuses to run when the target working tree is dirty or when the plan contains unresolved collisions.
+`adopt-apply` performs no commit, push, or merge. It refuses to run when the target working tree is dirty or when the plan contains unresolved collisions. Run it only while the target is under exclusive operator ownership; apply takes a non-blocking advisory lock on the repository directory to serialize adoption processes, then revalidates destinations and uses no-follow descriptor traversal with atomic per-file installation.
+
+TypeScript/Node adoption requires repository-owned `package.json` and
+`package-lock.json` npm identity. It rejects pnpm, Yarn, and Bun lockfiles
+rather than installing dependencies or materializing scaffold package-manager
+metadata into an existing repository.
 
 For a Python repository, adoption deliberately leaves dependency resolution outside the generic adoption engine. Existing `flake.lock` and `uv.lock` files are preserved byte-for-byte. After `template::adopt-apply`, run the explicit bootstrap boundary, review any newly generated lockfiles, verify without lockfile updates, and include the accepted bootstrap output in the adoption pull request:
 
@@ -33,7 +38,7 @@ After applying Agent Core on an existing bootstrap/adoption branch, `just agent:
 
 Explicit `--adapter <id>` always wins when the Adapter exists.
 
-Auto selection uses only dedicated Adapters that are actually present in the current Templates source. Known marker examples are `CMakeLists.txt`, `pyproject.toml`, `Cargo.toml`, and `flake.nix`.
+Auto selection uses only dedicated Adapters that are actually present in the current Templates source. Known marker examples are `CMakeLists.txt`, `pyproject.toml`, `Cargo.toml`, `package.json`, and `flake.nix`.
 
 When no dedicated Adapter matches, or more than one dedicated Adapter matches, selection falls back to `base`. It does not guess which dedicated Adapter the repository intended to use.
 

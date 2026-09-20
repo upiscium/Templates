@@ -18,6 +18,7 @@ agent-python     -> upiscium/Template-Agent-Python
 agent-rust       -> upiscium/Template-Agent-Rust
 agent-nix        -> upiscium/Template-Agent-Nix
 agent-cpp-cmake  -> upiscium/Template-Agent-Cpp-CMake
+agent-typescript-node -> upiscium/Template-Agent-TypeScript-Node
 ```
 
 `agent-base` is intentionally not published as a GitHub Template Repository. It is the minimum/fallback contract used for local Nix initialization and repository adoption; GitHub new-repository users should select a concrete language/toolchain template.
@@ -26,7 +27,7 @@ agent-cpp-cmake  -> upiscium/Template-Agent-Cpp-CMake
 
 The distribution repositories are external artifacts, so their initial creation is an explicit operator action. Do not grant the recurring publisher repository-administration permission just to automate this one-time step.
 
-Create the four public repositories with an initial branch, using the descriptions from `distribution/template-repositories.json`. For example:
+Create the five public repositories with an initial branch, using the descriptions from `distribution/template-repositories.json`. For example:
 
 ```sh
 gh repo create upiscium/Template-Agent-Python \
@@ -34,7 +35,7 @@ gh repo create upiscium/Template-Agent-Python \
   --description 'Generated Agent-ready Python + uv template. Source: upiscium/Templates; do not edit directly.'
 ```
 
-Repeat for Rust, Nix, and C++/CMake. Confirm every repository has `main` as its default branch before enabling publication. If the account's new-repository default differs, rename the initial branch to `main` through GitHub before continuing.
+Repeat for Rust, Nix, C++/CMake, and TypeScript/Node. Confirm every repository has `main` as its default branch before enabling publication. If the account's new-repository default differs, rename the initial branch to `main` through GitHub before continuing.
 
 Enable each repository as a Template Repository once:
 
@@ -43,6 +44,7 @@ gh repo edit upiscium/Template-Agent-Python --template
 gh repo edit upiscium/Template-Agent-Rust --template
 gh repo edit upiscium/Template-Agent-Nix --template
 gh repo edit upiscium/Template-Agent-Cpp-CMake --template
+gh repo edit upiscium/Template-Agent-TypeScript-Node --template
 ```
 
 Verify the settings:
@@ -52,7 +54,8 @@ for repo in \
   Template-Agent-Python \
   Template-Agent-Rust \
   Template-Agent-Nix \
-  Template-Agent-Cpp-CMake
+  Template-Agent-Cpp-CMake \
+  Template-Agent-TypeScript-Node
 do
   gh api "repos/upiscium/$repo" --jq '{full_name,default_branch,is_template,description}'
 done
@@ -67,7 +70,7 @@ is_template = true
 
 ## Publisher credential
 
-Create a fine-grained personal access token scoped to exactly these four distribution repositories. The recurring publisher requires only repository **Contents: Read and write**. Do not grant Administration permission to this token.
+Create a fine-grained personal access token scoped to exactly these five distribution repositories. The recurring publisher requires only repository **Contents: Read and write**. Do not grant Administration permission to this token.
 
 Store it only as an Actions secret on `upiscium/Templates`:
 

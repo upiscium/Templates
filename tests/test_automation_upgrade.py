@@ -41,7 +41,7 @@ AGENT_SPEC.loader.exec_module(agent_core)
 
 
 class AutomationUpgradeContractTest(unittest.TestCase):
-    TEMPLATE_NAMES = ("agent-base", "agent-python", "agent-rust", "agent-nix", "agent-cpp-cmake")
+    TEMPLATE_NAMES = ("agent-base", "agent-python", "agent-rust", "agent-nix", "agent-cpp-cmake", "agent-typescript-node")
     AGENT_KNOWLEDGE_VAULT_19 = {
         "task": "19",
         "branch": "task/19-agent-core-v3-1-1",
@@ -535,7 +535,7 @@ mod project 'just/project/mod.just'
         ownership = ROOT / "components" / "agent-core" / ".automation" / "ownership.toml"
         self.assertIn('repository = "github:upiscium/Templates"', upstream.read_text())
         self.assertIn('"AGENTS.md" = "replace"', ownership.read_text())
-        for template in ("agent-base", "agent-python", "agent-rust", "agent-nix", "agent-cpp-cmake"):
+        for template in ("agent-base", "agent-python", "agent-rust", "agent-nix", "agent-cpp-cmake", "agent-typescript-node"):
             self.assertEqual(
                 upstream.read_bytes(),
                 (ROOT / "templates" / template / ".automation" / "UPSTREAM").read_bytes(),

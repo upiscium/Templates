@@ -9,7 +9,13 @@ ROOT = Path(__file__).resolve().parents[1]
 class CiContractTest(unittest.TestCase):
     def test_ci_covers_all_generated_language_adapters(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "template-ci.yml").read_text(encoding="utf-8")
-        for template in ("agent-python", "agent-rust", "agent-nix", "agent-cpp-cmake"):
+        for template in (
+            "agent-python",
+            "agent-rust",
+            "agent-nix",
+            "agent-cpp-cmake",
+            "agent-typescript-node",
+        ):
             self.assertIn(f"- {template}", workflow)
         self.assertIn("python3 tools/render_templates.py check", workflow)
         self.assertIn("python3 -m unittest discover -s tests -v", workflow)

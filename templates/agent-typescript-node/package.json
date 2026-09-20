@@ -1,0 +1,15 @@
+{
+  "name": "@@PROJECT_NAME@@",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@10",
+  "engines": { "node": ">=22.6.0 <23" },
+  "scripts": {
+    "format:check": "node scripts/format-check.mjs",
+    "lint": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/*.test.mjs",
+    "build": "tsc"
+  }
+}

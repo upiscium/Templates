@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 AUTOMATION_MODULE = ".automation/just/automation.just"
 AGENT_CORE_PYTHON_MODULES = ("agent.just", "automation.just", "integrate.just", "repository.just")
 NO_BYTECODE_PREFIX = "env PYTHONDONTWRITEBYTECODE=1 python3 -B "
-TEMPLATE_NAMES = ("agent-base", "agent-python", "agent-rust", "agent-nix", "agent-cpp-cmake")
+TEMPLATE_NAMES = ("agent-base", "agent-python", "agent-rust", "agent-nix", "agent-cpp-cmake", "agent-typescript-node")
 RECIPES = (
     ("automation::version",),
     ("automation::check-update", "."),
