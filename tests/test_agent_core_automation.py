@@ -536,7 +536,10 @@ None yet.
             root = Path(directory)
             self.issue_fixture(root)
             title, body = agent_core.publication.canonical_metadata(
-                root, "2", head=self.HEAD, changed_paths=["components/control.py"]
+                root,
+                "2",
+                head=self.HEAD,
+                changed_paths=["components/control.py", "docs/fixes #99"],
             )
             self.assertEqual("2: Spike OpenCode headless control and event semantics", title)
             self.assertIn("Issue #2: Spike OpenCode headless control and event semantics", body)
@@ -563,10 +566,7 @@ None yet.
             self.assertNotIn("- Requirement: fake requirement", body)
             self.assertNotIn("- Requirement: 検証対象の境界が確認できたら停止する。", body)
             self.assertIn("Closes #2", body)
-            directives = [
-                match.group(0).casefold()
-                for match in agent_core.publication.CLOSING_DIRECTIVE_RE.finditer(title + "\n" + body)
-            ]
+            directives = agent_core.publication._publication_directives(title, body)
             self.assertEqual(["closes #2"], directives)
             self.assertIn("https://github.com/upiscium/SwitchBoard/issues/2", body)
             self.assertNotIn(".task-state/issue.json#title", title + "\n" + body)

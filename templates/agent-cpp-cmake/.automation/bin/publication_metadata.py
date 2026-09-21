@@ -182,6 +182,20 @@ def _issue_purpose(snapshot: dict) -> list[str]:
     ]
 
 
+def _publication_directives(title: str, body: str) -> list[str]:
+    """Find semantic closing relations without treating rendered paths as prose."""
+    semantic_body = re.sub(
+        r"(?ms)^## Changed paths\n\n.*?(?=^## |\Z)",
+        "",
+        body,
+        count=1,
+    )
+    return [
+        match.group(0).casefold()
+        for match in CLOSING_DIRECTIVE_RE.finditer(title + "\n" + semantic_body)
+    ]
+
+
 def _decode_json(raw: bytes | None, name: str) -> dict | None:
     if raw is None:
         return None
@@ -483,10 +497,7 @@ def canonical_metadata(root: Path, task: str, *, head: str, changed_paths: list[
             "", "## Follow-up Tasks", "", *followups, "",
         ]
     )
-    directives = [
-        match.group(0).casefold()
-        for match in CLOSING_DIRECTIVE_RE.finditer(title + "\n" + body)
-    ]
+    directives = _publication_directives(title, body)
     expected_directives = [f"closes #{relation}".casefold()] if relation is not None else []
     if directives != expected_directives:
         raise PublicationMetadataError(
