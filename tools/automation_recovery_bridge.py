@@ -746,7 +746,12 @@ def _bootstrap_contract_authority(contract, target: Path, task: str, directory_f
             name: contract._read_state_file(directory_fd, name)
             for name in ("task.md", "issue.json", "contract.json")
         }
-        validation = contract.validate_contract(target, task, require_pristine=True)
+        validation = contract.validate_contract(
+            target,
+            task,
+            require_pristine=True,
+            directory_fd=directory_fd,
+        )
         repository = contract.repository_identity(target)
         confirmed_evidence = {
             name: contract._read_state_file(directory_fd, name)

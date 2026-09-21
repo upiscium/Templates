@@ -180,7 +180,7 @@ class BootstrapUpgradeBridgeTest(unittest.TestCase):
         return subprocess.run(
             ("python3", "tools/automation_recovery_bridge.py", "bootstrap-upgrade",
              str(self.task), expected), cwd=self.candidate, env=env,
-             text=True, capture_output=True, check=check)
+             text=True, capture_output=True, check=check, timeout=60)
 
     def fail_text(self, result) -> str:
         return result.stdout + result.stderr

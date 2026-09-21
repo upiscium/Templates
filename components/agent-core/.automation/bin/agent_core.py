@@ -40,6 +40,7 @@ def run(
     cwd: Path | None = None,
     check: bool = True,
     remove_env: tuple[str, ...] = (),
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     for name in [key for key in environment if key.startswith("GIT_")]:
@@ -47,7 +48,7 @@ def run(
     for name in remove_env:
         environment.pop(name, None)
     result = subprocess.run(
-        command, cwd=cwd, text=True, capture_output=True, env=environment
+        command, cwd=cwd, text=True, capture_output=True, env=environment, input=input_text
     )
     if check and result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
@@ -59,8 +60,13 @@ def git(*args: str, cwd: Path | None = None, check: bool = True) -> str:
     return run(["git", *args], cwd=cwd, check=check).stdout.strip()
 
 
-def gh(*args: str, cwd: Path | None = None) -> str:
-    return run(["gh", *args], cwd=cwd, remove_env=("GH_REPO",)).stdout.strip()
+def gh(*args: str, cwd: Path | None = None, input_text: str | None = None) -> str:
+    return run(
+        ["gh", *args],
+        cwd=cwd,
+        remove_env=("GH_REPO",),
+        input_text=input_text,
+    ).stdout.strip()
 
 
 def repo_root(cwd: Path | None = None) -> Path:
@@ -247,6 +253,9 @@ def verify(root: Path, task: str) -> None:
     status_before = git("status", "--porcelain", "--untracked-files=all", cwd=root)
     result = run(["just", "project::check"], cwd=root, check=False)
     status_after = git("status", "--porcelain", "--untracked-files=all", cwd=root)
+    head_after = git("rev-parse", "HEAD", cwd=root)
+    if head_after != head:
+        raise AutomationError("project::check changed HEAD; verification evidence is stale")
     receipt = {
         "schema_version": 1,
         "task_id": task,
@@ -437,6 +446,56 @@ def _validate_edit_target(pr: dict, *, branch: str, base: str, head: str) -> Non
         raise AutomationError("pull request repair target identity is invalid: " + ", ".join(mismatches or ["number"]))
 
 
+def _guard_publication_context(
+    root: Path,
+    task: str,
+    *,
+    branch: str,
+    context: dict,
+    head: str,
+    title: str,
+    body: str,
+    base: str | None = None,
+    expected_evidence: dict[str, bytes | None] | None = None,
+) -> dict[str, bytes | None]:
+    """Revalidate local identity and evidence immediately before a GitHub mutation."""
+    guarded_branch, guarded_context, guarded_head = _publication_context(root, task)
+    if (
+        guarded_branch != branch
+        or guarded_head != head
+        or guarded_context["repository"].casefold() != context["repository"].casefold()
+        or guarded_context["status"] != context["status"]
+        or guarded_context["record"] != context["record"]
+    ):
+        raise AutomationError("Task publication context changed during guarded publication")
+    if git("rev-parse", "HEAD", cwd=root) != head:
+        raise AutomationError("Task HEAD changed during guarded publication")
+    if base is not None and default_branch(root) != base:
+        raise AutomationError("repository default branch changed during guarded publication")
+    guarded_title, _, guarded_body = _validated_local_metadata(root, task, guarded_head)
+    if guarded_title != title or not publication.canonical_pr_body_matches(body, guarded_body):
+        raise AutomationError("local publication metadata changed during guarded publication")
+    evidence = publication.publication_evidence_snapshot(root)
+    if expected_evidence is not None and evidence != expected_evidence:
+        raise AutomationError("publication evidence changed during guarded publication")
+    if git("rev-parse", "HEAD", cwd=root) != head:
+        raise AutomationError("Task HEAD changed during guarded publication")
+    return evidence
+
+
+def _mark_publication_state(
+    record: object,
+    task: str,
+    expected: str,
+    target: str,
+    evidence: dict[str, bytes | None],
+) -> str:
+    kwargs = {"expected_evidence": evidence} if evidence else {}
+    return lifecycle.mark_task_publication_state(
+        record, task, expected, target, **kwargs
+    )
+
+
 def pr_create(root: Path, task: str) -> dict:
     verify(root, task)
     branch, context, head = _publication_context(root, task)
@@ -444,7 +503,7 @@ def pr_create(root: Path, task: str) -> dict:
         raise AutomationError(f"pr-create requires publication-ready; found {context['status']}")
     repository = context["repository"]
     base = default_branch(root)
-    title, body, body_text = _validated_local_metadata(root, task, head)
+    title, _, body_text = _validated_local_metadata(root, task, head)
     existing = pr_for_branch(root, branch, repository)
     if existing is not None:
         if not isinstance(existing.get("number"), int) or isinstance(existing.get("number"), bool):
@@ -472,23 +531,66 @@ def pr_create(root: Path, task: str) -> dict:
             body=body_text,
             draft=True,
         )
+        expected_evidence = _guard_publication_context(
+            root,
+            task,
+            branch=branch,
+            context=context,
+            head=head,
+            title=title,
+            body=body_text,
+            base=base,
+        )
         try:
-            lifecycle.mark_task_publication_state(context["record"], task, "publication-ready", "draft-pr-created")
+            _mark_publication_state(
+                context["record"], task, "publication-ready", "draft-pr-created",
+                expected_evidence,
+            )
         except lifecycle.LifecycleError as exc:
             raise AutomationError(str(exc)) from exc
         print(json.dumps(confirmed))
         return confirmed
     if remote_branch_head(root, branch, repository) != head:
         raise AutomationError("remote Task branch does not match the exact publication HEAD")
-    gh("pr", "create", "--repo", repository, "--draft", "--base", base, "--head", branch, "--title", title, "--body-file", str(body), cwd=root)
+    expected_evidence = _guard_publication_context(
+        root,
+        task,
+        branch=branch,
+        context=context,
+        head=head,
+        title=title,
+        body=body_text,
+        base=base,
+    )
+    if remote_branch_head(root, branch, repository) != head:
+        raise AutomationError("remote Task branch changed during guarded publication")
+    gh(
+        "pr", "create", "--repo", repository, "--draft", "--base", base,
+        "--head", branch, "--title", title, "--body-file", "-", cwd=root,
+        input_text=body_text,
+    )
     if canonical_repository(root).casefold() != repository.casefold():
         raise AutomationError("repository identity changed during pull request creation")
     pr = pr_for_branch(root, branch, repository)
     if not pr:
         raise AutomationError("created pull request cannot be re-read")
     _validate_live_pr(pr, branch=branch, base=base, head=head, title=title, body=body_text, draft=True)
+    _guard_publication_context(
+        root,
+        task,
+        branch=branch,
+        context=context,
+        head=head,
+        title=title,
+        body=body_text,
+        base=base,
+        expected_evidence=expected_evidence,
+    )
     try:
-        lifecycle.mark_task_publication_state(context["record"], task, "publication-ready", "draft-pr-created")
+        _mark_publication_state(
+            context["record"], task, "publication-ready", "draft-pr-created",
+            expected_evidence,
+        )
     except lifecycle.LifecycleError as exc:
         raise AutomationError(str(exc)) from exc
     print(json.dumps(pr))
@@ -519,17 +621,48 @@ def pr_edit(root: Path, task: str, expected_pr_number: int | None = None) -> Non
         ):
             raise AutomationError("pull request repair target identity changed before mutation")
     _validate_edit_target(pr, branch=branch, base=default_branch(root), head=head)
-    title, body, body_text = _validated_local_metadata(root, task, head)
-    gh("pr", "edit", str(pr["number"]), "--repo", repository, "--title", title, "--body-file", str(body), cwd=root)
+    title, _, body_text = _validated_local_metadata(root, task, head)
+    base = default_branch(root)
+    expected_evidence = _guard_publication_context(
+        root,
+        task,
+        branch=branch,
+        context=context,
+        head=head,
+        title=title,
+        body=body_text,
+        base=base,
+    )
+    before_edit = pr_for_branch(root, branch, repository)
+    if not before_edit or before_edit.get("number") != pr.get("number"):
+        raise AutomationError("pull request repair target changed during guarded publication")
+    _validate_edit_target(before_edit, branch=branch, base=base, head=head)
+    gh(
+        "pr", "edit", str(pr["number"]), "--repo", repository, "--title", title,
+        "--body-file", "-", cwd=root, input_text=body_text,
+    )
     if canonical_repository(root).casefold() != repository.casefold():
         raise AutomationError("repository identity changed during pull request repair")
     updated = pr_for_branch(root, branch, repository)
     if not updated or updated.get("number") != pr.get("number"):
         raise AutomationError("pull request identity changed during guarded repair")
-    _validate_live_pr(updated, branch=branch, base=default_branch(root), head=head, title=title, body=body_text, draft=True)
+    _validate_live_pr(updated, branch=branch, base=base, head=head, title=title, body=body_text, draft=True)
     if context["status"] == "publication-ready":
+        expected_evidence = _guard_publication_context(
+            root,
+            task,
+            branch=branch,
+            context=context,
+            head=head,
+            title=title,
+            body=body_text,
+            base=base,
+        )
         try:
-            lifecycle.mark_task_publication_state(context["record"], task, "publication-ready", "draft-pr-created")
+            _mark_publication_state(
+                context["record"], task, "publication-ready", "draft-pr-created",
+                expected_evidence,
+            )
         except lifecycle.LifecycleError as exc:
             raise AutomationError(str(exc)) from exc
     print(f"updated PR #{pr['number']}")
@@ -555,15 +688,19 @@ def pr_ready(root: Path, task: str, expected_pr_number: int | None = None) -> No
     if not pr:
         raise AutomationError(f"no pull request for {branch}")
     number = pr["number"]
-    base = None
+    base = default_branch(root)
     if expected_pr_number is not None:
         number = _validated_pr_number(pr)
         if number != expected_pr_number:
             raise AutomationError("pull request identity changed before mutation")
-        base = default_branch(root)
 
-    def require_guarded_context() -> None:
-        verify(root, task)
+    def require_guarded_context(
+        *,
+        verify_now: bool = True,
+        expected_evidence: dict[str, bytes | None] | None = None,
+    ) -> dict[str, bytes | None]:
+        if verify_now:
+            verify(root, task)
         guarded_branch, guarded_context, guarded_head = _publication_context(root, task)
         if (
             guarded_branch != branch
@@ -579,15 +716,19 @@ def pr_ready(root: Path, task: str, expected_pr_number: int | None = None) -> No
         guarded_title, _, guarded_body = _validated_local_metadata(root, task, guarded_head)
         if guarded_title != title or not publication.canonical_pr_body_matches(body, guarded_body):
             raise AutomationError("local publication metadata changed during guarded readiness")
+        evidence = publication.publication_evidence_snapshot(root)
+        if expected_evidence is not None and evidence != expected_evidence:
+            raise AutomationError("publication evidence changed during guarded readiness")
+        return evidence
 
+    expected_evidence: dict[str, bytes | None]
     if pr.get("isDraft"):
-        _validate_live_pr(pr, branch=branch, base=base or default_branch(root), head=head, title=title, body=body, draft=True)
-        if expected_pr_number is not None:
-            require_guarded_context()
-            before_ready = pr_for_branch(root, branch, repository)
-            if not before_ready or _validated_pr_number(before_ready) != number:
-                raise AutomationError("pull request identity changed before mutation")
-            _validate_live_pr(before_ready, branch=branch, base=base, head=head, title=title, body=body, draft=True)
+        _validate_live_pr(pr, branch=branch, base=base, head=head, title=title, body=body, draft=True)
+        expected_evidence = require_guarded_context()
+        before_ready = pr_for_branch(root, branch, repository)
+        if not before_ready or _validated_pr_number(before_ready) != number:
+            raise AutomationError("pull request identity changed before mutation")
+        _validate_live_pr(before_ready, branch=branch, base=base, head=head, title=title, body=body, draft=True)
         gh("pr", "ready", str(number), "--repo", repository, cwd=root)
         if canonical_repository(root).casefold() != repository.casefold():
             raise AutomationError("repository identity changed while marking pull request ready")
@@ -596,19 +737,22 @@ def pr_ready(root: Path, task: str, expected_pr_number: int | None = None) -> No
             raise AutomationError("pull request identity changed while marking ready")
         if expected_pr_number is not None:
             _validated_pr_number(ready)
-        _validate_live_pr(ready, branch=branch, base=base or default_branch(root), head=head, title=title, body=body, draft=False)
+        _validate_live_pr(ready, branch=branch, base=base, head=head, title=title, body=body, draft=False)
     else:
         # Reconcile an earlier successful GitHub readiness write whose local
         # lifecycle transition was interrupted.
-        _validate_live_pr(pr, branch=branch, base=base or default_branch(root), head=head, title=title, body=body, draft=False)
-    if expected_pr_number is not None:
-        require_guarded_context()
-        before_transition = pr_for_branch(root, branch, repository)
-        if not before_transition or _validated_pr_number(before_transition) != number:
-            raise AutomationError("pull request identity changed before lifecycle transition")
-        _validate_live_pr(before_transition, branch=branch, base=base, head=head, title=title, body=body, draft=False)
+        _validate_live_pr(pr, branch=branch, base=base, head=head, title=title, body=body, draft=False)
+        expected_evidence = publication.publication_evidence_snapshot(root)
+    require_guarded_context(verify_now=False, expected_evidence=expected_evidence)
+    before_transition = pr_for_branch(root, branch, repository)
+    if not before_transition or _validated_pr_number(before_transition) != number:
+        raise AutomationError("pull request identity changed before lifecycle transition")
+    _validate_live_pr(before_transition, branch=branch, base=base, head=head, title=title, body=body, draft=False)
     try:
-        lifecycle.mark_task_publication_state(context["record"], task, "draft-pr-created", "integration-pending")
+        _mark_publication_state(
+            context["record"], task, "draft-pr-created", "integration-pending",
+            expected_evidence,
+        )
     except lifecycle.LifecycleError as exc:
         raise AutomationError(str(exc)) from exc
     print(f"PR #{number} marked ready")
