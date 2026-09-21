@@ -1568,7 +1568,13 @@ def _publication_recover(modules: dict, target: Path, task: str) -> dict:
     }
 
 
-def _source_publication_snapshot(modules: dict, target: Path, task: str) -> dict:
+def _source_publication_snapshot(
+    modules: dict,
+    target: Path,
+    task: str,
+    *,
+    require_remote_branch: bool = True,
+) -> dict:
     lifecycle = modules["task_lifecycle"]
     core = modules["agent_core"]
     contract = modules["task_contract"]
@@ -1596,7 +1602,9 @@ def _source_publication_snapshot(modules: dict, target: Path, task: str) -> dict
             raise BridgeError(f"publication-ready recovery requires draft-pr-created or integration-pending; found {status}")
         head = _target_git("rev-parse", "--verify", "HEAD^{commit}", target=target)
         local = _target_git("rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}", target=target)
-        if head != local or record.head != head or _remote_branch_head(target, repository, branch) != head:
+        if head != local or record.head != head:
+            raise BridgeError("Task HEAD, local branch, and registered worktree HEAD differ")
+        if require_remote_branch and _remote_branch_head(target, repository, branch) != head:
             raise BridgeError("Task HEAD, local branch, and remote branch differ")
         if _target_git("status", "--porcelain=v1", "--untracked-files=all", target=target):
             raise BridgeError("target worktree must be clean")
@@ -1783,7 +1791,9 @@ def _post_merge_publication_recover(
     requested_pr: int,
     implementation_revision: str,
 ) -> dict:
-    before = _source_publication_snapshot(modules, target, task)
+    before = _source_publication_snapshot(
+        modules, target, task, require_remote_branch=False
+    )
     if _read_publication_recovery_receipt(modules, target) is not None:
         raise BridgeError("publication-recovery receipt exists; refusing to proceed")
     existing_receipt = _read_post_merge_publication_receipt(modules, target)
@@ -1804,7 +1814,9 @@ def _post_merge_publication_recover(
             "GitHub merge commit is not present in the synchronized default branch"
         )
 
-    latest = _source_publication_snapshot(modules, target, task)
+    latest = _source_publication_snapshot(
+        modules, target, task, require_remote_branch=False
+    )
     protected = (
         "record", "head", "branch", "repository", "base", "base_revision", "state",
         "status", "verification", "work_units", "contract", "issue", "tree", "title", "body",
@@ -1855,7 +1867,9 @@ def _post_merge_publication_recover(
     elif before["status"] != "integration-pending":  # snapshot rejects this
         raise BridgeError("post-merge recovery requires draft-pr-created or integration-pending")
 
-    after = _source_publication_snapshot(modules, target, task)
+    after = _source_publication_snapshot(
+        modules, target, task, require_remote_branch=False
+    )
     if after["status"] != "integration-pending":
         raise BridgeError("post-merge recovery did not reach integration-pending")
     expected_state = _post_merge_state(before, b"integration-pending")
