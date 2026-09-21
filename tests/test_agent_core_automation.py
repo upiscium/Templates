@@ -323,7 +323,29 @@ None yet.
             "number": 2,
             "url": "https://github.com/upiscium/SwitchBoard/issues/2",
             "title": "Spike OpenCode headless control and event semantics",
-            "body": "日本語のIssue本文です。\n\n- [ ] イベント意味論を確認する。",
+            "body": (
+                "## 目的\n"
+                "OpenCodeのheadless controlとevent semanticsを検証する。\n\n"
+                "背景説明はacceptance criterionではない。\n\n"
+                "## 検証対象\n"
+                "headless controlとevent semanticsの境界を確認する。\n\n"
+                "```text\n"
+                "event context example\n"
+                "```\n\n"
+                "## Acceptance criteria\n"
+                "- [ ] イベント意味論を確認する。\n"
+                "```text\n"
+                "```literal\n"
+                "- fake requirement\n"
+                "```\n"
+                "- [ ] headless event boundaryを確認する。\n\n"
+                "## Non-goals\n"
+                "- PWA実装\n"
+                "- SQLite schema確定\n"
+                "- Permission Broker本実装\n\n"
+                "## Stop condition\n"
+                "検証対象の境界が確認できたら停止する。"
+            ),
             "state": "open",
             "repository": "upiscium/SwitchBoard",
             "labels": ["spike"],
@@ -518,14 +540,96 @@ None yet.
             )
             self.assertEqual("2: Spike OpenCode headless control and event semantics", title)
             self.assertIn("Issue #2: Spike OpenCode headless control and event semantics", body)
-            self.assertIn("日本語のIssue本文です。", body)
+            self.assertIn("Bound Issue source content (preserved language):", body)
+            self.assertIn("> ## 目的", body)
+            self.assertIn("> OpenCodeのheadless controlとevent semanticsを検証する。", body)
             self.assertIn("イベント意味論を確認する。", body)
             self.assertIn("> - [ ] イベント意味論を確認する。", body)
+            self.assertIn("- Requirement: イベント意味論を確認する。", body)
+            self.assertIn("- Requirement: headless event boundaryを確認する。", body)
+            self.assertIn("> ```text", body)
+            self.assertIn("> event context example", body)
+            self.assertIn("> ```literal", body)
+            self.assertIn("> ## Non-goals", body)
+            self.assertIn("> - PWA実装", body)
+            self.assertIn("> - SQLite schema確定", body)
+            self.assertIn("> ## Stop condition", body)
+            self.assertNotIn("- Requirement: PWA実装", body)
+            self.assertNotIn("- Requirement: SQLite schema確定", body)
+            self.assertNotIn("- Requirement: Permission Broker本実装", body)
+            self.assertNotIn("- Requirement: ## Non-goals", body)
+            self.assertNotIn("- Requirement: ```text", body)
+            self.assertNotIn("- Requirement: event context example", body)
+            self.assertNotIn("- Requirement: fake requirement", body)
+            self.assertNotIn("- Requirement: 検証対象の境界が確認できたら停止する。", body)
             self.assertIn("Closes #2", body)
+            directives = [
+                match.group(0).casefold()
+                for match in agent_core.publication.CLOSING_DIRECTIVE_RE.finditer(title + "\n" + body)
+            ]
+            self.assertEqual(["closes #2"], directives)
             self.assertIn("https://github.com/upiscium/SwitchBoard/issues/2", body)
             self.assertNotIn(".task-state/issue.json#title", title + "\n" + body)
             self.assertNotIn(".task-state/issue.json#body", title + "\n" + body)
             self.assertNotIn("Authoritative source:", title + "\n" + body)
+
+    def test_issue_backed_metadata_without_acceptance_section_uses_bounded_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.issue_fixture(root)
+            snapshot_path = root / ".task-state/issue.json"
+            contract_path = root / ".task-state/contract.json"
+            snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            snapshot["payload"]["body"] = (
+                "Context prose about the requested spike.\n\n"
+                "## Non-goals\n"
+                "- PWA実装\n"
+                "- SQLite schema確定\n\n"
+                "## Stop condition\n"
+                "Stop after the boundary is understood."
+            )
+            snapshot["sha256"] = agent_core.task_contract._digest(snapshot["payload"])
+            metadata = json.loads(contract_path.read_text(encoding="utf-8"))
+            metadata["sha256"] = snapshot["sha256"]
+            snapshot_path.write_text(json.dumps(snapshot), encoding="utf-8")
+            contract_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+            _, body = agent_core.publication.canonical_metadata(
+                root, "2", head=self.HEAD, changed_paths=["one"]
+            )
+
+            self.assertIn(
+                "- Requirement: Satisfy the authoritative requirements in Issue #2.",
+                body,
+            )
+            self.assertNotIn("- Requirement: Context prose about the requested spike.", body)
+            self.assertNotIn("- Requirement: ## Non-goals", body)
+            self.assertNotIn("- Requirement: PWA実装", body)
+            self.assertNotIn("- Requirement: SQLite schema確定", body)
+            self.assertNotIn("- Requirement: Stop after the boundary is understood.", body)
+
+    def test_generated_publication_metadata_matches_source(self) -> None:
+        for template in (
+            "agent-base",
+            "agent-cpp-cmake",
+            "agent-nix",
+            "agent-python",
+            "agent-rust",
+            "agent-typescript-node",
+        ):
+            generated = (
+                MODULE_PATH.parents[4]
+                / "templates"
+                / template
+                / ".automation"
+                / "bin"
+                / "publication_metadata.py"
+            )
+            self.assertEqual(
+                MODULE_PATH.with_name("publication_metadata.py").read_bytes(),
+                generated.read_bytes(),
+                generated.as_posix(),
+            )
 
     def test_issue_backed_metadata_rejects_missing_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

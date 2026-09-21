@@ -31,6 +31,11 @@ CLOSING_DIRECTIVE_RE = re.compile(
     r"(?:#\d+|[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#\d+|"
     r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/\d+)"
 )
+ISSUE_H2_RE = re.compile(r"^\s{0,3}##(?!#)\s+(.+?)\s*$")
+ISSUE_FENCE_RE = re.compile(r"^\s{0,3}(?P<marker>`{3,}|~{3,})(?P<info>.*)$")
+ISSUE_LIST_ITEM_RE = re.compile(
+    r"^\s{0,3}(?:[-+*]|\d+[.)])\s+(?:\[[ xX]\]\s*)?(?P<value>\S.*)\s*$"
+)
 
 
 @dataclass(frozen=True)
@@ -97,6 +102,51 @@ def _requirements(lines: list[str]) -> list[str]:
     return requirements
 
 
+def _issue_acceptance_requirements(body: str) -> list[str]:
+    """Extract only explicit list items from one exact Issue criteria section."""
+    collecting = False
+    found = False
+    requirements: list[str] = []
+    fence: tuple[str, int] | None = None
+    for line in body.splitlines():
+        fence_match = ISSUE_FENCE_RE.match(line)
+        if fence is not None:
+            if (
+                fence_match is not None
+                and fence_match.group("marker")[0] == fence[0]
+                and len(fence_match.group("marker")) >= fence[1]
+                and not fence_match.group("info").strip()
+            ):
+                fence = None
+            continue
+        if fence_match is not None:
+            marker = fence_match.group("marker")
+            fence = (marker[0], len(marker))
+            continue
+
+        heading_match = ISSUE_H2_RE.match(line)
+        if heading_match is not None:
+            heading = re.sub(r"\s+#+\s*$", "", heading_match.group(1)).strip()
+            if heading.casefold() == "acceptance criteria":
+                if found:
+                    return []
+                found = True
+                collecting = True
+            elif collecting:
+                break
+            continue
+        if not collecting:
+            continue
+
+        item = ISSUE_LIST_ITEM_RE.match(line)
+        if item is None:
+            continue
+        value = _neutralize_closing_directives(item.group("value").strip())
+        if value:
+            requirements.append(f"- Requirement: {value}")
+    return requirements
+
+
 def _issue_snapshot(root: Path, task: str, state: str, directory_fd: int) -> dict | None:
     """Resolve Issue-backed publication authority from the pinned snapshot."""
     issue_pointer = (
@@ -127,7 +177,7 @@ def _issue_purpose(snapshot: dict) -> list[str]:
         f"Issue #{snapshot['issue']}: {_neutralize_closing_directives(payload['title'].strip())}",
         f"Bound Issue: {payload['url']}",
         f"Closes #{snapshot['issue']}",
-        "Issue purpose (from the pinned snapshot):",
+        "Bound Issue source content (preserved language):",
         *excerpt,
     ]
 
@@ -377,15 +427,19 @@ def canonical_metadata(root: Path, task: str, *, head: str, changed_paths: list[
         criteria = _content_lines(sections.get("Acceptance criteria", ""))
         title_summary = purpose[0].lstrip("- ").strip() if purpose else ""
         relation = None
+        requirements = _requirements(criteria)
     else:
         payload = snapshot["payload"]
         purpose = _issue_purpose(snapshot)
-        criteria = _content_lines(payload["body"])
         title_summary = _neutralize_closing_directives(payload["title"].strip())
         relation = snapshot["issue"]
-    if not purpose or not criteria:
+        requirements = _issue_acceptance_requirements(payload["body"])
+        if not requirements:
+            requirements = [
+                f"- Requirement: Satisfy the authoritative requirements in Issue #{relation}."
+            ]
+    if not purpose:
         raise PublicationMetadataError("Task purpose and acceptance criteria must be resolved")
-    requirements = _requirements(criteria)
     if not requirements:
         raise PublicationMetadataError("Task acceptance criteria contain no authoritative requirements")
     blockers = _neutralize_closing_directives(
