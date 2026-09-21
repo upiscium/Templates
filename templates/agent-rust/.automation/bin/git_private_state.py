@@ -24,6 +24,7 @@ REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 SHARED_DIRS = ("cleanup", "integration", "discard-pristine", "automation-maintenance")
 FIXED_AUTHORITY_FILES = {
     "authority.json",
+    "post-merge-publication-recovery.json",
     "source-recovery-proof.json",
     "publication-recovery.json",
 }
@@ -105,6 +106,11 @@ def admin_maintenance(root: Path) -> Path:
 def publication_recovery_receipt(root: Path) -> Path:
     """Return the protected receipt path in this worktree's Git admin dir."""
     return admin_maintenance(root) / "publication-recovery.json"
+
+
+def post_merge_publication_recovery_receipt(root: Path) -> Path:
+    """Return the protected post-merge receipt for this worktree."""
+    return admin_maintenance(root) / "post-merge-publication-recovery.json"
 
 
 def cleanup_receipt(root: Path, task: str) -> Path:
@@ -680,6 +686,39 @@ def _validate_legacy_content(path: Path, content: bytes) -> None:
             ))
             and (value.get("issue_sha256") is None or _valid_digest(value.get("issue_sha256")))
         )
+    elif name == "post-merge-publication-recovery.json":
+        required = {
+            "schema_version", "kind", "repository", "task_id", "worktree", "branch",
+            "head", "tree", "base_branch", "base_revision", "pr_number", "merge_commit",
+            "default_revision", "draft_pr_created_state_sha256",
+            "integration_pending_state_sha256", "work_units_sha256", "verification_sha256",
+            "contract_sha256", "issue_sha256", "title_sha256", "body_sha256",
+            "implementation_source", "implementation_revision",
+        }
+        valid = (
+            set(value) == required
+            and value.get("schema_version") == 1
+            and value.get("kind") == "post-merge-publication-recovery"
+            and _valid_repository(value.get("repository"))
+            and _valid_task_id(value.get("task_id"))
+            and _valid_absolute_path(value.get("worktree"))
+            and _valid_task_branch(value.get("branch"), value.get("task_id"))
+            and all(_valid_oid(value.get(field)) for field in (
+                "head", "tree", "base_revision", "merge_commit", "default_revision",
+                "implementation_revision",
+            ))
+            and _valid_nonempty(value.get("base_branch"))
+            and isinstance(value.get("pr_number"), int)
+            and not isinstance(value.get("pr_number"), bool)
+            and value.get("pr_number") > 0
+            and all(_valid_digest(value.get(field)) for field in (
+                "draft_pr_created_state_sha256", "integration_pending_state_sha256",
+                "work_units_sha256", "verification_sha256", "contract_sha256",
+                "title_sha256", "body_sha256",
+            ))
+            and (value.get("issue_sha256") is None or _valid_digest(value.get("issue_sha256")))
+            and _valid_absolute_path(value.get("implementation_source"))
+        )
     elif name == "source-recovery-proof.json":
         required = {
             "schema_version", "kind", "task_id", "branch", "worktree", "authority_head",
@@ -761,7 +800,7 @@ def _scan_shared_legacy(layout: Topology) -> tuple[list[tuple[Path, Path]], Path
                 authority_value = _legacy_json(content, child)
                 authority_admin = (
                     _validate_publication_recovery_topology(child, authority_value, layout)
-                    if child.name == "publication-recovery.json"
+                    if child.name in {"publication-recovery.json", "post-merge-publication-recovery.json"}
                     else _validate_authority_topology(child, content, layout)
                 )
             if child.name in FIXED_AUTHORITY_FILES:
@@ -804,7 +843,7 @@ def _scan_admin_legacy(layout: Topology) -> list[tuple[Path, Path]]:
         authority_value = _legacy_json(content, child)
         owner = (
             _validate_publication_recovery_topology(child, authority_value, layout)
-            if child.name == "publication-recovery.json"
+            if child.name in {"publication-recovery.json", "post-merge-publication-recovery.json"}
             else _validate_authority_topology(child, content, layout)
         )
         if owner != layout.admin:
@@ -913,7 +952,7 @@ def _validate_canonical(
                     authority_value = _legacy_json(content, child)
                     authority_admin = (
                         _validate_publication_recovery_topology(child, authority_value, layout)
-                        if child.name == "publication-recovery.json"
+                        if child.name in {"publication-recovery.json", "post-merge-publication-recovery.json"}
                         else _validate_authority_topology(child, content, layout)
                     )
                     if child.name in FIXED_AUTHORITY_FILES and authority_admin != layout.common:
@@ -955,7 +994,7 @@ def _validate_canonical(
                     authority_value = _legacy_json(content, child)
                     owner = (
                         _validate_publication_recovery_topology(child, authority_value, layout)
-                        if child.name == "publication-recovery.json"
+                        if child.name in {"publication-recovery.json", "post-merge-publication-recovery.json"}
                         else _validate_authority_topology(child, content, layout)
                     )
                     if owner != layout.admin:

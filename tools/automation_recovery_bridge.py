@@ -628,6 +628,11 @@ def parser() -> argparse.ArgumentParser:
     publication_ready.add_argument("target", type=Path)
     publication_ready.add_argument("task", type=_issue_argument)
     publication_ready.add_argument("expected_implementation_revision", type=_revision_argument)
+    post_merge = sub.add_parser("post-merge-publication-recover")
+    post_merge.add_argument("target", type=Path)
+    post_merge.add_argument("task", type=_issue_argument)
+    post_merge.add_argument("pr", type=_issue_argument)
+    post_merge.add_argument("expected_implementation_revision", type=_revision_argument)
     bootstrap = sub.add_parser("bootstrap-upgrade")
     bootstrap.add_argument("target", type=Path)
     bootstrap.add_argument("expected_source_revision", type=_sha1_revision_argument)
@@ -1007,6 +1012,33 @@ def _remote_branch_head(target: Path, repository: str, branch: str) -> str:
         ["gh", "api", "--hostname", "github.com", f"repos/{repository}/git/ref/heads/{quote(branch, safe='')}", "--jq", ".object.sha"],
         cwd=target,
     )
+    head = result.stdout.strip()
+    if not _REVISION_RE.fullmatch(head):
+        raise BridgeError("remote Task branch HEAD is not a full immutable revision")
+    return head
+
+
+def _post_merge_remote_branch_head(
+    target: Path, repository: str, branch: str
+) -> str | None:
+    """Return the live remote head, allowing only a verified post-merge 404."""
+    command = [
+        "gh",
+        "api",
+        "--hostname",
+        "github.com",
+        f"repos/{repository}/git/ref/heads/{quote(branch, safe='')}",
+        "--jq",
+        ".object.sha",
+    ]
+    result = _pinned_run(command, cwd=target, check=False)
+    if result.returncode:
+        if re.search(r"\(HTTP 404\)\s*$", result.stderr.strip()):
+            return None
+        raise BridgeError(
+            f"{' '.join(command)}: "
+            f"{result.stderr.strip() or result.stdout.strip() or result.returncode}"
+        )
     head = result.stdout.strip()
     if not _REVISION_RE.fullmatch(head):
         raise BridgeError("remote Task branch HEAD is not a full immutable revision")
@@ -1563,7 +1595,13 @@ def _publication_recover(modules: dict, target: Path, task: str) -> dict:
     }
 
 
-def _source_publication_snapshot(modules: dict, target: Path, task: str) -> dict:
+def _source_publication_snapshot(
+    modules: dict,
+    target: Path,
+    task: str,
+    *,
+    require_remote_branch: bool = True,
+) -> dict:
     lifecycle = modules["task_lifecycle"]
     core = modules["agent_core"]
     contract = modules["task_contract"]
@@ -1591,7 +1629,14 @@ def _source_publication_snapshot(modules: dict, target: Path, task: str) -> dict
             raise BridgeError(f"publication-ready recovery requires draft-pr-created or integration-pending; found {status}")
         head = _target_git("rev-parse", "--verify", "HEAD^{commit}", target=target)
         local = _target_git("rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}", target=target)
-        if head != local or record.head != head or _remote_branch_head(target, repository, branch) != head:
+        if head != local or record.head != head:
+            raise BridgeError("Task HEAD, local branch, and registered worktree HEAD differ")
+        remote = (
+            _remote_branch_head(target, repository, branch)
+            if require_remote_branch
+            else _post_merge_remote_branch_head(target, repository, branch)
+        )
+        if remote is not None and remote != head:
             raise BridgeError("Task HEAD, local branch, and remote branch differ")
         if _target_git("status", "--porcelain=v1", "--untracked-files=all", target=target):
             raise BridgeError("target worktree must be clean")
@@ -1615,6 +1660,7 @@ def _source_publication_snapshot(modules: dict, target: Path, task: str) -> dict
     return {
         "record": record, "head": head, "branch": branch, "repository": repository,
         "base": base, "state": state, "status": status, "verification": verification,
+        "base_revision": base_revision.group(1).decode(),
         "work_units": _state_bytes(target, "work-units.json", contract),
         "contract": _state_bytes(target, "contract.json", contract),
         "issue": _optional_state_bytes(target, "issue.json", contract),
@@ -1659,6 +1705,237 @@ def _source_pr(core, target: Path, snapshot: dict, *, ready: bool | None) -> tup
     if pr.get("isCrossRepository") is not False:
         raise BridgeError("cross-repository pull requests are not valid recovery targets")
     return pr, number
+
+
+def _read_post_merge_publication_receipt(modules: dict, target: Path) -> bytes | None:
+    private = modules["git_private_state"]
+    try:
+        private.prepare(target, admin=True)
+        path = private.post_merge_publication_recovery_receipt(target)
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return None
+        return private.read_bytes(path, "post-merge publication recovery receipt")
+    except Exception as exc:
+        raise BridgeError(str(exc)) from exc
+
+
+def _post_merge_state(snapshot: dict, status: bytes) -> bytes:
+    current = snapshot["status"].encode()
+    if current == status:
+        return snapshot["state"]
+    return _replace_publication_status(snapshot["state"], current, status)
+
+
+def _post_merge_receipt(
+    target: Path,
+    task: str,
+    snapshot: dict,
+    pr_number: int,
+    merge_commit: str,
+    default_revision: str,
+    implementation_revision: str,
+) -> bytes:
+    def digest(content: bytes | str | None) -> str | None:
+        if isinstance(content, str):
+            content = content.encode()
+        return hashlib.sha256(content).hexdigest() if content is not None else None
+
+    value = {
+        "schema_version": 1,
+        "kind": "post-merge-publication-recovery",
+        "repository": snapshot["repository"],
+        "task_id": task,
+        "worktree": str(target),
+        "branch": snapshot["branch"],
+        "head": snapshot["head"],
+        "tree": snapshot["tree"],
+        "base_branch": snapshot["base"],
+        "base_revision": snapshot["base_revision"],
+        "pr_number": pr_number,
+        "merge_commit": merge_commit.lower(),
+        "default_revision": default_revision,
+        "draft_pr_created_state_sha256": digest(
+            _post_merge_state(snapshot, b"draft-pr-created")
+        ),
+        "integration_pending_state_sha256": digest(
+            _post_merge_state(snapshot, b"integration-pending")
+        ),
+        "work_units_sha256": digest(snapshot["work_units"]),
+        "verification_sha256": digest(snapshot["verification"]),
+        "contract_sha256": digest(snapshot["contract"]),
+        "issue_sha256": digest(snapshot["issue"]),
+        "title_sha256": digest(snapshot["title"]),
+        "body_sha256": digest(snapshot["body"]),
+        "implementation_source": str(ROOT),
+        "implementation_revision": implementation_revision,
+    }
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def _merged_publication_pr(
+    modules: dict, target: Path, snapshot: dict, requested: int
+) -> tuple[dict, str]:
+    listed = _source_pr_list(target, snapshot["repository"], snapshot["branch"])
+    if listed[0].get("number") != requested:
+        raise BridgeError("unique Task-branch pull request does not match the requested PR")
+    try:
+        pr = modules["agent_core"].pr_details(target, str(requested))
+    except Exception as exc:
+        raise BridgeError(str(exc)) from exc
+    expected = {
+        "number": requested,
+        "headRefName": snapshot["branch"],
+        "baseRefName": snapshot["base"],
+        "headRefOid": snapshot["head"],
+        "isCrossRepository": False,
+        "state": "MERGED",
+        "title": snapshot["title"],
+    }
+    mismatches = [name for name, value in expected.items() if pr.get(name) != value]
+    if not modules["publication_metadata"].canonical_pr_body_matches(
+        snapshot["body"], pr.get("body")
+    ):
+        mismatches.append("body")
+    merge = pr.get("mergeCommit")
+    merge_oid = merge.get("oid") if isinstance(merge, dict) else None
+    if (
+        mismatches
+        or not isinstance(merge_oid, str)
+        or not _REVISION_RE.fullmatch(merge_oid.lower())
+    ):
+        raise BridgeError(
+            "merged publication evidence is invalid: "
+            + ", ".join(mismatches or ["mergeCommit"])
+        )
+    if modules["agent_core"].canonical_repository(target).casefold() != snapshot[
+        "repository"
+    ].casefold():
+        raise BridgeError("repository identity changed during post-merge recovery")
+    return pr, merge_oid.lower()
+
+
+def _post_merge_publication_recover(
+    modules: dict,
+    target: Path,
+    task: str,
+    requested_pr: int,
+    implementation_revision: str,
+) -> dict:
+    before = _source_publication_snapshot(
+        modules, target, task, require_remote_branch=False
+    )
+    if _read_publication_recovery_receipt(modules, target) is not None:
+        raise BridgeError("publication-recovery receipt exists; refusing to proceed")
+    existing_receipt = _read_post_merge_publication_receipt(modules, target)
+    first_pr, merge_oid = _merged_publication_pr(
+        modules, target, before, requested_pr
+    )
+    main = modules["task_lifecycle"].main_worktree(target).path
+    try:
+        synchronized = modules["task_lifecycle"].synchronize_default_branch(main)
+    except Exception as exc:
+        raise BridgeError(str(exc)) from exc
+    if synchronized["branch"] != before["base"]:
+        raise BridgeError("synchronized branch differs from the Task base branch")
+    if not modules["agent_core"].merge_commit_is_ancestor(
+        main, merge_oid, synchronized["revision"]
+    ):
+        raise BridgeError(
+            "GitHub merge commit is not present in the synchronized default branch"
+        )
+
+    latest = _source_publication_snapshot(
+        modules, target, task, require_remote_branch=False
+    )
+    protected = (
+        "record", "head", "branch", "repository", "base", "base_revision", "state",
+        "status", "verification", "work_units", "contract", "issue", "tree", "title", "body",
+    )
+    if any(latest[name] != before[name] for name in protected):
+        raise BridgeError("post-merge recovery subject changed before guarded transition")
+    _, latest_merge = _merged_publication_pr(modules, target, latest, requested_pr)
+    if latest_merge != merge_oid:
+        raise BridgeError("merged pull request identity changed during recovery")
+    try:
+        modules["task_lifecycle"].require_synchronized_default_branch_revision(
+            main, synchronized["branch"], synchronized["revision"]
+        )
+    except Exception as exc:
+        raise BridgeError(str(exc)) from exc
+
+    receipt_default_revision = synchronized["revision"]
+    if existing_receipt is not None:
+        try:
+            existing_value = json.loads(existing_receipt.decode("utf-8"))
+            receipt_default_revision = existing_value["default_revision"]
+        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise BridgeError("post-merge publication recovery receipt is invalid") from exc
+    receipt = _post_merge_receipt(
+        target,
+        task,
+        before,
+        requested_pr,
+        merge_oid,
+        receipt_default_revision,
+        implementation_revision,
+    )
+    if existing_receipt is not None and existing_receipt != receipt:
+        raise BridgeError("conflicting post-merge publication recovery receipt exists")
+    evidence = {
+        "work-units.json": before["work_units"],
+        "verification.json": before["verification"],
+        "contract.json": before["contract"],
+        "issue.json": before["issue"],
+    }
+    if before["status"] == "draft-pr-created":
+        try:
+            modules["task_lifecycle"].recover_post_merge_publication_pending(
+                before["record"], task, before["state"], evidence, receipt
+            )
+        except Exception as exc:
+            raise BridgeError(str(exc)) from exc
+    elif before["status"] != "integration-pending":  # snapshot rejects this
+        raise BridgeError("post-merge recovery requires draft-pr-created or integration-pending")
+
+    after = _source_publication_snapshot(
+        modules, target, task, require_remote_branch=False
+    )
+    if after["status"] != "integration-pending":
+        raise BridgeError("post-merge recovery did not reach integration-pending")
+    expected_state = _post_merge_state(before, b"integration-pending")
+    if after["state"] != expected_state or any(
+        after[name] != before[name]
+        for name in (
+            "record", "head", "branch", "repository", "base", "base_revision",
+            "verification", "work_units", "contract", "issue", "tree", "title", "body",
+        )
+    ):
+        raise BridgeError("post-merge recovery changed protected evidence or product content")
+    _, final_merge = _merged_publication_pr(modules, target, after, requested_pr)
+    if final_merge != merge_oid:
+        raise BridgeError("merged pull request identity changed before receipt consumption")
+    modules["task_lifecycle"].require_synchronized_default_branch_revision(
+        main, synchronized["branch"], synchronized["revision"]
+    )
+    if before["status"] == "draft-pr-created" or existing_receipt is not None:
+        try:
+            modules["task_lifecycle"].complete_post_merge_publication_recovery(
+                before["record"], task, after["state"], evidence, receipt
+            )
+        except Exception as exc:
+            raise BridgeError(str(exc)) from exc
+    return {
+        "status": "INTEGRATION_PENDING",
+        "task": task,
+        "branch": before["branch"],
+        "head": before["head"],
+        "repository": before["repository"],
+        "pullRequest": first_pr,
+        "mergeCommit": merge_oid,
+        "defaultBranchRevision": synchronized["revision"],
+    }
 
 
 def _publication_ready_recover(modules: dict, target: Path, task: str) -> dict:
@@ -1748,6 +2025,7 @@ def main() -> int:
             args.expected_implementation_revision
             if args.command in {
                 "maintenance-finalize",
+                "post-merge-publication-recover",
                 "publication-ready-recover",
                 "publication-recover",
                 "maintenance-contract-refresh-inspect",
@@ -1758,9 +2036,9 @@ def main() -> int:
         _verify_bootstrap(ROOT, revision)
         _clean_root(ROOT, revision)
         target = args.target.resolve()
-        if args.command in {"maintenance-finalize", "publication-ready-recover", "publication-recover", "bootstrap-upgrade", "maintenance-contract-refresh-inspect", "maintenance-contract-refresh"} and target == ROOT:
+        if args.command in {"maintenance-finalize", "post-merge-publication-recover", "publication-ready-recover", "publication-recover", "bootstrap-upgrade", "maintenance-contract-refresh-inspect", "maintenance-contract-refresh"} and target == ROOT:
             raise BridgeError(f"{args.command} target must not be the source root")
-        if args.command in {"maintenance-finalize", "publication-ready-recover", "publication-recover", "bootstrap-upgrade", "maintenance-contract-refresh-inspect", "maintenance-contract-refresh"}:
+        if args.command in {"maintenance-finalize", "post-merge-publication-recover", "publication-ready-recover", "publication-recover", "bootstrap-upgrade", "maintenance-contract-refresh-inspect", "maintenance-contract-refresh"}:
             _validate_target_git_configuration(target)
         with maintenance_environment():
             if args.command in {"recover-task-contract-from-issue", "resume-contract-check"}:
@@ -1808,6 +2086,13 @@ def main() -> int:
                 with _verified_modules(ROOT, revision) as modules:
                     _clean_root(ROOT, revision)
                     value = _publication_ready_recover(modules, target, args.task)
+                    result = {**value, "implementationRevision": revision}
+            elif args.command == "post-merge-publication-recover":
+                with _verified_modules(ROOT, revision) as modules:
+                    _clean_root(ROOT, revision)
+                    value = _post_merge_publication_recover(
+                        modules, target, args.task, int(args.pr), revision
+                    )
                     result = {**value, "implementationRevision": revision}
             elif args.command == "publication-recover":
                 with _verified_modules(ROOT, revision) as modules:
