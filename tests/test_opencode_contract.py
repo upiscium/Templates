@@ -4,8 +4,9 @@ import json
 import os
 import shutil
 import subprocess
-import tempfile
 import re
+import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from typing import Any, Iterable
@@ -32,6 +33,23 @@ TASK_ORCHESTRATOR_LEAVES = (
     "investigator",
     "security-reviewer",
     "scout",
+)
+AGENT_CORE_PERMISSION_LEAVES = (
+    "architect",
+    "general",
+    "explore",
+    "verifier",
+    "reviewer",
+    "investigator",
+    "security-reviewer",
+    "scout",
+)
+MANDATORY_PERMISSION_CLASSES = (
+    "local-filesystem-delete",
+    "repository-history-destruction",
+    "remote-destructive-operation",
+    "privilege-escalation",
+    "system-store-destruction",
 )
 LEAF_STATUS_SET = {"COMPLETED", "BLOCKED", "NEEDS_APPROVAL", "NEEDS_DECISION"}
 LEAF_STATUS_FIELDS = tuple(f"status: {status}" for status in (
@@ -314,6 +332,148 @@ class OpenCodeContractTest(unittest.TestCase):
         self.assertEqual(permission_for("task-orchestrator")["bash"]["just agent::pr-prepare *"], "allow")
         self.assertEqual(permission_for("build")["bash"]["just agent::pr-prepare *"], "deny")
         self.assertEqual(permission_for("general")["bash"]["just agent::pr-prepare *"], "deny")
+
+    def test_local_delete_ask_boundary_is_parent_only(self) -> None:
+        global_bash = self.config["permission"]["bash"]
+        orchestrator_bash = permission_for("task-orchestrator")["bash"]
+        self.assertEqual(global_bash["rm -rf *"], "deny")
+        self.assertEqual(orchestrator_bash["rm -rf *"], "ask")
+
+        for leaf in AGENT_CORE_PERMISSION_LEAVES:
+            with self.subTest(leaf=leaf):
+                leaf_bash = permission_for(leaf)["bash"]
+                self.assertEqual(leaf_bash["*"], "deny")
+                self.assertNotIn("rm -rf *", leaf_bash)
+                self.assertNotIn("rm -r *", leaf_bash)
+                self.assertNotIn("rmdir *", leaf_bash)
+
+        for command in (
+            "git reset *",
+            "git clean *",
+            "git push *",
+            "sudo *",
+            "nix store delete *",
+            "gh pr merge *",
+        ):
+            self.assertEqual(global_bash[command], "deny", command)
+            self.assertNotIn(command, orchestrator_bash)
+
+    def test_agent_core_permission_manifest_is_closed_and_semantic(self) -> None:
+        manifest = tomllib.loads(
+            (CORE / "opencode-contract-permissions.toml").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            set(manifest), {"schema_version", "contract", "profile", "surfaces", "probes"}
+        )
+        self.assertEqual(manifest["schema_version"], 1)
+        self.assertEqual(manifest["contract"], "permission-semantics")
+        self.assertEqual(manifest["profile"], "agent-core")
+
+        expected_surfaces = {
+            "task-orchestrator": (
+                "parent",
+                ".opencode/agents/task-orchestrator.md",
+            ),
+            **{
+                role: ("leaf", f".opencode/agents/{role}.md")
+                for role in AGENT_CORE_PERMISSION_LEAVES
+            },
+        }
+        actual_surfaces = {surface["id"]: surface for surface in manifest["surfaces"]}
+        self.assertEqual(set(actual_surfaces), set(expected_surfaces))
+        self.assertNotIn("build", actual_surfaces)
+        self.assertNotIn("plan", actual_surfaces)
+        for surface_id, (boundary, agent_source) in expected_surfaces.items():
+            with self.subTest(surface=surface_id):
+                surface = actual_surfaces[surface_id]
+                self.assertEqual(
+                    set(surface),
+                    {"id", "boundary", "base_source", "agent_source", "signals"},
+                )
+                self.assertEqual(surface["boundary"], boundary)
+                self.assertEqual(surface["base_source"], "opencode.json")
+                self.assertEqual(surface["agent_source"], agent_source)
+                if boundary == "parent":
+                    self.assertEqual(surface["signals"], [])
+                else:
+                    self.assertEqual(
+                        set(surface["signals"]), {"NEEDS_APPROVAL", "NEEDS_DECISION"}
+                    )
+
+        probes_by_surface: dict[str, list[dict[str, object]]] = {
+            surface_id: [] for surface_id in actual_surfaces
+        }
+        for probe in manifest["probes"]:
+            probes_by_surface[probe["surface"]].append(probe)
+        for surface_id, probes in probes_by_surface.items():
+            with self.subTest(surface=surface_id):
+                covered = {class_id for probe in probes for class_id in probe["classes"]}
+                self.assertTrue(set(MANDATORY_PERMISSION_CLASSES) <= covered)
+                self.assertNotIn(
+                    "safe-read-only",
+                    covered,
+                    "safe-read-only is conditional and must not force leaf allowlists",
+                )
+                inputs = {probe["input"] for probe in probes}
+                self.assertIn("rm -rf .build/default", inputs)
+                self.assertIn("git reset --hard HEAD", inputs)
+                self.assertIn("git push --force origin main", inputs)
+                self.assertIn("sudo rm -rf /tmp/agent-core", inputs)
+                self.assertIn("nix store delete /nix/store/example", inputs)
+                if surface_id == "task-orchestrator":
+                    self.assertIn("rm -r .build/default", inputs)
+                    self.assertIn("rmdir .build/default", inputs)
+                    self.assertIn("git clean -fd", inputs)
+                    self.assertIn("git push origin --delete feature", inputs)
+                    self.assertIn("gh pr merge 123 --delete-branch", inputs)
+
+    def test_fresh_cache_delete_escalation_contract_is_bounded(self) -> None:
+        manifest = tomllib.loads(
+            (CORE / "opencode-contract-permissions.toml").read_text(encoding="utf-8")
+        )
+        cache_probes = {
+            probe["input"]
+            for probe in manifest["probes"]
+            if probe["input"] in {
+                "rm -rf .build/default",
+                "rm -r .build/default",
+                "rmdir .build/default",
+            }
+        }
+        self.assertEqual(
+            cache_probes,
+            {"rm -rf .build/default", "rm -r .build/default", "rmdir .build/default"},
+        )
+
+        orchestrator = body_text("task-orchestrator").lower()
+        for phrase in (
+            "independently re-evaluate",
+            "only when the operation is already ask/allow",
+            "configured authority",
+            "user-rejected",
+            "final for that exact operation",
+            "never retry, rephrase, re-delegate, or substitute",
+            "safe alternative",
+        ):
+            self.assertIn(phrase, orchestrator, phrase)
+
+        for leaf in AGENT_CORE_PERMISSION_LEAVES:
+            with self.subTest(leaf=leaf):
+                leaf_body = body_text(leaf).lower()
+                self.assertIn("needs_approval", leaf_body)
+                for field in (
+                    "denied_operation",
+                    "why_needed",
+                    "supporting_evidence",
+                    "expected_effect",
+                    "consequence_if_denied",
+                    "work_unit_state",
+                    "safe_continuation_point",
+                    "safe_alternatives",
+                ):
+                    self.assertIn(field, leaf_body)
+                self.assertEqual(permission_for(leaf)["bash"]["*"], "deny")
+                self.assertNotIn("ask", set(_iter_permission_values(permission_for(leaf))))
 
     def test_guarded_finalize_permission_boundaries(self) -> None:
         bash = self.config["permission"]["bash"]
@@ -844,6 +1004,19 @@ global permissive plan
             for field in LEAF_STATUS_FIELDS:
                 self.assertIn(field, generated_orchestrator, f"{template}: task-orchestrator: {field}")
             self.assertEqual(set(exact_status_fields(generated_orchestrator)), set(LEAF_STATUS_FIELDS), f"{template}: task-orchestrator status format")
+
+    def test_generated_templates_distribute_permission_manifest(self) -> None:
+        source = (CORE / "opencode-contract-permissions.toml").read_bytes()
+        for template in LEAF_CONTRACT_TEMPLATES:
+            with self.subTest(template=template):
+                generated = (
+                    ROOT
+                    / "templates"
+                    / template
+                    / "opencode-contract-permissions.toml"
+                )
+                self.assertEqual(generated.read_bytes(), source)
+
     def test_leaf_prompts_expose_completion_status_contract(self) -> None:
         for leaf in LEAF_PRIMARY_AGENTS:
             assert_prompt_contract_for_leaf_statuses(self, body_text(leaf), leaf)

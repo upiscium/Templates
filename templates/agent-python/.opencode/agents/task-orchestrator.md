@@ -20,6 +20,7 @@ permission:
     "just agent::doctor": allow
     "just agent::context": allow
     "just project::doctor": allow
+    "rm -rf *": ask
     "just agent::task-start-from-issue *": deny
     "just agent::task-start *": deny
     "just agent::contract-check *": deny
