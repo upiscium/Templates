@@ -124,6 +124,35 @@ class GitPrivateStateTest(unittest.TestCase):
             "issue_sha256": None,
         }
 
+    def post_merge_publication_recovery_record(self, root: Path, task: str = "1") -> dict:
+        worktree = Path(self.valid_worktree(root, f"{task}-test"))
+        head = command("git", "rev-parse", "HEAD", cwd=worktree)
+        return {
+            "schema_version": 1,
+            "kind": "post-merge-publication-recovery",
+            "repository": "acme/widgets",
+            "task_id": task,
+            "worktree": str(worktree),
+            "branch": f"task/{task}-test",
+            "head": head,
+            "tree": head,
+            "base_branch": "main",
+            "base_revision": head,
+            "pr_number": 367,
+            "merge_commit": head,
+            "default_revision": head,
+            "draft_pr_created_state_sha256": "a" * 64,
+            "integration_pending_state_sha256": "b" * 64,
+            "work_units_sha256": "c" * 64,
+            "verification_sha256": "d" * 64,
+            "contract_sha256": "e" * 64,
+            "issue_sha256": None,
+            "title_sha256": "f" * 64,
+            "body_sha256": "1" * 64,
+            "implementation_source": "/tmp/source",
+            "implementation_revision": head,
+        }
+
     def proof_record(self, root: Path, task: str = "1") -> dict:
         authority = self.authority_record(root, task)
         return {
@@ -170,6 +199,23 @@ class GitPrivateStateTest(unittest.TestCase):
             receipt = private_state.publication_recovery_receipt(linked)
             private_state.prepare(linked, admin=True)
             content = json.dumps(self.publication_recovery_record(repo)).encode()
+            private_state.exclusive_write_bytes(receipt, content)
+            private_state.prepare(linked, admin=True)
+            self.assertEqual(content, private_state.read_bytes(receipt))
+
+    def test_post_merge_publication_receipt_is_worktree_private_and_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.repository(root)
+            linked = Path(self.valid_worktree(repo, "1-test"))
+            receipt = private_state.post_merge_publication_recovery_receipt(linked)
+            self.assertEqual(
+                private_state.admin_git_dir(linked)
+                / "agent-core/automation-maintenance/post-merge-publication-recovery.json",
+                receipt,
+            )
+            private_state.prepare(linked, admin=True)
+            content = json.dumps(self.post_merge_publication_recovery_record(repo)).encode()
             private_state.exclusive_write_bytes(receipt, content)
             private_state.prepare(linked, admin=True)
             self.assertEqual(content, private_state.read_bytes(receipt))

@@ -81,6 +81,7 @@ class TaskLifecycleTest(unittest.TestCase):
                  mock.patch.object(lifecycle, "assert_task_identity"), \
                  mock.patch.object(lifecycle.private_state, "prepare"), \
                  mock.patch.object(lifecycle.private_state, "publication_recovery_receipt", return_value=root / "receipt"), \
+                 mock.patch.object(lifecycle.private_state, "post_merge_publication_recovery_receipt", return_value=root / "post-receipt"), \
                  mock.patch.object(lifecycle.private_state, "_validate_legacy_content"), \
                  mock.patch.object(lifecycle.private_state, "_validate_publication_recovery_topology"), \
                  mock.patch.object(lifecycle.private_state, "topology"), \
@@ -114,6 +115,7 @@ class TaskLifecycleTest(unittest.TestCase):
                  mock.patch.object(lifecycle, "assert_task_identity"), \
                  mock.patch.object(lifecycle.private_state, "prepare"), \
                  mock.patch.object(lifecycle.private_state, "publication_recovery_receipt", return_value=root / "receipt"), \
+                 mock.patch.object(lifecycle.private_state, "post_merge_publication_recovery_receipt", return_value=root / "post-receipt"), \
                  mock.patch.object(lifecycle.private_state, "_validate_legacy_content"), \
                  mock.patch.object(lifecycle.private_state, "_validate_publication_recovery_topology"), \
                  mock.patch.object(lifecycle.private_state, "topology"), \
@@ -158,6 +160,7 @@ class TaskLifecycleTest(unittest.TestCase):
                      mock.patch.object(lifecycle, "assert_task_identity"), \
                      mock.patch.object(lifecycle.private_state, "prepare"), \
                      mock.patch.object(lifecycle.private_state, "publication_recovery_receipt", return_value=root / "receipt"), \
+                     mock.patch.object(lifecycle.private_state, "post_merge_publication_recovery_receipt", return_value=root / "post-receipt"), \
                      mock.patch.object(lifecycle.private_state, "_validate_legacy_content"), \
                      mock.patch.object(lifecycle.private_state, "_validate_publication_recovery_topology"), \
                      mock.patch.object(lifecycle.private_state, "topology"), \
@@ -207,6 +210,54 @@ class TaskLifecycleTest(unittest.TestCase):
             self.assertEqual(result, "consumed")
             self.assertFalse(receipt.exists())
             unlink.assert_called_once()
+
+    def test_guarded_post_merge_recovery_is_exact_state_and_evidence_cas(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".task-state/task.md"
+            state.parent.mkdir()
+            original = b"## Current state\n\n- Status: draft-pr-created\n"
+            state.write_bytes(original)
+            evidence = {
+                "work-units.json": b"units",
+                "verification.json": b"verification",
+                "contract.json": b"contract",
+                "issue.json": None,
+            }
+            for name, content in evidence.items():
+                if content is not None:
+                    (state.parent / name).write_bytes(content)
+            record = lifecycle.WorktreeRecord(root, "task/225-recovery", "a" * 40)
+            with mock.patch.object(lifecycle, "current_worktree", return_value=record), \
+                 mock.patch.object(lifecycle, "worktree_for_task", return_value=record), \
+                 mock.patch.object(lifecycle, "require_resolved_contract"), \
+                 mock.patch.object(lifecycle, "assert_task_identity"), \
+                 mock.patch.object(lifecycle.private_state, "prepare"), \
+                 mock.patch.object(lifecycle.private_state, "post_merge_publication_recovery_receipt", return_value=root / "receipt"), \
+                 mock.patch.object(lifecycle.private_state, "publication_recovery_receipt", return_value=root / "blocked-receipt"), \
+                 mock.patch.object(lifecycle.private_state, "_validate_legacy_content"), \
+                 mock.patch.object(lifecycle.private_state, "_validate_publication_recovery_topology"), \
+                 mock.patch.object(lifecycle.private_state, "topology"), \
+                 mock.patch.object(lifecycle.private_state, "mutation_lock", return_value=nullcontext()), \
+                 mock.patch.object(lifecycle.private_state, "exclusive_write_bytes", side_effect=lambda path, content, **_: path.write_bytes(content)):
+                result = lifecycle.recover_post_merge_publication_pending(
+                    record, "225", original, evidence, b"{}"
+                )
+            self.assertEqual(result, "transitioned")
+            self.assertEqual(
+                state.read_bytes(),
+                original.replace(b"draft-pr-created", b"integration-pending"),
+            )
+
+    def test_direct_finalize_still_rejects_draft_pr_created(self) -> None:
+        record = lifecycle.WorktreeRecord(Path("/task"), "task/225-recovery", "a" * 40)
+        with mock.patch.object(lifecycle, "require_resolved_contract"), \
+             mock.patch.object(lifecycle, "work_units_lock", return_value=nullcontext()), \
+             mock.patch.object(lifecycle, "assert_task_identity"), \
+             mock.patch.object(lifecycle, "state_path", return_value=Path("/state")), \
+             mock.patch.object(lifecycle, "state_status", return_value="draft-pr-created"), \
+             self.assertRaisesRegex(lifecycle.LifecycleError, "requires Task status integration-pending"):
+            lifecycle.mark_task_merged_from_integration(record, "225")
 
     def test_batch_conflict_detects_dependency_and_shared_resources(self) -> None:
         summaries = [
