@@ -124,6 +124,40 @@ class GitPrivateStateTest(unittest.TestCase):
             "issue_sha256": None,
         }
 
+    def dispatch_record(
+        self,
+        root: Path,
+        task: str = "1",
+        *,
+        kind: str = "task",
+        state: str = "starting",
+    ) -> dict:
+        worktree = Path(self.valid_worktree(root, f"{task}-test"))
+        common = private_state.common_git_dir(root)
+        return {
+            "schema_version": 1,
+            "kind": kind,
+            "task_id": task,
+            "repository": "acme/widgets",
+            "branch": f"task/{task}-test" if kind == "task" else "main",
+            "worktree": str(worktree),
+            "common_git_dir": str(common),
+            "orchestrator": (
+                "task-orchestrator" if kind == "task" else "maintenance-orchestrator"
+            ),
+            "pid": None,
+            "boot_id": None,
+            "start_ticks": None,
+            "port": None,
+            "session_id": None,
+            "credential": "credential-material",
+            "implementation_version": "3.2.0",
+            "implementation_revision": "a" * 40,
+            "state": state,
+            "pending_permission": None,
+            "failure": "startup failed" if state == "failed" else None,
+        }
+
     def proof_record(self, root: Path, task: str = "1") -> dict:
         authority = self.authority_record(root, task)
         return {
@@ -153,6 +187,139 @@ class GitPrivateStateTest(unittest.TestCase):
                 common / "agent-core" / "integration" / "pr-12.head",
             )
             self.assertFalse((common / "agent-core").exists())
+
+    def test_dispatch_record_is_in_the_common_canonical_namespace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(Path(directory))
+            common = private_state.common_git_dir(repo)
+            self.assertEqual(
+                common / "agent-core/dispatch/12.json",
+                private_state.dispatch_record(repo, "12"),
+            )
+            self.assertFalse((common / "agent-core").exists())
+            for task in ("", ".", "../1", "task/1"):
+                with self.subTest(task=task), self.assertRaises(
+                    private_state.GitPrivateStateError
+                ):
+                    private_state.dispatch_record(repo, task)
+
+    def test_valid_dispatch_record_preserves_credential_and_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(Path(directory))
+            private_state.prepare(repo)
+            path = private_state.dispatch_record(repo, "1")
+            value = self.dispatch_record(repo)
+            value["pid"] = 1234
+            value["boot_id"] = "01234567-89ab-cdef-0123-456789abcdef"
+            value["start_ticks"] = 9876
+            value["port"] = 43123
+            value["session_id"] = "session-1"
+            content = json.dumps(value, sort_keys=True).encode("utf-8")
+            private_state.write_bytes(path, content)
+            private_state.prepare(repo)
+            self.assertEqual(content, private_state.read_bytes(path))
+            self.assertEqual(0o700, stat.S_IMODE(path.parent.stat().st_mode))
+            self.assertEqual(0o600, stat.S_IMODE(path.stat().st_mode))
+            self.assertEqual("credential-material", json.loads(content)["credential"])
+
+    def test_dispatch_maintenance_records_and_staged_start_are_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(Path(directory))
+            private_state.prepare(repo)
+            value = self.dispatch_record(repo, "maintenance", kind="maintenance")
+            value.pop("pending_permission")
+            path = private_state.dispatch_record(repo, "maintenance")
+            private_state.write_bytes(path, json.dumps(value).encode("utf-8"))
+            private_state.prepare(repo)
+            value["state"] = "permission-pending"
+            value["session_id"] = "session-maintenance"
+            value["pending_permission"] = {
+                "id": "permission-1",
+                "session_id": "session-maintenance",
+                "permission": "bash",
+                "patterns": ["git push"],
+            }
+            private_state.write_bytes(path, json.dumps(value).encode("utf-8"))
+            private_state.prepare(repo)
+
+    def test_dispatch_schema_rejects_unknown_keys_and_filename_identity(self) -> None:
+        cases = ("extra", "filename", "duplicate")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                repo = self.repository(Path(directory))
+                private_state.prepare(repo)
+                value = self.dispatch_record(repo)
+                path = private_state.dispatch_record(repo, "1")
+                if case == "extra":
+                    value["unexpected"] = "foreign"
+                    content = json.dumps(value).encode("utf-8")
+                elif case == "filename":
+                    path = private_state.common_state(repo) / "dispatch/2.json"
+                    content = json.dumps(value).encode("utf-8")
+                else:
+                    content = (
+                        b'{"schema_version":1,"schema_version":1}'
+                    )
+                private_state.write_bytes(path, content)
+                with self.assertRaises(private_state.GitPrivateStateError):
+                    private_state.prepare(repo)
+
+    def test_dispatch_schema_rejects_unsafe_values_and_state_mismatches(self) -> None:
+        cases = (
+            ("common_git_dir", "relative/git"),
+            ("common_git_dir", "/tmp/another-git-common-dir"),
+            ("worktree", "relative/worktree"),
+            ("repository", "not-a-repository"),
+            ("port", 65536),
+            ("pid", True),
+            ("implementation_revision", "not-a-revision"),
+            ("pending_permission", {"operation": "git push"}),
+            ("failure", "failure without failed state"),
+        )
+        for field, replacement in cases:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                repo = self.repository(Path(directory))
+                private_state.prepare(repo)
+                value = self.dispatch_record(repo)
+                value[field] = replacement
+                path = private_state.dispatch_record(repo, "1")
+                private_state.write_bytes(path, json.dumps(value).encode("utf-8"))
+                with self.assertRaises(private_state.GitPrivateStateError):
+                    private_state.prepare(repo)
+
+    def test_unknown_dispatch_file_and_unsafe_modes_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(Path(directory))
+            private_state.prepare(repo)
+            dispatch = private_state.common_state(repo) / "dispatch"
+            unknown = dispatch / "1.json.bak"
+            unknown.write_bytes(b"foreign")
+            unknown.chmod(0o600)
+            with self.assertRaises(private_state.GitPrivateStateError):
+                private_state.prepare(repo)
+
+        for kind in ("directory", "record"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                repo = self.repository(Path(directory))
+                private_state.prepare(repo)
+                path = private_state.dispatch_record(repo, "1")
+                private_state.write_bytes(path, json.dumps(self.dispatch_record(repo)).encode())
+                (path.parent if kind == "directory" else path).chmod(
+                    0o755 if kind == "directory" else 0o644
+                )
+                with self.assertRaises(private_state.GitPrivateStateError):
+                    private_state.prepare(repo)
+
+    def test_dispatch_lock_is_public_and_fences_caller_transaction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(Path(directory))
+            path = private_state.dispatch_record(repo, "1")
+            with private_state.dispatch_lock(repo):
+                lock = private_state.common_state(repo) / "dispatch.lock"
+                self.assertEqual(0o600, stat.S_IMODE(lock.stat().st_mode))
+                self.assertEqual(0o700, stat.S_IMODE(path.parent.stat().st_mode))
+                private_state.write_bytes(path, json.dumps(self.dispatch_record(repo)).encode())
+            private_state.prepare(repo)
 
     def test_publication_recovery_path_is_worktree_admin_private(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

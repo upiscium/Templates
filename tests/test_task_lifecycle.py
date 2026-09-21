@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -18,6 +19,42 @@ spec.loader.exec_module(lifecycle)
 
 
 class TaskLifecycleTest(unittest.TestCase):
+    def test_cleanup_requires_any_dispatch_to_be_durably_stopped(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "163.json"
+            path.write_text("{}", encoding="utf-8")
+            base = {"task_id": "163", "pid": 10, "boot_id": "boot", "start_ticks": 20}
+            with (
+                mock.patch.object(lifecycle.private_state, "dispatch_record", return_value=path),
+                mock.patch.object(lifecycle.private_state, "validate_record"),
+                mock.patch.object(
+                    lifecycle.private_state,
+                    "read_bytes",
+                    return_value=json.dumps({**base, "state": "running"}).encode(),
+                ),
+                self.assertRaisesRegex(lifecycle.LifecycleError, "must be stopped"),
+            ):
+                lifecycle.require_dispatch_stopped_for_cleanup(root, "163")
+
+            stopped = {
+                "task_id": "163",
+                "state": "stopped",
+                "pid": None,
+                "boot_id": None,
+                "start_ticks": None,
+            }
+            with (
+                mock.patch.object(lifecycle.private_state, "dispatch_record", return_value=path),
+                mock.patch.object(lifecycle.private_state, "validate_record"),
+                mock.patch.object(
+                    lifecycle.private_state,
+                    "read_bytes",
+                    return_value=json.dumps(stopped).encode(),
+                ),
+            ):
+                lifecycle.require_dispatch_stopped_for_cleanup(root, "163")
+
     def test_generic_state_set_cannot_cross_publication_boundaries(self) -> None:
         record = lifecycle.WorktreeRecord(Path("/task"), "task/101-metadata", "a" * 40)
         for status in ("draft-pr-created", "integration-pending"):

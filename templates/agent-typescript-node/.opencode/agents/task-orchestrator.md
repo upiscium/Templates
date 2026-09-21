@@ -24,6 +24,10 @@ permission:
     "just agent::task-start *": deny
     "just agent::contract-check *": deny
     "just agent::contract-resume-check *": deny
+    "just agent::dispatch-start *": deny
+    "just agent::dispatch-status *": deny
+    "just agent::dispatch-respond *": deny
+    "just agent::dispatch-stop *": deny
     "just agent::batch-plan *": deny
     "just agent::state-set *": allow
     "just agent::work-unit-next *": allow

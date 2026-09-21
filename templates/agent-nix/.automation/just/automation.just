@@ -1,6 +1,7 @@
 root := justfile_directory()
 script := root / ".automation" / "bin" / "automation_upgrade.py"
 maintenance := root / ".automation" / "bin" / "maintenance_lifecycle.py"
+dispatch := root / ".automation" / "bin" / "worktree_dispatch.py"
 
 [working-directory: root]
 version:
@@ -29,6 +30,22 @@ commit task message="":
 [working-directory: root]
 maintenance-check task:
     env PYTHONDONTWRITEBYTECODE=1 python3 -B {{quote(maintenance)}} check {{quote(task)}}
+
+[working-directory: root]
+dispatch-start task:
+    env PYTHONDONTWRITEBYTECODE=1 python3 -B {{quote(dispatch)}} start maintenance {{quote(task)}}
+
+[working-directory: root]
+dispatch-status task:
+    env PYTHONDONTWRITEBYTECODE=1 python3 -B {{quote(dispatch)}} status maintenance {{quote(task)}}
+
+[working-directory: root]
+dispatch-respond task permission_id response:
+    env PYTHONDONTWRITEBYTECODE=1 python3 -B {{quote(dispatch)}} respond maintenance {{quote(task)}} {{quote(permission_id)}} {{quote(response)}}
+
+[working-directory: root]
+dispatch-stop task:
+    env PYTHONDONTWRITEBYTECODE=1 python3 -B {{quote(dispatch)}} stop maintenance {{quote(task)}}
 
 [working-directory: root]
 maintenance-contract-refresh-inspect task expected_old_digest expected_new_digest:

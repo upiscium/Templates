@@ -3,6 +3,7 @@ script := root / ".automation/bin/agent_core.py"
 lifecycle := root / ".automation/bin/task_lifecycle.py"
 discard_pristine := root / ".automation/bin/discard_pristine.py"
 init := root / ".automation/bin/init_context.py"
+dispatch := root / ".automation/bin/worktree_dispatch.py"
 
 [working-directory: root]
 preflight:
@@ -31,6 +32,22 @@ contract-check task='':
 [working-directory: root]
 contract-resume-check task='':
     env PYTHONDONTWRITEBYTECODE=1 python3 -B {{quote(lifecycle)}} contract-resume-check {{if task != '' { quote(task) } else { '' }}}
+
+[working-directory: root]
+dispatch-start task:
+    env PYTHONDONTWRITEBYTECODE=1 python3 -B {{quote(dispatch)}} start task {{quote(task)}}
+
+[working-directory: root]
+dispatch-status task:
+    env PYTHONDONTWRITEBYTECODE=1 python3 -B {{quote(dispatch)}} status task {{quote(task)}}
+
+[working-directory: root]
+dispatch-respond task permission_id response:
+    env PYTHONDONTWRITEBYTECODE=1 python3 -B {{quote(dispatch)}} respond task {{quote(task)}} {{quote(permission_id)}} {{quote(response)}}
+
+[working-directory: root]
+dispatch-stop task:
+    env PYTHONDONTWRITEBYTECODE=1 python3 -B {{quote(dispatch)}} stop task {{quote(task)}}
 
 [working-directory: root]
 status task:

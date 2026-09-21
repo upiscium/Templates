@@ -379,6 +379,36 @@ class OpenCodeContractTest(unittest.TestCase):
         ):
             self.assertIn(phrase, main, phrase)
 
+    def test_worktree_dispatch_is_main_only_and_bounded(self) -> None:
+        global_bash = self.config["permission"]["bash"]
+        build_bash = permission_for("build")["bash"]
+        task_bash = permission_for("task-orchestrator")["bash"]
+        maintenance_bash = permission_for("maintenance-orchestrator")["bash"]
+        for namespace in ("agent", "automation"):
+            for operation in ("start", "status", "respond", "stop"):
+                command = f"just {namespace}::dispatch-{operation} *"
+                self.assertEqual("deny", global_bash[command], command)
+                self.assertEqual("allow", build_bash[command], command)
+        for operation in ("start", "status", "respond", "stop"):
+            self.assertEqual(
+                "deny", task_bash[f"just agent::dispatch-{operation} *"]
+            )
+            self.assertEqual(
+                "deny",
+                maintenance_bash[f"just automation::dispatch-{operation} *"],
+            )
+
+        main = body_text("build").lower()
+        for phrase in (
+            "just agent::dispatch-start <task>",
+            "just automation::dispatch-start <task>",
+            "exact pending permission id and pattern",
+            "once`, `session`, or `deny",
+            "never use `--auto`",
+            "arbitrary host, port, password, session id, agent, or target path",
+        ):
+            self.assertIn(phrase, main, phrase)
+
     def test_task_state_and_lifecycle_mutation_are_not_main_or_orchestrator_authority(self) -> None:
         edit = self.config["permission"]["edit"]
         self.assertEqual(edit[".task-state/**"], "deny")
