@@ -1018,6 +1018,33 @@ def _remote_branch_head(target: Path, repository: str, branch: str) -> str:
     return head
 
 
+def _post_merge_remote_branch_head(
+    target: Path, repository: str, branch: str
+) -> str | None:
+    """Return the live remote head, allowing only a verified post-merge 404."""
+    command = [
+        "gh",
+        "api",
+        "--hostname",
+        "github.com",
+        f"repos/{repository}/git/ref/heads/{quote(branch, safe='')}",
+        "--jq",
+        ".object.sha",
+    ]
+    result = _pinned_run(command, cwd=target, check=False)
+    if result.returncode:
+        if re.search(r"\(HTTP 404\)\s*$", result.stderr.strip()):
+            return None
+        raise BridgeError(
+            f"{' '.join(command)}: "
+            f"{result.stderr.strip() or result.stdout.strip() or result.returncode}"
+        )
+    head = result.stdout.strip()
+    if not _REVISION_RE.fullmatch(head):
+        raise BridgeError("remote Task branch HEAD is not a full immutable revision")
+    return head
+
+
 def _publication_snapshot(modules: dict, target: Path, task: str) -> dict:
     lifecycle = modules["task_lifecycle"]
     agent_core = modules["agent_core"]
@@ -1604,7 +1631,12 @@ def _source_publication_snapshot(
         local = _target_git("rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}", target=target)
         if head != local or record.head != head:
             raise BridgeError("Task HEAD, local branch, and registered worktree HEAD differ")
-        if require_remote_branch and _remote_branch_head(target, repository, branch) != head:
+        remote = (
+            _remote_branch_head(target, repository, branch)
+            if require_remote_branch
+            else _post_merge_remote_branch_head(target, repository, branch)
+        )
+        if remote is not None and remote != head:
             raise BridgeError("Task HEAD, local branch, and remote branch differ")
         if _target_git("status", "--porcelain=v1", "--untracked-files=all", target=target):
             raise BridgeError("target worktree must be clean")

@@ -153,11 +153,9 @@ class PostMergePublicationRecoveryBridgeTest(unittest.TestCase):
             ),
             mock.patch.object(
                 bridge,
-                "_remote_branch_head",
-                side_effect=bridge.BridgeError(
-                    "remote Task branch is missing (GitHub 404)"
-                ),
-            ) as remote_branch,
+                "_post_merge_remote_branch_head",
+                return_value=None,
+            ) as deleted_remote_branch,
             mock.patch.object(bridge, "_validate_target_git_configuration"),
             mock.patch.object(
                 bridge, "_read_publication_recovery_receipt", return_value=None
@@ -174,7 +172,10 @@ class PostMergePublicationRecoveryBridgeTest(unittest.TestCase):
             )
         self.assertEqual(result["status"], "INTEGRATION_PENDING")
         self.assertEqual(result["mergeCommit"], self.merge)
-        remote_branch.assert_not_called()
+        self.assertEqual(
+            deleted_remote_branch.call_args_list,
+            [mock.call(self.target, self.repository, self.branch)] * 3,
+        )
         self.lifecycle.recover_post_merge_publication_pending.assert_called_once()
         self.lifecycle.complete_post_merge_publication_recovery.assert_called_once()
         self.core.gh.assert_not_called()
@@ -202,6 +203,40 @@ class PostMergePublicationRecoveryBridgeTest(unittest.TestCase):
         remote_branch.assert_called_once_with(
             self.target, self.repository, self.branch
         )
+
+    def test_post_merge_remote_lookup_accepts_only_verified_404(self) -> None:
+        missing = mock.Mock(returncode=1, stdout="", stderr="gh: Not Found (HTTP 404)\n")
+        failure = mock.Mock(returncode=1, stdout="", stderr="gh: network failure\n")
+        with mock.patch.object(bridge, "_pinned_run", return_value=missing):
+            self.assertIsNone(
+                bridge._post_merge_remote_branch_head(
+                    self.target, self.repository, self.branch
+                )
+            )
+        with mock.patch.object(bridge, "_pinned_run", return_value=failure), \
+             self.assertRaisesRegex(bridge.BridgeError, "network failure"):
+            bridge._post_merge_remote_branch_head(
+                self.target, self.repository, self.branch
+            )
+
+    def test_post_merge_snapshot_rejects_live_remote_head_drift(self) -> None:
+        with (
+            mock.patch.object(bridge, "_target_git", side_effect=self.snapshot_git),
+            mock.patch.object(bridge, "_state_bytes", side_effect=self.snapshot_state),
+            mock.patch.object(
+                bridge, "_optional_state_bytes", return_value=self.before["issue"]
+            ),
+            mock.patch.object(
+                bridge, "_post_merge_remote_branch_head", return_value="9" * 40
+            ),
+            self.assertRaisesRegex(bridge.BridgeError, "remote branch differ"),
+        ):
+            bridge._source_publication_snapshot(
+                self.modules,
+                self.target,
+                self.task,
+                require_remote_branch=False,
+            )
 
     def test_open_draft_open_ready_and_closed_unmerged_all_reject(self) -> None:
         for state, draft in (("OPEN", True), ("OPEN", False), ("CLOSED", False)):
