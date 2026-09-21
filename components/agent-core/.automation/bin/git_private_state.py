@@ -17,19 +17,66 @@ import subprocess
 NAMESPACE = "agent-core"
 LEGACY_NAMESPACE = "opencode"
 TASK_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+DISPATCH_TASK_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 PR_RE = re.compile(r"[1-9][0-9]*")
 HASH_RE = re.compile(r"[0-9a-f]{64}")
 OID_RE = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
 REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 SHARED_DIRS = ("cleanup", "integration", "discard-pristine", "automation-maintenance")
+# Dispatch is canonical-only: unlike historical evidence, it can contain a
+# live credential and must never be claimed from the foreign legacy namespace.
+DISPATCH_DIR = "dispatch"
+COMMON_STATE_DIRS = (*SHARED_DIRS, DISPATCH_DIR)
 FIXED_AUTHORITY_FILES = {
     "authority.json",
     "source-recovery-proof.json",
     "publication-recovery.json",
 }
-LOCK_FILES = {"cleanup.lock", "migration.lock"}
+LOCK_FILES = {"cleanup.lock", "dispatch.lock", "migration.lock"}
 TEMP_RE = re.compile(r"\.(?:migrate|record)\.[0-9]+\.[0-9a-f]{16}")
 _GIT_EXECUTABLE = "git"
+
+DISPATCH_STATES = {
+    "starting",
+    "running",
+    "permission-pending",
+    "idle",
+    "stopped",
+    "failed",
+}
+DISPATCH_SCHEMA_VERSION = 1
+DISPATCH_FIELDS = {
+    "schema_version",
+    "kind",
+    "task_id",
+    "repository",
+    "branch",
+    "worktree",
+    "common_git_dir",
+    "orchestrator",
+    "pid",
+    "boot_id",
+    "start_ticks",
+    "port",
+    "session_id",
+    "credential",
+    "implementation_version",
+    "implementation_revision",
+    "state",
+    "pending_permission",
+    "failure",
+}
+DISPATCH_OPTIONAL_FIELDS = {"pending_permission"}
+PENDING_PERMISSION_FIELDS = {"id", "session_id", "permission", "patterns"}
+DISPATCH_ORCHESTRATORS = {
+    "task": "task-orchestrator",
+    "maintenance": "maintenance-orchestrator",
+}
+BOOT_ID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*")
 
 
 class GitPrivateStateError(RuntimeError):
@@ -96,6 +143,13 @@ def admin_git_dir(root: Path) -> Path:
 
 def common_state(root: Path) -> Path:
     return common_git_dir(root) / NAMESPACE
+
+
+def dispatch_record(root: Path, task: str) -> Path:
+    """Return the canonical common Git-private dispatch record for ``task``."""
+    if not isinstance(task, str) or DISPATCH_TASK_RE.fullmatch(task) is None:
+        raise GitPrivateStateError("invalid Task ID")
+    return common_state(root) / DISPATCH_DIR / f"{task}.json"
 
 
 def admin_maintenance(root: Path) -> Path:
@@ -401,11 +455,15 @@ def validate_record(path: Path, what: str = "private-state record") -> None:
     """Require the ownership and mode contract for a persisted state record."""
     if NAMESPACE in path.parts:
         _require_canonical_file(path, what)
+        if path.parent.name == DISPATCH_DIR:
+            _validate_dispatch_content(path, read_bytes(path, what))
     else:
         _require_legacy_record(path, what)
 
 
 def _valid_shared_file(directory: str, name: str, *, allow_fixed: bool) -> bool:
+    if directory == DISPATCH_DIR:
+        return name.endswith(".json") and DISPATCH_TASK_RE.fullmatch(name[:-5]) is not None
     if directory in {"cleanup", "discard-pristine"}:
         return name.endswith(".json") and TASK_RE.fullmatch(name[:-5]) is not None
     if directory == "integration":
@@ -426,7 +484,12 @@ def _recover_canonical_temps(layout: Topology, *, include_admin: bool = True) ->
     for namespace in directories:
         if _namespace_kind(namespace, foreign_regular=False) != "directory":
             continue
-        subdirs = [namespace / name for name in SHARED_DIRS]
+        subdirectory_names = (
+            COMMON_STATE_DIRS
+            if namespace == layout.common / NAMESPACE
+            else SHARED_DIRS
+        )
+        subdirs = [namespace / name for name in subdirectory_names]
         for directory in subdirs:
             if not directory.exists():
                 continue
@@ -474,6 +537,206 @@ def _valid_nonempty(value: object) -> bool:
 
 def _valid_absolute_path(value: object) -> bool:
     return _valid_nonempty(value) and Path(value).is_absolute()
+
+
+def _valid_dispatch_text(value: object, maximum: int, *, allow_empty: bool = False) -> bool:
+    if not isinstance(value, str) or len(value) > maximum:
+        return False
+    if not allow_empty and not value:
+        return False
+    return all(
+        ord(character) >= 0x20
+        and ord(character) != 0x7F
+        and not 0xD800 <= ord(character) <= 0xDFFF
+        for character in value
+    )
+
+
+def _valid_dispatch_path(value: object) -> bool:
+    if not _valid_dispatch_text(value, 4096):
+        return False
+    path = Path(value)
+    return path.is_absolute() and path != Path("/") and ".." not in path.parts
+
+
+def _valid_dispatch_branch(value: object, kind: object, task: object) -> bool:
+    if not _valid_dispatch_text(value, 255) or BRANCH_RE.fullmatch(value) is None:
+        return False
+    if value.startswith("/") or value.endswith("/") or "//" in value or ".." in value:
+        return False
+    if kind == "task":
+        return _valid_task_branch(value, task)
+    return True
+
+
+def _valid_common_dir_identity(value: object) -> bool:
+    return _valid_dispatch_path(value)
+
+
+def _valid_dispatch_pid(value: object) -> bool:
+    return (
+        value is None
+        or (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and 1 <= value <= 2**31 - 1
+        )
+    )
+
+
+def _valid_dispatch_start_ticks(value: object) -> bool:
+    return (
+        value is None
+        or (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and 0 <= value <= 2**63 - 1
+        )
+    )
+
+
+def _valid_dispatch_port(value: object) -> bool:
+    return (
+        value is None
+        or (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and 1 <= value <= 65535
+        )
+    )
+
+
+def _valid_dispatch_boot_id(value: object) -> bool:
+    return value is None or (
+        isinstance(value, str) and BOOT_ID_RE.fullmatch(value) is not None
+    )
+
+
+def _valid_dispatch_session(value: object) -> bool:
+    return value is None or _valid_dispatch_text(value, 256)
+
+
+def _valid_dispatch_credential(value: object) -> bool:
+    return value is None or _valid_dispatch_text(value, 512)
+
+
+def _valid_pending_permission(value: object) -> bool:
+    if value is None:
+        return True
+    return (
+        isinstance(value, dict)
+        and set(value) == PENDING_PERMISSION_FIELDS
+        and _valid_dispatch_text(value.get("id"), 256)
+        and _valid_dispatch_text(value.get("session_id"), 256)
+        and _valid_dispatch_text(value.get("permission"), 256)
+        and isinstance(value.get("patterns"), list)
+        and len(value["patterns"]) <= 128
+        and all(_valid_dispatch_text(pattern, 4096) for pattern in value["patterns"])
+    )
+
+
+def _valid_dispatch_failure(value: object) -> bool:
+    return value is None or _valid_dispatch_text(value, 4000)
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[object, object]]) -> dict:
+    value: dict = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON object key")
+        value[key] = item
+    return value
+
+
+def _reject_json_constant(value: str) -> object:
+    raise ValueError(f"invalid JSON constant: {value}")
+
+
+def _dispatch_json(content: bytes, path: Path) -> dict:
+    try:
+        value = json.loads(
+            content.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise GitPrivateStateError(f"invalid dispatch private-state record: {path}") from exc
+    if not isinstance(value, dict):
+        raise GitPrivateStateError(f"invalid dispatch private-state record: {path}")
+    return value
+
+
+def _validate_dispatch_content(
+    path: Path, content: bytes, *, layout: Topology | None = None
+) -> None:
+    value = _dispatch_json(content, path)
+    if path.parent.name != DISPATCH_DIR or not path.name.endswith(".json"):
+        raise GitPrivateStateError(f"invalid dispatch private-state filename: {path}")
+    task = path.name[:-5]
+    if DISPATCH_TASK_RE.fullmatch(task) is None:
+        raise GitPrivateStateError(f"invalid dispatch private-state filename: {path}")
+    expected = DISPATCH_FIELDS | DISPATCH_OPTIONAL_FIELDS
+    required = DISPATCH_FIELDS - DISPATCH_OPTIONAL_FIELDS
+    if not (set(value) <= expected and required <= set(value)):
+        raise GitPrivateStateError(f"invalid dispatch private-state schema: {path}")
+    if (
+        isinstance(value.get("schema_version"), bool)
+        or not isinstance(value.get("schema_version"), int)
+        or value.get("schema_version") != DISPATCH_SCHEMA_VERSION
+        or not isinstance(value.get("kind"), str)
+        or value.get("kind") not in {"task", "maintenance"}
+        or value.get("task_id") != task
+        or not _valid_task_id(value.get("task_id"))
+        or not _valid_repository(value.get("repository"))
+        or not _valid_dispatch_branch(value.get("branch"), value.get("kind"), task)
+        or not _valid_dispatch_path(value.get("worktree"))
+        or not _valid_common_dir_identity(value.get("common_git_dir"))
+        or value.get("orchestrator") != DISPATCH_ORCHESTRATORS[value.get("kind")]
+        or not _valid_dispatch_pid(value.get("pid"))
+        or not _valid_dispatch_boot_id(value.get("boot_id"))
+        or not _valid_dispatch_start_ticks(value.get("start_ticks"))
+        or not _valid_dispatch_port(value.get("port"))
+        or not _valid_dispatch_session(value.get("session_id"))
+        or not _valid_dispatch_credential(value.get("credential"))
+        or not _valid_dispatch_text(value.get("implementation_version"), 128)
+        or not _valid_oid(value.get("implementation_revision"))
+        or not isinstance(value.get("state"), str)
+        or value.get("state") not in DISPATCH_STATES
+        or not _valid_pending_permission(value.get("pending_permission"))
+        or not _valid_dispatch_failure(value.get("failure"))
+    ):
+        raise GitPrivateStateError(f"invalid dispatch private-state record: {path}")
+    if value.get("pid") is None:
+        if value.get("boot_id") is not None or value.get("start_ticks") is not None:
+            raise GitPrivateStateError(f"invalid dispatch process identity: {path}")
+    elif value.get("boot_id") is None or value.get("start_ticks") is None:
+        raise GitPrivateStateError(f"invalid dispatch process identity: {path}")
+    if value.get("state") == "permission-pending":
+        if "pending_permission" not in value or value.get("pending_permission") is None:
+            raise GitPrivateStateError(f"invalid dispatch pending permission: {path}")
+    elif value.get("pending_permission") is not None:
+        raise GitPrivateStateError(f"invalid dispatch pending permission: {path}")
+    pending = value.get("pending_permission")
+    session_id = value.get("session_id")
+    if pending is not None and pending["session_id"] != session_id:
+        raise GitPrivateStateError(f"invalid dispatch pending permission session: {path}")
+    if value.get("state") == "failed":
+        if value.get("failure") is None:
+            raise GitPrivateStateError(f"invalid dispatch failure: {path}")
+    elif value.get("failure") is not None:
+        raise GitPrivateStateError(f"invalid dispatch failure: {path}")
+    if layout is not None:
+        try:
+            common = layout.common.resolve(strict=True)
+            if not stat.S_ISDIR(common.lstat().st_mode):
+                raise OSError("Git common directory is not a directory")
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise GitPrivateStateError(f"cannot inspect dispatch common directory: {path}") from exc
+        identity = value["common_git_dir"]
+        if (
+            Path(identity).resolve() != common
+        ):
+            raise GitPrivateStateError(f"dispatch common directory identity mismatch: {path}")
 
 
 def _valid_repository(value: object) -> bool:
@@ -608,9 +871,14 @@ def _validate_publication_recovery_topology(
     return admin
 
 
-def _validate_legacy_content(path: Path, content: bytes) -> None:
+def _validate_legacy_content(
+    path: Path, content: bytes, *, layout: Topology | None = None
+) -> None:
     directory = path.parent.name
     name = path.name
+    if directory == DISPATCH_DIR:
+        _validate_dispatch_content(path, content, layout=layout)
+        return
     if directory == "integration":
         try:
             text = content.decode("ascii", errors="strict")
@@ -891,7 +1159,7 @@ def _validate_canonical(
             if entry.name in LOCK_FILES:
                 _require_canonical_file(entry, "canonical private-state lock")
                 continue
-            if entry.name not in SHARED_DIRS:
+            if entry.name not in COMMON_STATE_DIRS:
                 raise GitPrivateStateError(f"unknown canonical private-state entry: {entry}")
             _require_canonical_dir(entry)
             for child in entry.iterdir():
@@ -907,7 +1175,7 @@ def _validate_canonical(
                     raise GitPrivateStateError(f"unknown canonical private-state entry: {child}")
                 _require_canonical_file(child, "canonical private-state record")
                 content = read_bytes(child, "canonical private-state record")
-                _validate_legacy_content(child, content)
+                _validate_legacy_content(child, content, layout=layout)
                 _validate_authority_filename(child, content)
                 if entry.name == "automation-maintenance":
                     authority_value = _legacy_json(content, child)
@@ -1424,7 +1692,7 @@ def prepare(
         shared_pairs, _ = _scan_shared_legacy(layout)
         pairs = shared_pairs + (_scan_admin_legacy(layout) if admin else [])
         inspected = _inspect_pairs(pairs)
-        for name in SHARED_DIRS:
+        for name in COMMON_STATE_DIRS:
             _ensure_namespace(layout.common, (name,))
         if admin:
             _ensure_namespace(layout.admin, ("automation-maintenance",))
@@ -1485,6 +1753,17 @@ def mutation_lock(root: Path, *, admin: bool = False):
         layout.common / NAMESPACE / "migration.lock", create=True, exact=True
     ), admin_context:
         _recover_canonical_temps(layout, include_admin=admin)
+        yield
+
+
+@contextmanager
+def dispatch_lock(root: Path):
+    """Serialize caller-managed dispatch start and reconciliation transactions."""
+    layout = topology(root)
+    prepare(root, common_dir=layout.common, admin_dir=layout.admin)
+    lock = layout.common / NAMESPACE / "dispatch.lock"
+    with _file_lock(lock, create=True, exact=True):
+        _validate_canonical(layout)
         yield
 
 

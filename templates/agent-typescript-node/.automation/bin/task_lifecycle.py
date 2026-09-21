@@ -1547,6 +1547,34 @@ def cleanup_plan(root: Path, task: str) -> dict:
     }
 
 
+def require_dispatch_stopped_for_cleanup(root: Path, task: str) -> None:
+    """Refuse worktree removal until the canonical dispatch is durably stopped."""
+    try:
+        path = private_state.dispatch_record(root, task)
+        if not os.path.lexists(path):
+            return
+        private_state.validate_record(path, "dispatch record")
+        value = json.loads(
+            private_state.read_bytes(path, "dispatch record").decode("utf-8")
+        )
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        private_state.GitPrivateStateError,
+    ) as exc:
+        raise LifecycleError("cleanup refused: dispatch record is unsafe") from exc
+    if (
+        not isinstance(value, dict)
+        or value.get("task_id") != task
+        or value.get("state") != "stopped"
+        or any(value.get(field) is not None for field in ("pid", "boot_id", "start_ticks"))
+    ):
+        raise LifecycleError(
+            "cleanup refused: Task dispatch must be stopped before worktree removal"
+        )
+
+
 def read_cleanup_receipt(path: Path, task: str) -> dict:
     if path.is_symlink() or not path.is_file():
         raise LifecycleError("cleanup receipt is not a regular local file")
@@ -1656,19 +1684,24 @@ def finish_cleanup(root: Path, plan: dict, receipt: Path) -> None:
 
 def task_cleanup(root: Path, task: str) -> None:
     require_main_worktree(root)
-    with cleanup_lock(root):
-        receipt = cleanup_receipt_path(root, task)
-        if receipt.exists():
-            finish_cleanup(root, read_cleanup_receipt(receipt, task), receipt)
-            return
-        plan = cleanup_plan(root, task)
-        try:
-            private_state.write_bytes(
-                receipt, (json.dumps(plan, sort_keys=True) + "\n").encode("utf-8")
-            )
-        except private_state.GitPrivateStateError as exc:
-            raise LifecycleError(str(exc)) from exc
-        finish_cleanup(root, plan, receipt)
+    try:
+        with private_state.dispatch_lock(root):
+            require_dispatch_stopped_for_cleanup(root, task)
+            with cleanup_lock(root):
+                receipt = cleanup_receipt_path(root, task)
+                if receipt.exists():
+                    finish_cleanup(root, read_cleanup_receipt(receipt, task), receipt)
+                    return
+                plan = cleanup_plan(root, task)
+                try:
+                    private_state.write_bytes(
+                        receipt, (json.dumps(plan, sort_keys=True) + "\n").encode("utf-8")
+                    )
+                except private_state.GitPrivateStateError as exc:
+                    raise LifecycleError(str(exc)) from exc
+                finish_cleanup(root, plan, receipt)
+    except private_state.GitPrivateStateError as exc:
+        raise LifecycleError(str(exc)) from exc
 
 
 def extract_list(path: Path, heading: str) -> list[str]:

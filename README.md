@@ -606,6 +606,34 @@ its filtered content digest to remain identical to the stored snapshot. A
 coherently rewritten set of ignored Task State files therefore cannot
 self-authenticate. An unavailable or changed Issue fails closed.
 
+Issue #163 adds bounded, worktree-rooted OpenCode dispatch without granting
+wildcard external-directory access or automatically approving Ask boundaries:
+
+```sh
+just agent::dispatch-start <task>
+just agent::dispatch-status <task>
+just agent::dispatch-respond <task> <permission-id> <once|session|deny>
+just agent::dispatch-stop <task>
+
+just automation::dispatch-start <task>
+just automation::dispatch-status <task>
+just automation::dispatch-respond <task> <permission-id> <once|session|deny>
+just automation::dispatch-stop <task>
+```
+
+The dispatcher derives the exact registered Task worktree and fixed
+`task-orchestrator` or `maintenance-orchestrator`; callers cannot provide a
+path, agent, host, port, password, or session ID. It starts an authenticated
+loopback-only OpenCode server, records bounded process/session identity in
+Git-private `agent-core/dispatch/` state, and returns after submitting the
+asynchronous readiness handoff. `dispatch-status` surfaces the exact pending
+permission pattern. Main relays only an explicit `once`, `session`, or `deny`
+choice through `dispatch-respond`. The dispatch path never uses `--auto`.
+Maintenance dispatch derives its trusted Templates source path and immutable
+revision from an already-validated active or consumed maintenance receipt;
+pristine maintenance without that source receipt remains blocked rather than
+accepting a caller-selected path.
+
 Issue #101 makes pull request publication metadata evidence-backed and
 fail-closed. After current-head `just agent::verify <task>` evidence exists and
 the Task is `publication-ready`, run:
