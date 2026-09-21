@@ -81,6 +81,17 @@ class TaskContractTest(unittest.TestCase):
         self.assertNotIn("extra", filtered)
         self.assertEqual(contract._digest(filtered), contract._digest(json.loads(json.dumps(filtered))))
 
+    def test_state_reader_rejects_a_fifo_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".task-state"
+            state.mkdir()
+            os.mkfifo(state / "work-units.json")
+            with contract.contract_state_lock(root) as directory_fd, self.assertRaisesRegex(
+                contract.ContractError, "not regular"
+            ):
+                contract._read_state_file(directory_fd, "work-units.json")
+
     def write_pristine(self, root: Path, task: str = "19") -> contract.lifecycle.WorktreeRecord:
         branch = f"task/{task}-agent-core-v3-1-1"
         template = (ROOT / "components/agent-core/.automation/templates/task-state.md").read_text(
@@ -448,6 +459,44 @@ class TaskContractTest(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(contract.ContractError, "identity or content"):
                     contract.validate_contract(root, "19")
+
+    def test_issue_snapshot_loader_rejects_noncanonical_snapshot_pointer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            record = self.write_pristine(root)
+            patches = self.hydration_patches(root, record)
+            with patches[0], patches[1], patches[2]:
+                contract.hydrate_task_contract(root, "19", "19", self.payload(), "acme/widgets")
+            metadata_path = root / ".task-state/contract.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["snapshot"] = ".task-state/other.json"
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            with self.assertRaisesRegex(contract.ContractError, "metadata mismatch"):
+                contract.load_issue_snapshot(root, "19")
+
+    def test_contract_validation_reuses_an_already_held_state_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            record = self.write_pristine(root)
+            patches = self.hydration_patches(root, record)
+            with patches[0], patches[1], patches[2]:
+                contract.hydrate_task_contract(root, "19", "19", self.payload(), "acme/widgets")
+                with contract.contract_state_lock(root) as directory_fd:
+                    result = contract.validate_contract(root, "19", directory_fd=directory_fd)
+            self.assertEqual("READY", result["status"])
+
+    def test_issue_snapshot_loader_rejects_malformed_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            record = self.write_pristine(root)
+            patches = self.hydration_patches(root, record)
+            with patches[0], patches[1], patches[2]:
+                contract.hydrate_task_contract(root, "19", "19", self.payload(), "acme/widgets")
+            for content in (b"{not-json", b"\xff"):
+                with self.subTest(content=content):
+                    (root / ".task-state/issue.json").write_bytes(content)
+                    with self.assertRaisesRegex(contract.ContractError, "malformed"):
+                        contract.load_issue_snapshot(root, "19")
 
     def test_directory_replacement_at_publication_boundary_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -58,6 +58,53 @@ class TaskLifecycleTest(unittest.TestCase):
                 lifecycle.task_state_set(root, "148", "publication-ready")
             self.assertEqual(lifecycle.state_status(state), "blocked")
 
+    def test_work_units_lock_rejects_a_symlinked_lock_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".task-state"
+            state.mkdir()
+            target = root / "outside.lock"
+            target.write_bytes(b"")
+            (state / "work-units.lock").symlink_to(target)
+            record = lifecycle.WorktreeRecord(root, "task/148-lock", "a" * 40)
+            with self.assertRaisesRegex(lifecycle.LifecycleError, "lock"):
+                with lifecycle.work_units_lock(record):
+                    pass
+
+    def test_read_work_units_rejects_non_object_and_non_object_records(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".task-state"
+            state.mkdir()
+            record = lifecycle.WorktreeRecord(root, "task/148-schema", "a" * 40)
+            path = state / "work-units.json"
+            path.write_text("[]", encoding="utf-8")
+            with self.assertRaisesRegex(lifecycle.LifecycleError, "state schema"):
+                lifecycle.read_work_units(record, "148")
+            path.write_text(
+                '{"schema_version":1,"task_id":"148","worktree":"%s",'
+                '"branch":"task/148-schema","units":{"WU-148-01":[]}}\n' % root,
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(lifecycle.LifecycleError, "invalid Work Unit record"):
+                lifecycle.read_work_units(record, "148")
+
+    def test_read_work_units_rejects_nonregular_or_symlinked_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".task-state"
+            state.mkdir()
+            record = lifecycle.WorktreeRecord(root, "task/148-files", "a" * 40)
+            (state / "work-units.json").mkdir()
+            with self.assertRaisesRegex(lifecycle.LifecycleError, "state file is not regular"):
+                lifecycle.read_work_units(record, "148")
+            (state / "work-units.json").rmdir()
+            target = root / "outside-work-units.json"
+            target.write_text("{}", encoding="utf-8")
+            (state / "work-units.json").symlink_to(target)
+            with self.assertRaisesRegex(lifecycle.LifecycleError, "safely readable"):
+                lifecycle.read_work_units(record, "148")
+
     def test_guarded_blocked_publication_recovery_is_exact_locked_status_cas(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -249,6 +296,45 @@ class TaskLifecycleTest(unittest.TestCase):
                 original.replace(b"draft-pr-created", b"integration-pending"),
             )
 
+    def test_guarded_post_merge_recovery_rejects_duplicate_status_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".task-state/task.md"
+            state.parent.mkdir()
+            original = (
+                b"## Current state\n\n"
+                b"- Status: draft-pr-created\n"
+                b"- Status: draft-pr-created\n"
+            )
+            state.write_bytes(original)
+            evidence = {
+                "work-units.json": b"units",
+                "verification.json": b"verification",
+                "contract.json": b"contract",
+                "issue.json": None,
+            }
+            for name, content in evidence.items():
+                if content is not None:
+                    (state.parent / name).write_bytes(content)
+            record = lifecycle.WorktreeRecord(root, "task/225-recovery", "a" * 40)
+            with mock.patch.object(lifecycle, "current_worktree", return_value=record), \
+                 mock.patch.object(lifecycle, "worktree_for_task", return_value=record), \
+                 mock.patch.object(lifecycle, "require_resolved_contract"), \
+                 mock.patch.object(lifecycle, "assert_task_identity"), \
+                 mock.patch.object(lifecycle.private_state, "prepare"), \
+                 mock.patch.object(lifecycle.private_state, "post_merge_publication_recovery_receipt", return_value=root / "receipt"), \
+                 mock.patch.object(lifecycle.private_state, "publication_recovery_receipt", return_value=root / "blocked-receipt"), \
+                 mock.patch.object(lifecycle.private_state, "_validate_legacy_content"), \
+                 mock.patch.object(lifecycle.private_state, "_validate_publication_recovery_topology"), \
+                 mock.patch.object(lifecycle.private_state, "topology"), \
+                 mock.patch.object(lifecycle.private_state, "mutation_lock", return_value=nullcontext()), \
+                 mock.patch.object(lifecycle.private_state, "exclusive_write_bytes", side_effect=lambda path, content, **_: path.write_bytes(content)), \
+                 self.assertRaisesRegex(lifecycle.LifecycleError, "cannot update post-merge Task State status"):
+                lifecycle.recover_post_merge_publication_pending(
+                    record, "225", original, evidence, b"{}"
+                )
+            self.assertEqual(state.read_bytes(), original)
+
     def test_direct_finalize_still_rejects_draft_pr_created(self) -> None:
         record = lifecycle.WorktreeRecord(Path("/task"), "task/225-recovery", "a" * 40)
         with mock.patch.object(lifecycle, "require_resolved_contract"), \
@@ -340,11 +426,19 @@ class TaskLifecycleTest(unittest.TestCase):
                 lifecycle.require_resolved_contract(record, "19")
 
     def test_generated_lifecycle_files_match_sources(self) -> None:
-        pairs = [
-            (
-                ROOT / "components" / "agent-core" / ".automation" / "bin" / "task_lifecycle.py",
-                ROOT / "templates" / "agent-base" / ".automation" / "bin" / "task_lifecycle.py",
-            ),
+        pairs = []
+        for template in ("agent-base", "agent-cpp-cmake", "agent-nix", "agent-python", "agent-rust", "agent-typescript-node"):
+            pairs.extend([
+                (
+                    ROOT / "components" / "agent-core" / ".automation" / "bin" / "task_lifecycle.py",
+                    ROOT / "templates" / template / ".automation" / "bin" / "task_lifecycle.py",
+                ),
+                (
+                    ROOT / "components" / "agent-core" / ".automation" / "bin" / "task_contract.py",
+                    ROOT / "templates" / template / ".automation" / "bin" / "task_contract.py",
+                ),
+            ])
+        pairs.extend([
             (
                 ROOT / "components" / "agent-core" / ".automation" / "just" / "agent.just",
                 ROOT / "templates" / "agent-base" / ".automation" / "just" / "agent.just",
@@ -357,7 +451,7 @@ class TaskLifecycleTest(unittest.TestCase):
                 ROOT / "components" / "agent-core" / "opencode.json",
                 ROOT / "templates" / "agent-base" / "opencode.json",
             ),
-        ]
+        ])
         for source, generated in pairs:
             self.assertEqual(source.read_bytes(), generated.read_bytes(), source.as_posix())
 

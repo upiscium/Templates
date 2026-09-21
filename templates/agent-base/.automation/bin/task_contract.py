@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import fcntl
 import json
 import os
 import re
@@ -61,30 +60,12 @@ class ContractError(lifecycle.LifecycleError):
 
 @contextmanager
 def contract_state_lock(root: Path):
-    """Pin the real Task State directory and share the lifecycle lock inode."""
-    directory = root / ".task-state"
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    """Pin the real Task State directory and share the lifecycle lock."""
     try:
-        directory_fd = os.open(directory, flags)
-    except OSError as exc:
-        raise ContractError("Task State directory must be a real local directory") from exc
-    try:
-        metadata = os.fstat(directory_fd)
-        if not stat.S_ISDIR(metadata.st_mode):
-            raise ContractError("Task State path is not a directory")
-        lock_flags = os.O_RDWR | os.O_CREAT
-        if hasattr(os, "O_NOFOLLOW"):
-            lock_flags |= os.O_NOFOLLOW
-        lock_fd = os.open("work-units.lock", lock_flags, 0o600, dir_fd=directory_fd)
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        with lifecycle.state_directory_lock(root) as directory_fd:
             yield directory_fd
-        finally:
-            os.close(lock_fd)
-    finally:
-        os.close(directory_fd)
+    except lifecycle.LifecycleError as exc:
+        raise ContractError(str(exc)) from exc
 
 
 def _assert_state_dir_binding(root: Path, directory_fd: int) -> None:
@@ -104,6 +85,8 @@ def _read_state_file(directory_fd: int, name: str) -> bytes | None:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
     try:
         fd = os.open(name, flags, dir_fd=directory_fd)
     except FileNotFoundError:
@@ -167,6 +150,22 @@ def write_publication_metadata(root: Path, title: bytes, body: bytes) -> None:
             for name, content in previous.items():
                 _restore_state_file(directory_fd, name, content)
             raise
+
+
+def read_publication_metadata(root: Path) -> tuple[bytes, bytes]:
+    """Read both publication files from the pinned Task State directory."""
+    try:
+        with contract_state_lock(root) as directory_fd:
+            title = _read_state_file(directory_fd, "pr-title.txt")
+            body = _read_state_file(directory_fd, "pr-body.md")
+            _assert_state_dir_binding(root, directory_fd)
+    except ContractError:
+        raise
+    except OSError as exc:
+        raise ContractError("publication metadata files are not safely readable") from exc
+    if title is None or body is None:
+        raise ContractError("publication metadata files are missing")
+    return title, body
 
 
 def write_verification_receipt(root: Path, content: bytes) -> None:
@@ -381,7 +380,10 @@ def _hydrate_task_contract_locked(root: Path, task: str, issue: str, payload: di
     state_bytes = _read_state_file(directory_fd, "task.md")
     if state_bytes is None:
         raise ContractError("Task State is missing")
-    existing_state = state_bytes.decode("utf-8")
+    try:
+        existing_state = state_bytes.decode("utf-8")
+    except UnicodeError as exc:
+        raise ContractError("Task State is malformed") from exc
     placeholder = _placeholder_state(root, existing_state)
     if existing_state != placeholder and "canonical-contract sha256=" not in existing_state:
         raise ContractError("Task State is not the exact canonical pristine placeholder")
@@ -396,16 +398,20 @@ def _hydrate_task_contract_locked(root: Path, task: str, issue: str, payload: di
     if snapshot_bytes is not None:
         try:
             old = json.loads(snapshot_bytes.decode("utf-8"))
-        except json.JSONDecodeError as exc:
+        except (UnicodeError, json.JSONDecodeError) as exc:
             raise ContractError("existing Issue snapshot is malformed") from exc
+        if not isinstance(old, dict) or not isinstance(old.get("payload"), dict):
+            raise ContractError("existing Issue snapshot is malformed")
         if old.get("sha256") != _digest(old.get("payload", {})):
             raise ContractError("existing Issue snapshot integrity check failed")
         try:
             if contract_bytes is None:
                 raise ContractError("existing canonical contract metadata is missing")
             metadata = json.loads(contract_bytes.decode("utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise ContractError("existing canonical contract metadata is malformed") from exc
+        if not isinstance(metadata, dict):
+            raise ContractError("existing canonical contract metadata is malformed")
         if metadata.get("sha256") != old.get("sha256") or metadata.get("issue") != old.get("issue") or metadata.get("repository") != old.get("repository"):
             raise ContractError("existing canonical contract metadata mismatch")
         if old.get("issue") != number or old.get("repository") != identity:
@@ -457,30 +463,111 @@ def recover_task_from_issue(worktree: Path, issue: str, *, runner=None) -> dict:
     return hydrate_task_contract(worktree, task, issue, payload, identity)
 
 
-def validate_contract(root: Path, task: str, *, require_pristine: bool = False) -> dict:
+def _validate_contract_locked(
+    root: Path,
+    task: str,
+    *,
+    require_pristine: bool,
+    directory_fd: int,
+) -> dict:
     if require_pristine:
         record = _pristine(root, task)
     else:
         record = lifecycle.require_local_task(root, task)
-    state = lifecycle.state_path(root).read_text(encoding="utf-8")
+    _assert_state_dir_binding(root, directory_fd)
+    state_bytes = _read_state_file(directory_fd, "task.md")
+    if state_bytes is None:
+        raise ContractError("Task State is missing")
+    try:
+        state = state_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ContractError("Task State is not valid UTF-8") from exc
     _validate_task_identity_exact(record, task, state)
     if "canonical-contract sha256=" not in state:
         raise ContractError("Task State has no canonical contract marker")
-    path = root / SNAPSHOT
-    if not path.is_file():
+    data = load_issue_snapshot(root, task, directory_fd=directory_fd)
+    markers = re.findall(r"canonical-contract sha256=([0-9a-f]{64}) issue=([0-9]+)", state)
+    if len(markers) != 1 or markers[0][0] != data["sha256"] or int(markers[0][1]) != data["issue"]:
+        raise ContractError("Task State canonical contract marker mismatch")
+    expected = _canonical_state(_placeholder_state(root), data["issue"], data["sha256"])
+    for heading in ("Purpose", "Scope", "Prohibited changes", "Dependencies", "Acceptance criteria", "Test plan", "Stop conditions", "Coordination surfaces", "External resources"):
+        if len(re.findall(rf"(?m)^## {re.escape(heading)}$", state)) != 1:
+            raise ContractError(f"canonical Task State section is missing or duplicated: {heading}")
+        pattern = rf"(?ms)^## {re.escape(heading)}\n\n(.*?)(?=^## |\Z)"
+        actual = re.search(pattern, state)
+        wanted = re.search(pattern, expected)
+        if not actual or not wanted or actual.group(1).strip() != wanted.group(1).strip():
+            raise ContractError(f"canonical Task State section is tampered: {heading}")
+    return {"status": "READY", "task": task, "worktree": str(record.path), "issue": data["issue"], "repository": data["repository"], "sha256": data["sha256"]}
+
+
+def validate_contract(
+    root: Path,
+    task: str,
+    *,
+    require_pristine: bool = False,
+    directory_fd: int | None = None,
+) -> dict:
+    """Validate the canonical contract, optionally reusing a held State lock."""
+    if directory_fd is not None:
+        return _validate_contract_locked(
+            root,
+            task,
+            require_pristine=require_pristine,
+            directory_fd=directory_fd,
+        )
+    with contract_state_lock(root) as locked_directory_fd:
+        return _validate_contract_locked(
+            root,
+            task,
+            require_pristine=require_pristine,
+            directory_fd=locked_directory_fd,
+        )
+
+
+def _validate_task_identity_exact(record: lifecycle.WorktreeRecord, task: str, state: str) -> None:
+    expected = {
+        "Task ID": task,
+        "Branch": record.branch,
+        "Worktree": str(record.path),
+    }
+    for label, value in expected.items():
+        if value is None or len(re.findall(rf"(?m)^- {re.escape(label)}: .+$", state)) != 1:
+            raise ContractError(f"Task State identity is missing or duplicated: {label}")
+        if not re.search(rf"(?m)^- {re.escape(label)}: {re.escape(value)}$", state):
+            raise ContractError(f"Task State identity mismatch: {label}")
+
+
+def _load_issue_snapshot_locked(root: Path, task: str, directory_fd: int) -> dict:
+    """Load and validate the pinned Issue snapshot without consulting GitHub."""
+    try:
+        _assert_state_dir_binding(root, directory_fd)
+        snapshot_bytes = _read_state_file(directory_fd, "issue.json")
+        contract_bytes = _read_state_file(directory_fd, "contract.json")
+        _assert_state_dir_binding(root, directory_fd)
+    except ContractError:
+        raise
+    except OSError as exc:
+        raise ContractError("canonical Issue snapshot is malformed") from exc
+    if snapshot_bytes is None:
         raise ContractError("canonical Issue snapshot is missing")
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
+        data = json.loads(snapshot_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise ContractError("canonical Issue snapshot is malformed") from exc
-    if set(data) != {"schema_version", "issue", "repository", "sha256", "payload"} or data.get("schema_version") != 1:
+    if not isinstance(data, dict) or set(data) != {
+        "schema_version", "issue", "repository", "sha256", "payload"
+    } or data.get("schema_version") != 1:
         raise ContractError("canonical Issue snapshot has an invalid schema")
+
     issue = data.get("issue")
     repository = data.get("repository")
     payload = data.get("payload")
     if isinstance(issue, bool) or not isinstance(issue, int) or issue < 1 or str(issue) != task:
         raise ContractError("canonical Issue snapshot Task identity mismatch")
-    if not isinstance(repository, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+    if not isinstance(repository, str) or not re.fullmatch(
+        r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository
+    ):
         raise ContractError("canonical Issue snapshot repository is malformed")
     if not isinstance(payload, dict) or set(payload) != {
         "number", "url", "title", "body", "state", "repository", "labels", "assignees", "milestone"
@@ -495,8 +582,11 @@ def validate_contract(root: Path, task: str, *, require_pristine: bool = False) 
         or payload["url"].casefold() != f"https://github.com/{repository}/issues/{issue}".casefold()
         or not isinstance(payload.get("title"), str)
         or not payload["title"].strip()
+        or len(payload["title"]) > 256
+        or any(ord(char) < 32 or ord(char) == 127 for char in payload["title"])
         or not isinstance(payload.get("body"), str)
         or not payload["body"].strip()
+        or len(payload["body"].encode("utf-8")) > 1024 * 1024
         or not isinstance(payload.get("labels"), list)
         or not all(isinstance(item, str) for item in payload["labels"])
         or not isinstance(payload.get("assignees"), list)
@@ -515,38 +605,37 @@ def validate_contract(root: Path, task: str, *, require_pristine: bool = False) 
         raise ContractError("canonical Issue payload identity or content is malformed")
     if data.get("sha256") != _digest(payload):
         raise ContractError("canonical Issue snapshot integrity check failed")
+
+    if contract_bytes is None:
+        raise ContractError("canonical contract metadata is malformed")
     try:
-        metadata = json.loads((root / CONTRACT).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        metadata = json.loads(contract_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise ContractError("canonical contract metadata is malformed") from exc
-    if metadata != {"schema_version": 1, "issue": data["issue"], "repository": data["repository"], "snapshot": SNAPSHOT, "sha256": data["sha256"]}:
-        raise ContractError("canonical contract metadata mismatch")
-    markers = re.findall(r"canonical-contract sha256=([0-9a-f]{64}) issue=([0-9]+)", state)
-    if len(markers) != 1 or markers[0][0] != data["sha256"] or int(markers[0][1]) != data["issue"]:
-        raise ContractError("Task State canonical contract marker mismatch")
-    expected = _canonical_state(_placeholder_state(root), data["issue"], data["sha256"])
-    for heading in ("Purpose", "Scope", "Prohibited changes", "Dependencies", "Acceptance criteria", "Test plan", "Stop conditions", "Coordination surfaces", "External resources"):
-        if len(re.findall(rf"(?m)^## {re.escape(heading)}$", state)) != 1:
-            raise ContractError(f"canonical Task State section is missing or duplicated: {heading}")
-        pattern = rf"(?ms)^## {re.escape(heading)}\n\n(.*?)(?=^## |\Z)"
-        actual = re.search(pattern, state)
-        wanted = re.search(pattern, expected)
-        if not actual or not wanted or actual.group(1).strip() != wanted.group(1).strip():
-            raise ContractError(f"canonical Task State section is tampered: {heading}")
-    return {"status": "READY", "task": task, "worktree": str(record.path), "issue": data["issue"], "repository": data["repository"], "sha256": data["sha256"]}
-
-
-def _validate_task_identity_exact(record: lifecycle.WorktreeRecord, task: str, state: str) -> None:
-    expected = {
-        "Task ID": task,
-        "Branch": record.branch,
-        "Worktree": str(record.path),
+    expected_metadata = {
+        "schema_version": 1,
+        "issue": data["issue"],
+        "repository": data["repository"],
+        "snapshot": SNAPSHOT,
+        "sha256": data["sha256"],
     }
-    for label, value in expected.items():
-        if value is None or len(re.findall(rf"(?m)^- {re.escape(label)}: .+$", state)) != 1:
-            raise ContractError(f"Task State identity is missing or duplicated: {label}")
-        if not re.search(rf"(?m)^- {re.escape(label)}: {re.escape(value)}$", state):
-            raise ContractError(f"Task State identity mismatch: {label}")
+    if metadata != expected_metadata:
+        raise ContractError("canonical contract metadata mismatch")
+    _assert_state_dir_binding(root, directory_fd)
+    return data
+
+
+def load_issue_snapshot(
+    root: Path,
+    task: str,
+    *,
+    directory_fd: int | None = None,
+) -> dict:
+    """Load a pinned Issue snapshot, reusing a held State lock when supplied."""
+    if directory_fd is not None:
+        return _load_issue_snapshot_locked(root, task, directory_fd)
+    with contract_state_lock(root) as locked_directory_fd:
+        return _load_issue_snapshot_locked(root, task, locked_directory_fd)
 
 
 def _resolve_contract_target(root: Path, task: str | None) -> tuple[Path, str]:
@@ -703,7 +792,7 @@ def refresh_task_contract(
                 raise ContractError("canonical Task Contract changed after inspection")
             # Revalidate local identity and the authoritative Issue immediately
             # before the first mutation while the Task State lock is held.
-            local = validate_contract(root, task)
+            local = validate_contract(root, task, directory_fd=directory_fd)
             if local["sha256"] != expected_old_digest:
                 raise ContractError("canonical Task Contract changed before refresh")
             identity, live = fetch_issue(root, task, runner)
@@ -758,7 +847,7 @@ def refresh_task_contract(
                     mutation_started = True
                     _write_state_file(directory_fd, name, content)
             _assert_state_dir_binding(root, directory_fd)
-            verified = validate_contract(root, task)
+            verified = validate_contract(root, task, directory_fd=directory_fd)
             if verified["sha256"] != expected_new_digest:
                 raise ContractError("refreshed canonical Task Contract failed validation")
             if validate_after_mutation is not None:
