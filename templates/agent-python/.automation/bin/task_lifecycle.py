@@ -1903,6 +1903,7 @@ def merged_cleanup_evidence(
         raise LifecycleError("cleanup refused: merged Task pull request identity is missing or ambiguous")
     pr = matches[0]
     published_head = pr.get("headRefOid")
+    base_revision = pr.get("baseRefOid")
     if (
         pr.get("state") != "MERGED"
         or pr.get("headRefName") != record.branch
@@ -1911,9 +1912,13 @@ def merged_cleanup_evidence(
         or not isinstance(pr.get("number"), int)
         or not isinstance(published_head, str)
         or not re.fullmatch(r"[0-9a-fA-F]{40,64}", published_head)
+        or not isinstance(base_revision, str)
+        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", base_revision)
     ):
         raise LifecycleError("cleanup refused: merged pull request evidence does not match the Task")
     published_head = published_head.lower()
+    base_revision = base_revision.lower()
+    require_cleanup_base_revision(root, base_revision)
     if local_head.lower() != published_head:
         raise LifecycleError("cleanup refused: local Task head does not match published PR head")
     ahead = git(
@@ -1932,6 +1937,7 @@ def merged_cleanup_evidence(
         "repository": repository,
         "pr": pr["number"],
         "published_head": published_head,
+        "base_revision": base_revision,
         "upstream": "deleted" if remote_head is None else "live",
     }
 
@@ -2013,6 +2019,17 @@ def read_cleanup_receipt(path: Path, task: str) -> dict:
         or not re.fullmatch(r"[0-9a-fA-F]{40,64}", evidence["base_revision"])
     ):
         raise LifecycleError("cleanup receipt is invalid")
+    if value["status"] == "merged" and (
+        set(evidence) != {"repository", "pr", "published_head", "base_revision", "upstream"}
+        or not isinstance(evidence.get("repository"), str)
+        or not isinstance(evidence.get("pr"), int)
+        or not isinstance(evidence.get("published_head"), str)
+        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", evidence["published_head"])
+        or not isinstance(evidence.get("base_revision"), str)
+        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", evidence["base_revision"])
+        or evidence.get("upstream") not in {"deleted", "live"}
+    ):
+        raise LifecycleError("cleanup receipt is invalid")
     return value
 
 
@@ -2045,16 +2062,19 @@ def finish_cleanup(root: Path, plan: dict, receipt: Path) -> None:
             if repository.casefold() != plan["evidence"].get("repository", "").casefold():
                 raise LifecycleError("cleanup repository identity changed after worktree removal")
             matches = cleanup_prs(root, branch, repository)
+            base_revision = plan["evidence"].get("base_revision")
             if (
                 len(matches) != 1
                 or matches[0].get("state") != "MERGED"
                 or matches[0].get("headRefOid", "").lower() != expected_head
                 or matches[0].get("headRefName") != branch
                 or matches[0].get("baseRefName") != default_branch(root)
+                or matches[0].get("baseRefOid", "").lower() != base_revision
                 or matches[0].get("isCrossRepository") is not False
                 or matches[0].get("number") != plan["evidence"].get("pr")
             ):
                 raise LifecycleError("cleanup merged PR evidence changed after worktree removal")
+            require_cleanup_base_revision(root, base_revision)
             remote_head = remote_branch_head(WorktreeRecord(root, branch, expected_head))
             if remote_head is not None and remote_head != expected_head:
                 raise LifecycleError("cleanup remote Task branch changed after worktree removal")

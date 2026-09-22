@@ -495,12 +495,13 @@ class PostMergeFinalizationTest(RepositoryFixture):
     def merged_evidence(self, task_worktree: Path, merge_oid: str, **changes: object) -> dict:
         value = {
             "number": 93,
-            "state": "MERGED",
-            "headRefName": command("git", "branch", "--show-current", cwd=task_worktree),
-            "headRefOid": command("git", "rev-parse", "HEAD", cwd=task_worktree),
-            "baseRefName": "main",
-            "isCrossRepository": False,
-            "mergeCommit": {"oid": merge_oid},
+                "state": "MERGED",
+                "headRefName": command("git", "branch", "--show-current", cwd=task_worktree),
+                "headRefOid": command("git", "rev-parse", "HEAD", cwd=task_worktree),
+                "baseRefName": "main",
+                "baseRefOid": command("git", "rev-parse", "main", cwd=task_worktree),
+                "isCrossRepository": False,
+                "mergeCommit": {"oid": merge_oid},
         }
         value.update(changes)
         return value
@@ -564,7 +565,7 @@ class PostMergeFinalizationTest(RepositoryFixture):
                     },
                     "base": {
                         "ref": evidence["baseRefName"],
-                        "sha": "c" * 40,
+                        "sha": evidence.get("baseRefOid", "c" * 40),
                         "repo": {"full_name": "acme/widgets"},
                     },
                 }
@@ -781,6 +782,56 @@ class PostMergeFinalizationTest(RepositoryFixture):
         self.assertEqual(101, len(matches))
         self.assertIn("--paginate", query.call_args.args)
         self.assertIn("--slurp", query.call_args.args)
+
+    def test_cleanup_rejects_malformed_pr_base_sha(self) -> None:
+        task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
+        raw = {
+            "number": evidence["number"],
+            "state": "closed",
+            "merged_at": "2026-08-30T00:00:00Z",
+            "draft": False,
+            "merge_commit_sha": evidence["mergeCommit"]["oid"],
+            "head": {
+                "ref": evidence["headRefName"],
+                "sha": evidence["headRefOid"],
+                "repo": {"full_name": "acme/widgets"},
+            },
+            "base": {
+                "ref": evidence["baseRefName"],
+                "sha": "not-a-sha",
+                "repo": {"full_name": "acme/widgets"},
+            },
+        }
+        with self.cleanup_run(evidence, pr_pages=[[raw]]), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "does not match the Task"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertTrue(task_worktree.exists())
+
+    def test_cleanup_rejects_pr_base_sha_outside_default_branch_history(self) -> None:
+        task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
+        raw = {
+            "number": evidence["number"],
+            "state": "closed",
+            "merged_at": "2026-08-30T00:00:00Z",
+            "draft": False,
+            "merge_commit_sha": evidence["mergeCommit"]["oid"],
+            "head": {
+                "ref": evidence["headRefName"],
+                "sha": evidence["headRefOid"],
+                "repo": {"full_name": "acme/widgets"},
+            },
+            "base": {
+                "ref": evidence["baseRefName"],
+                "sha": "d" * 40,
+                "repo": {"full_name": "acme/widgets"},
+            },
+        }
+        with self.cleanup_run(evidence, pr_pages=[[raw]]), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "not trusted default-branch history"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertTrue(task_worktree.exists())
 
     def test_cleanup_rejects_ambiguity_beyond_first_pr_page(self) -> None:
         task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)

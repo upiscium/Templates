@@ -522,11 +522,12 @@ def _valid_authority_fields(value: dict) -> bool:
 
 def _valid_cleanup_evidence(value: dict, status: str, local_head: str) -> bool:
     if status == "merged":
-        return (set(value) == {"repository", "pr", "published_head", "upstream"}
+        return (set(value) == {"repository", "pr", "published_head", "base_revision", "upstream"}
                 and _valid_repository(value.get("repository"))
                 and isinstance(value.get("pr"), int) and not isinstance(value.get("pr"), bool)
                 and value["pr"] > 0 and _valid_oid(value.get("published_head"))
                 and value.get("published_head").casefold() == local_head.casefold()
+                and _valid_oid(value.get("base_revision"))
                 and value.get("upstream") in {"live", "deleted"})
     return (set(value) == {"repository", "upstream", "base_revision"}
             and _valid_repository(value.get("repository"))

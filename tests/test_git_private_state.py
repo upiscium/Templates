@@ -72,6 +72,7 @@ class GitPrivateStateTest(unittest.TestCase):
                 "repository": "acme/widgets",
                 "pr": 1,
                 "published_head": head,
+                "base_revision": head,
                 "upstream": "deleted",
             },
         }
@@ -613,7 +614,7 @@ class GitPrivateStateTest(unittest.TestCase):
                 "cleanup/TASK-1.json": json.dumps({
                     "schema_version": 1, "task": "TASK-1", "status": "merged",
                     "worktree": self.valid_worktree(Path(directory), "TASK-1-test"), "branch": "task/TASK-1-test",
-                    "local_head": "a" * 40, "evidence": {"repository": "acme/widgets", "pr": 12, "published_head": "a" * 40, "upstream": "deleted"},
+                    "local_head": "a" * 40, "evidence": {"repository": "acme/widgets", "pr": 12, "published_head": "a" * 40, "base_revision": "a" * 40, "upstream": "deleted"},
                 }).encode(),
                 "integration/pr-12.head": b"a" * 40 + b"\n",
                 "discard-pristine/13.json": json.dumps({
@@ -771,7 +772,7 @@ class GitPrivateStateTest(unittest.TestCase):
             first.write_bytes(json.dumps({
                 "schema_version": 1, "task": "1", "status": "merged",
                 "worktree": self.valid_worktree(repo, "1-test"), "branch": "task/1-test",
-                "local_head": "a" * 40, "evidence": {"repository": "acme/widgets", "pr": 1, "published_head": "a" * 40, "upstream": "deleted"},
+                "local_head": "a" * 40, "evidence": {"repository": "acme/widgets", "pr": 1, "published_head": "a" * 40, "base_revision": "a" * 40, "upstream": "deleted"},
             }).encode())
             conflict.write_bytes(b"a" * 40 + b"\n")
             destination.write_bytes(b"b" * 40 + b"\n")
@@ -894,7 +895,7 @@ class GitPrivateStateTest(unittest.TestCase):
             content = json.dumps({
                 "schema_version": 1, "task": "7", "status": "merged",
                 "worktree": self.valid_worktree(repo, "7-test"), "branch": "task/7-test",
-                "local_head": "a" * 40, "evidence": {"repository": "acme/widgets", "pr": 7, "published_head": "a" * 40, "upstream": "deleted"},
+                "local_head": "a" * 40, "evidence": {"repository": "acme/widgets", "pr": 7, "published_head": "a" * 40, "base_revision": "a" * 40, "upstream": "deleted"},
             }).encode()
             legacy.write_bytes(content)
             current.write_bytes(content)
