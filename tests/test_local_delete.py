@@ -412,6 +412,7 @@ class LocalDeleteTest(unittest.TestCase):
             delete_paused = threading.Event()
             resume_delete = threading.Event()
             transition_started = threading.Event()
+            transition_lock_attempted = threading.Event()
             transition_lock_acquired = threading.Event()
             local_errors: list[BaseException] = []
             transition_errors: list[BaseException] = []
@@ -421,8 +422,11 @@ class LocalDeleteTest(unittest.TestCase):
 
             @contextmanager
             def tracked_work_units_lock(locked_record: lifecycle.WorktreeRecord):
+                transition_attempt = transition_started.is_set()
+                if transition_attempt:
+                    transition_lock_attempted.set()
                 with original_work_units_lock(locked_record) as directory_fd:
-                    if transition_started.is_set():
+                    if transition_attempt:
                         transition_lock_acquired.set()
                     yield directory_fd
 
@@ -461,8 +465,8 @@ class LocalDeleteTest(unittest.TestCase):
                 self.assertTrue(delete_paused.wait(5))
                 self.assertEqual(lifecycle.state_status(state), "implementing")
                 transition_thread.start()
-                self.assertTrue(transition_started.is_set())
-                self.assertFalse(transition_lock_acquired.wait(0.2))
+                self.assertTrue(transition_lock_attempted.wait(5))
+                self.assertFalse(transition_lock_acquired.is_set())
                 resume_delete.set()
                 delete_thread.join(5)
                 transition_thread.join(5)
@@ -485,29 +489,69 @@ class LocalDeleteTest(unittest.TestCase):
             target.mkdir(parents=True)
             artifact = target / "artifact"
             artifact.write_text("artifact", encoding="utf-8")
+            transition_started = threading.Event()
+            transition_lock_acquired = threading.Event()
+            release_transition = threading.Event()
+            local_lock_attempted = threading.Event()
+            local_lock_acquired = threading.Event()
+            local_errors: list[BaseException] = []
             transition_errors: list[BaseException] = []
+            original_work_units_lock = lifecycle.work_units_lock
 
             def run_transition() -> None:
                 try:
+                    transition_started.set()
                     lifecycle.task_state_set(root, "174", "verification-pending")
                 except BaseException as exc:  # pragma: no cover - asserted below
                     transition_errors.append(exc)
+
+            @contextmanager
+            def tracked_work_units_lock(locked_record: lifecycle.WorktreeRecord):
+                transition_attempt = transition_started.is_set() and not transition_lock_acquired.is_set()
+                if not transition_attempt and transition_lock_acquired.is_set():
+                    local_lock_attempted.set()
+                with original_work_units_lock(locked_record) as directory_fd:
+                    if transition_attempt:
+                        transition_lock_acquired.set()
+                        if not release_transition.wait(5):
+                            raise AssertionError("transition did not receive its resume signal")
+                    elif local_lock_attempted.is_set():
+                        local_lock_acquired.set()
+                    yield directory_fd
+
+            def run_delete() -> None:
+                try:
+                    local_delete.guarded_local_delete(root, ".build/default", True)
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    local_errors.append(exc)
 
             with (
                 mock.patch.object(local_delete.lifecycle, "current_worktree", return_value=record),
                 mock.patch.object(local_delete.lifecycle, "require_local_task", return_value=record),
                 mock.patch.object(local_delete.lifecycle, "require_resolved_contract"),
                 mock.patch.object(local_delete.lifecycle, "assert_task_identity"),
+                mock.patch.object(local_delete.lifecycle, "work_units_lock", tracked_work_units_lock),
             ):
                 transition_thread = threading.Thread(target=run_transition)
+                delete_thread = threading.Thread(target=run_delete)
                 transition_thread.start()
+                self.assertTrue(transition_lock_acquired.wait(5))
+                delete_thread.start()
+                self.assertTrue(local_lock_attempted.wait(5))
+                self.assertFalse(local_lock_acquired.is_set())
+                self.assertEqual(lifecycle.state_status(state), "implementing")
+                release_transition.set()
                 transition_thread.join(5)
-                self.assertFalse(transition_thread.is_alive())
-                self.assertEqual(transition_errors, [])
-                self.assertEqual(lifecycle.state_status(state), "verification-pending")
-                with self.assertRaisesRegex(local_delete.LocalDeleteError, "explicit mutable state"):
-                    local_delete.guarded_local_delete(root, ".build/default", True)
+                delete_thread.join(5)
 
+            self.assertFalse(transition_thread.is_alive())
+            self.assertFalse(delete_thread.is_alive())
+            self.assertEqual(transition_errors, [])
+            self.assertEqual(len(local_errors), 1)
+            self.assertIsInstance(local_errors[0], local_delete.LocalDeleteError)
+            self.assertIn("explicit mutable state", str(local_errors[0]))
+            self.assertTrue(local_lock_acquired.is_set())
+            self.assertEqual(lifecycle.state_status(state), "verification-pending")
             self.assertTrue(target.exists())
             self.assertTrue(artifact.exists())
 
