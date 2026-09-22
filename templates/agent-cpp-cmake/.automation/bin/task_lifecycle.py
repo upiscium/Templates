@@ -133,7 +133,12 @@ def git(*args: str, cwd: Path, check: bool = True) -> str:
 
 
 def gh(*args: str, cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return run(["gh", *args], cwd=cwd, check=check, remove_env=("GH_REPO",))
+    return run(
+        ["gh", *args],
+        cwd=cwd,
+        check=check,
+        remove_env=("GH_REPO", "GH_HOST", "GH_ENTERPRISE_TOKEN"),
+    )
 
 
 def _github_cli_executable() -> Path | None:
@@ -1846,9 +1851,10 @@ def pull_requests_for_branch(root: Path, branch: str, repository: str) -> list[d
             or isinstance(number, bool)
             or number < 1
             or not isinstance(state, str)
-            or not state
+            or state not in {"open", "closed"}
             or "merged_at" not in item
             or (merged_at is not None and not _github_timestamp(merged_at))
+            or (merged_at is not None and state != "closed")
             or not isinstance(draft, bool)
             or not isinstance(head_ref, str)
             or not head_ref
@@ -2020,13 +2026,21 @@ def read_cleanup_receipt(path: Path, task: str) -> dict:
     ):
         raise LifecycleError("cleanup receipt is invalid")
     if value["status"] == "merged" and (
-        set(evidence) != {"repository", "pr", "published_head", "base_revision", "upstream"}
+        set(evidence) not in (
+            {"repository", "pr", "published_head", "upstream"},
+            {"repository", "pr", "published_head", "base_revision", "upstream"},
+        )
         or not isinstance(evidence.get("repository"), str)
         or not isinstance(evidence.get("pr"), int)
         or not isinstance(evidence.get("published_head"), str)
         or not re.fullmatch(r"[0-9a-fA-F]{40,64}", evidence["published_head"])
-        or not isinstance(evidence.get("base_revision"), str)
-        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", evidence["base_revision"])
+        or (
+            "base_revision" in evidence
+            and (
+                not isinstance(evidence.get("base_revision"), str)
+                or not re.fullmatch(r"[0-9a-fA-F]{40,64}", evidence["base_revision"])
+            )
+        )
         or evidence.get("upstream") not in {"deleted", "live"}
     ):
         raise LifecycleError("cleanup receipt is invalid")
@@ -2044,7 +2058,20 @@ def finish_cleanup(root: Path, plan: dict, receipt: Path) -> None:
         if len(registered) != 1 or registered[0].path != expected_path or registered[0].branch != branch:
             raise LifecycleError("cleanup receipt conflicts with current worktree registration")
         current = cleanup_plan(root, task)
-        if current != plan:
+        if plan["status"] == "merged" and "base_revision" not in plan["evidence"]:
+            legacy_evidence = {
+                key: value for key, value in current["evidence"].items() if key != "base_revision"
+            }
+            if legacy_evidence != plan["evidence"]:
+                raise LifecycleError("cleanup evidence changed before worktree removal")
+            plan = current
+            try:
+                private_state.write_bytes(
+                    receipt, (json.dumps(plan, sort_keys=True) + "\n").encode()
+                )
+            except private_state.GitPrivateStateError as exc:
+                raise LifecycleError("cleanup receipt migration failed") from exc
+        elif current != plan:
             raise LifecycleError("cleanup evidence changed before worktree removal")
         run(["git", "worktree", "remove", str(expected_path)], cwd=root)
     if any(r.path == expected_path or r.branch == branch for r in parse_worktrees(root)):
@@ -2063,6 +2090,15 @@ def finish_cleanup(root: Path, plan: dict, receipt: Path) -> None:
                 raise LifecycleError("cleanup repository identity changed after worktree removal")
             matches = cleanup_prs(root, branch, repository)
             base_revision = plan["evidence"].get("base_revision")
+            migrated_plan = None
+            if plan["status"] == "merged" and base_revision is None and len(matches) == 1:
+                base_revision = matches[0].get("baseRefOid")
+                if isinstance(base_revision, str) and re.fullmatch(r"[0-9a-fA-F]{40,64}", base_revision):
+                    base_revision = base_revision.lower()
+                    migrated_plan = plan = {
+                        **plan,
+                        "evidence": {**plan["evidence"], "base_revision": base_revision},
+                    }
             if (
                 len(matches) != 1
                 or matches[0].get("state") != "MERGED"
@@ -2078,6 +2114,13 @@ def finish_cleanup(root: Path, plan: dict, receipt: Path) -> None:
             remote_head = remote_branch_head(WorktreeRecord(root, branch, expected_head))
             if remote_head is not None and remote_head != expected_head:
                 raise LifecycleError("cleanup remote Task branch changed after worktree removal")
+            if migrated_plan is not None:
+                try:
+                    private_state.write_bytes(
+                        receipt, (json.dumps(migrated_plan, sort_keys=True) + "\n").encode()
+                    )
+                except private_state.GitPrivateStateError as exc:
+                    raise LifecycleError("cleanup receipt migration failed") from exc
         else:
             require_cleanup_base_revision(root, plan["evidence"]["base_revision"])
             repository = cleanup_repository(root)

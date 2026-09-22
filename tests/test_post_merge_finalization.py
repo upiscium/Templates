@@ -471,7 +471,10 @@ class DefaultBranchSynchronizationTest(RepositoryFixture):
         ]
         with mock.patch.object(lifecycle, "run", side_effect=responses) as observed:
             self.assertEqual(lifecycle.default_branch(self.repo), "main")
-        self.assertEqual(observed.call_args_list[1].kwargs["remove_env"], ("GH_REPO",))
+        self.assertEqual(
+            observed.call_args_list[1].kwargs["remove_env"],
+            ("GH_REPO", "GH_HOST", "GH_ENTERPRISE_TOKEN"),
+        )
 
 
 class PostMergeFinalizationTest(RepositoryFixture):
@@ -832,6 +835,21 @@ class PostMergeFinalizationTest(RepositoryFixture):
         ):
             lifecycle.task_cleanup(self.repo, "TASK-1")
         self.assertTrue(task_worktree.exists())
+
+    def test_legacy_merged_cleanup_receipt_is_upgraded_on_retry(self) -> None:
+        task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
+        with self.cleanup_run(evidence, fail_update_ref_once=True), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "injected ref deletion failure"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(task_worktree.exists())
+        receipt = lifecycle.cleanup_receipt_path(self.repo, "TASK-1")
+        payload = json.loads(receipt.read_text(encoding="utf-8"))
+        payload["evidence"].pop("base_revision")
+        receipt.write_text(json.dumps(payload), encoding="utf-8")
+        with self.cleanup_run(evidence):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(receipt.exists())
 
     def test_cleanup_rejects_ambiguity_beyond_first_pr_page(self) -> None:
         task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)

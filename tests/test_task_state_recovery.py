@@ -162,6 +162,16 @@ class TaskStateRecoveryTest(unittest.TestCase):
             "merge_commit_sha": None,
         }
 
+    def test_generated_recovery_files_match_canonical_source(self) -> None:
+        source = (ROOT / "components/agent-core/.automation/bin/task_state_recovery.py").read_bytes()
+        generated = sorted(
+            ROOT.glob("templates/agent-*/.automation/bin/task_state_recovery.py")
+        )
+        self.assertEqual(6, len(generated))
+        for path in generated:
+            with self.subTest(path=path):
+                self.assertEqual(source, path.read_bytes())
+
     def plan(self, target: Path) -> dict:
         state = (
             f"- Task ID: {self.TASK}\n"
@@ -521,6 +531,11 @@ class TaskStateRecoveryTest(unittest.TestCase):
             ("duplicate", lambda raw: [[raw, copy_payload(raw)]]),
             ("wrong-number", lambda raw: [[{**raw, "number": 999}]]),
             ("closed", lambda raw: [[{**raw, "state": "closed"}]]),
+            ("invalid-state", lambda raw: [[{**raw, "state": "merged"}]]),
+            (
+                "open-merged",
+                lambda raw: [[{**raw, "state": "open", "merged_at": "2026-01-01T00:00:00Z"}]],
+            ),
             (
                 "merged",
                 lambda raw: [[{**raw, "state": "closed", "merged_at": "2026-01-01T00:00:00Z"}]],
