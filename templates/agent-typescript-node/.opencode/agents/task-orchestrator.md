@@ -20,16 +20,35 @@ permission:
     "just agent::doctor": allow
     "just agent::context": allow
     "just project::doctor": allow
+    "rm *": deny
     "rm -rf *": ask
-    "rm -rf *.git*": deny
-    "rm -rf *..*": deny
-    "rm -rf /*": deny
-    "rm -rf * /*": deny
-    "rm -rf *~*": deny
-    "rm -rf *$HOME*": deny
-    "rm -rf .": deny
-    "rm -rf ./": deny
-    "rm -rf ./*": deny
+    "rm -fr *": ask
+    "rm -r *": ask
+    "rmdir *": ask
+    "rm *.git*": deny
+    "rm *..*": deny
+    "rm /*": deny
+    "rm * /*": deny
+    "rm *~*": deny
+    "rm *$HOME*": deny
+    "rm .": deny
+    "rm ./": deny
+    "rm ./*": deny
+    "rm * .": deny
+    "rm * ./": deny
+    "rm * ./*": deny
+    "rmdir *.git*": deny
+    "rmdir *..*": deny
+    "rmdir /*": deny
+    "rmdir * /*": deny
+    "rmdir *~*": deny
+    "rmdir *$HOME*": deny
+    "rmdir .": deny
+    "rmdir ./": deny
+    "rmdir ./*": deny
+    "rmdir * .": deny
+    "rmdir * ./": deny
+    "rmdir * ./*": deny
     "just agent::task-start-from-issue *": deny
     "just agent::task-start *": deny
     "just agent::contract-check *": deny

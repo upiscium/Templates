@@ -337,7 +337,9 @@ class OpenCodeContractTest(unittest.TestCase):
     def test_local_delete_ask_boundary_is_parent_only(self) -> None:
         global_bash = self.config["permission"]["bash"]
         orchestrator_bash = permission_for("task-orchestrator")["bash"]
+        self.assertEqual(global_bash["rm *"], "deny")
         self.assertEqual(global_bash["rm -rf *"], "deny")
+        self.assertEqual(global_bash["rmdir *"], "deny")
         self.assertEqual(orchestrator_bash["rm -rf *"], "ask")
 
         for leaf in AGENT_CORE_PERMISSION_LEAVES:
@@ -374,6 +376,11 @@ class OpenCodeContractTest(unittest.TestCase):
             "rm -rf .git/objects",
             "rm -rf ./.git",
             "rm -rf .build/../.git",
+            "rm -fr .git",
+            "rm --force --recursive .git",
+            "rm -fr ../outside",
+            "rm --force --recursive ../outside",
+            "rmdir .git",
             "rm -rf ..",
             "rm -rf ../outside",
             "rm -rf /",
@@ -390,11 +397,31 @@ class OpenCodeContractTest(unittest.TestCase):
                     effective_bash("task-orchestrator", command), "deny", command
                 )
 
-        for command in ("rm -rf .build/default", "rm -rf cache"):
+        for command in (
+            "rm -rf .build/default",
+            "rm -fr .build/default",
+            "rm -r .build/default",
+            "rmdir .build/default",
+            "rm -rf cache",
+        ):
             with self.subTest(command=command):
                 self.assertEqual(
                     effective_bash("task-orchestrator", command), "ask", command
                 )
+
+        for command in (
+            "rm -fr .git",
+            "rm --force --recursive .git",
+            "rm -fr ../outside",
+            "rm --force --recursive ../outside",
+            "rmdir .git",
+        ):
+            with self.subTest(command=command):
+                action = None
+                for pattern, candidate in self.config["permission"]["bash"].items():
+                    if fnmatchcase(command, pattern):
+                        action = candidate
+                self.assertEqual(action, "deny", command)
 
         self.assertEqual(self.config["permission"]["external_directory"]["*"], "deny")
         self.assertNotIn("external_directory", permission_for("task-orchestrator"))
