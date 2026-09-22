@@ -416,14 +416,8 @@ def _same_plan(before: dict, after: dict) -> None:
 
 def _state_topology(target: Path, receipt_exists: bool) -> tuple[Path, set[str]]:
     directory, entries = _state_entries(target)
-    if not receipt_exists and entries:
+    if not receipt_exists and entries - {"work-units.lock"}:
         raise TaskStateRecoveryError("partial .task-state exists without a matching recovery receipt")
-    if not receipt_exists:
-        try:
-            directory.lstat()
-        except FileNotFoundError:
-            return directory, entries
-        raise TaskStateRecoveryError("unsupported pre-existing .task-state directory")
     return directory, entries
 
 

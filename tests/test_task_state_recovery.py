@@ -3,12 +3,14 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
-from contextlib import nullcontext
-from pathlib import Path
-import sys
+import os
+import stat
 import subprocess
+import sys
 import tempfile
 import unittest
+from contextlib import nullcontext
+from pathlib import Path
 from unittest import mock
 
 
@@ -253,6 +255,98 @@ class TaskStateRecoveryTest(unittest.TestCase):
             (state / "issue.json").write_text("{}\n", encoding="utf-8")
             with self.assertRaisesRegex(recovery.TaskStateRecoveryError, "partial"):
                 recovery._state_topology(target, False)
+
+    def test_zero_authority_initial_topologies_recover_identically(self) -> None:
+        normalized_states: list[bytes] = []
+        for topology in ("absent", "empty", "lock"):
+            with self.subTest(topology=topology), tempfile.TemporaryDirectory() as directory:
+                _repository, source, target, base, _main, implementation = self.exact_fixture(Path(directory))
+                state = target / ".task-state"
+                if topology != "absent":
+                    state.mkdir(mode=0o700)
+                    state.chmod(0o700)
+                if topology == "lock":
+                    lock = state / "work-units.lock"
+                    lock.write_bytes(b"")
+                    lock.chmod(0o600)
+                target_head = self.git("git", "rev-parse", "HEAD", cwd=target)
+                pull_request = {
+                    "number": self.PR,
+                    "state": "OPEN",
+                    "isDraft": True,
+                    "isCrossRepository": False,
+                    "headRefName": self.BRANCH,
+                    "headRefOid": target_head,
+                    "baseRefName": "main",
+                    "baseRefOid": base,
+                    "headRepository": {"nameWithOwner": "upiscium/Templates"},
+                }
+                pull_request_before = json.loads(json.dumps(pull_request))
+                tracked_before = self.git(
+                    "git", "status", "--porcelain=v1", "--untracked-files=all", cwd=target
+                )
+                with (
+                    mock.patch.object(recovery, "_gh_json", return_value=[pull_request]),
+                    mock.patch.object(recovery, "_issue_runner", return_value=self.issue_runner()),
+                    mock.patch.object(recovery.lifecycle, "remote_branch_head", return_value=target_head),
+                ):
+                    result = recovery.recover_missing_task_state(
+                        source, target, self.TASK, self.PR, implementation
+                    )
+                self.assertEqual(result["status"], "TASK_STATE_RECOVERED")
+                self.assertEqual(result["taskStatus"], "implementing")
+                self.assertEqual(result["resume"]["status"], "READY")
+                self.assertEqual(result["resume"]["mode"], "resume")
+                self.assertEqual(result["resume"]["taskStatus"], "implementing")
+                self.assertEqual(
+                    tracked_before,
+                    self.git("git", "status", "--porcelain=v1", "--untracked-files=all", cwd=target),
+                )
+                self.assertEqual(target_head, self.git("git", "rev-parse", "HEAD", cwd=target))
+                self.assertEqual(pull_request_before, pull_request)
+                self.assertIn(
+                    "- Status: implementing",
+                    (state / "task.md").read_text(encoding="utf-8"),
+                )
+                self.assertEqual(
+                    {"contract.json", "issue.json", "task.md", "work-units.lock"},
+                    {path.name for path in state.iterdir()},
+                )
+                lock_metadata = (state / "work-units.lock").lstat()
+                self.assertTrue(stat.S_ISREG(lock_metadata.st_mode))
+                self.assertEqual(os.geteuid(), lock_metadata.st_uid)
+                self.assertFalse(stat.S_IMODE(lock_metadata.st_mode) & 0o022)
+                self.assertFalse((state / "verification.json").exists())
+                self.assertFalse((state / "work-units.json").exists())
+                normalized_states.append(
+                    (state / "task.md").read_bytes().replace(str(target).encode(), b"<target>")
+                )
+        self.assertEqual(1, len({state for state in normalized_states}))
+
+    def test_authority_or_history_without_receipt_is_rejected(self) -> None:
+        cases = (
+            "task.md",
+            "issue.json",
+            "contract.json",
+            "verification.json",
+            "work-units.json",
+            "unknown.json",
+            "unknown-directory",
+        )
+        for name in cases:
+            with self.subTest(entry=name), tempfile.TemporaryDirectory() as directory:
+                target = Path(directory)
+                state = target / ".task-state"
+                state.mkdir(mode=0o700)
+                state.chmod(0o700)
+                entry = state / name
+                if name == "unknown-directory":
+                    entry.mkdir(mode=0o700)
+                else:
+                    entry.write_bytes(b"{}\n")
+                    entry.chmod(0o600)
+                with self.assertRaises(recovery.TaskStateRecoveryError):
+                    recovery._state_topology(target, False)
 
     def test_unknown_historical_evidence_is_rejected_with_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
