@@ -57,10 +57,24 @@ class FirstAdoptionFinalizeBridgeTest(unittest.TestCase):
             self.git(source, "add", ".")
             self.git(source, "commit", "-m", "verified module fixture")
             revision = self.git(source, "rev-parse", "HEAD")
-            with bridge._verified_modules(source, revision) as loaded:
+            pinned = mock.Mock(stdout="response\n")
+            with mock.patch.object(bridge, "_pinned_run", return_value=pinned) as run, \
+                 bridge._verified_modules(source, revision) as loaded:
                 self.assertIn("git_private_state", loaded)
                 self.assertIn("maintenance_lifecycle", loaded)
                 self.assertTrue(callable(loaded["maintenance_lifecycle"].maintenance_finalize))
+                result = loaded["agent_core"].gh(
+                    "api", "repos/upiscium/Templates", cwd=source,
+                    input_text="expected body",
+                )
+
+            self.assertEqual(result, "response")
+            run.assert_called_once_with(
+                ["gh", "api", "repos/upiscium/Templates"],
+                cwd=source,
+                input_text="expected body",
+            )
+            self.assertNotIn("expected body", run.call_args.args[0])
 
     def test_stale_main_bootstraps_fast_forward_and_exact_idempotent_transition(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

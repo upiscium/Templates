@@ -68,19 +68,7 @@ signals = ["NEEDS_APPROVAL", "NEEDS_DECISION"]
 [[probes]]
 surface = "task-orchestrator"
 tool = "bash"
-input = "rm -rf .build/default"
-classes = ["local-filesystem-delete"]
-
-[[probes]]
-surface = "task-orchestrator"
-tool = "bash"
-input = "rm -r .build/default"
-classes = ["local-filesystem-delete"]
-
-[[probes]]
-surface = "task-orchestrator"
-tool = "bash"
-input = "rmdir .build/default"
+input = "just agent::local-delete .build/default true"
 classes = ["local-filesystem-delete"]
 
 [[probes]]
@@ -146,7 +134,7 @@ classes = ["system-store-destruction"]
 [[probes]]
 surface = "architect"
 tool = "bash"
-input = "rm -rf .build/default"
+input = "just agent::local-delete .build/default true"
 classes = ["local-filesystem-delete"]
 
 [[probes]]
@@ -176,7 +164,7 @@ classes = ["system-store-destruction"]
 [[probes]]
 surface = "general"
 tool = "bash"
-input = "rm -rf .build/default"
+input = "just agent::local-delete .build/default true"
 classes = ["local-filesystem-delete"]
 
 [[probes]]
@@ -206,7 +194,7 @@ classes = ["system-store-destruction"]
 [[probes]]
 surface = "explore"
 tool = "bash"
-input = "rm -rf .build/default"
+input = "just agent::local-delete .build/default true"
 classes = ["local-filesystem-delete"]
 
 [[probes]]
@@ -236,7 +224,7 @@ classes = ["system-store-destruction"]
 [[probes]]
 surface = "verifier"
 tool = "bash"
-input = "rm -rf .build/default"
+input = "just agent::local-delete .build/default true"
 classes = ["local-filesystem-delete"]
 
 [[probes]]
@@ -266,7 +254,7 @@ classes = ["system-store-destruction"]
 [[probes]]
 surface = "reviewer"
 tool = "bash"
-input = "rm -rf .build/default"
+input = "just agent::local-delete .build/default true"
 classes = ["local-filesystem-delete"]
 
 [[probes]]
@@ -296,7 +284,7 @@ classes = ["system-store-destruction"]
 [[probes]]
 surface = "investigator"
 tool = "bash"
-input = "rm -rf .build/default"
+input = "just agent::local-delete .build/default true"
 classes = ["local-filesystem-delete"]
 
 [[probes]]
@@ -326,7 +314,7 @@ classes = ["system-store-destruction"]
 [[probes]]
 surface = "security-reviewer"
 tool = "bash"
-input = "rm -rf .build/default"
+input = "just agent::local-delete .build/default true"
 classes = ["local-filesystem-delete"]
 
 [[probes]]
@@ -356,7 +344,7 @@ classes = ["system-store-destruction"]
 [[probes]]
 surface = "scout"
 tool = "bash"
-input = "rm -rf .build/default"
+input = "just agent::local-delete .build/default true"
 classes = ["local-filesystem-delete"]
 
 [[probes]]

@@ -1,6 +1,7 @@
 root := justfile_directory()
 script := root / ".automation/bin/agent_core.py"
 lifecycle := root / ".automation/bin/task_lifecycle.py"
+local_delete := root / ".automation/bin/local_delete.py"
 discard_pristine := root / ".automation/bin/discard_pristine.py"
 init := root / ".automation/bin/init_context.py"
 
@@ -35,6 +36,10 @@ contract-resume-check task='':
 [working-directory: root]
 status task:
     env PYTHONDONTWRITEBYTECODE=1 python3 -B {{quote(lifecycle)}} status {{quote(task)}}
+
+[working-directory: root]
+local-delete target recursive="false":
+    env PYTHONDONTWRITEBYTECODE=1 python3 -B {{quote(local_delete)}} {{quote(target)}} {{quote(recursive)}}
 
 [working-directory: root]
 state-set task status:
