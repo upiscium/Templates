@@ -219,12 +219,13 @@ Known records are copied byte for byte with durable no-overwrite publication,
 all conflicts are rejected before migration mutation, and legacy records are
 removed only after every canonical destination is mode-, owner-, and
 content-equivalent. The legacy cleanup-lock inode is acquired nonblocking and
-hard-linked into the canonical cleanup-lock path before its legacy name is
-removed. Existing waiters therefore remain fenced on the same inode. A
-contended legacy lock, or distinct legacy and canonical lock inodes, reports a
-precise `BLOCKED` condition rather than claiming migration success. Successful
-cutover removes the legacy lock last and then removes the empty `opencode/`
-directory, leaving the path available to OpenCode.
+hard-linked into the canonical cleanup-lock path before migration continues.
+The legacy lock name remains as a hard-link alias after cutover, so existing
+waiters and late legacy callers remain fenced on the same inode. A contended
+legacy lock, a lock identity change, or distinct legacy and canonical lock
+inodes reports a precise `BLOCKED` condition rather than claiming migration
+success. The legacy state records and subdirectories are removed, while the
+reserved cleanup-lock alias keeps `opencode/` present for future fencing.
 
 Canonical reads and writes validate the actual descriptor chain. The opened Git
 administrative boundary must be owned by the effective user and must not be

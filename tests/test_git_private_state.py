@@ -682,9 +682,10 @@ class GitPrivateStateTest(unittest.TestCase):
                 )
                 self.assertEqual(content, (base / relative).read_bytes())
                 self.assertFalse((legacy / relative).exists())
-            self.assertFalse(legacy.exists())
+            self.assertTrue(legacy.exists())
             canonical_lock = common / "agent-core/cleanup.lock"
             self.assertEqual(legacy_lock_identity[0:2], self.identity(canonical_lock)[0:2])
+            self.assertEqual(legacy_lock_identity[0:2], self.identity(legacy_lock)[0:2])
             self.assertEqual(0o600, stat.S_IMODE(canonical_lock.stat().st_mode))
             private_state.prepare(authority_worktree, admin=True)
 
@@ -725,8 +726,44 @@ class GitPrivateStateTest(unittest.TestCase):
             legacy_lock.write_bytes(b"")
             inode = legacy_lock.stat().st_ino
             with private_state.cleanup_lock(repo):
-                self.assertFalse((common / "opencode").exists())
+                self.assertTrue((common / "opencode").exists())
                 self.assertEqual(inode, (common / "agent-core/cleanup.lock").stat().st_ino)
+                self.assertEqual(inode, legacy_lock.stat().st_ino)
+
+    def test_cleanup_operation_reserves_legacy_alias_when_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(Path(directory))
+            common = private_state.common_git_dir(repo)
+            with private_state.cleanup_lock(repo):
+                canonical = common / "agent-core/cleanup.lock"
+                legacy = common / "opencode/cleanup.lock"
+                self.assertEqual(canonical.stat().st_ino, legacy.stat().st_ino)
+            self.assertTrue(legacy.is_file())
+
+    def test_cleanup_operation_blocks_distinct_legacy_lock_after_initial_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(Path(directory))
+            common = private_state.common_git_dir(repo)
+            legacy = common / "opencode/cleanup.lock"
+            original = private_state._scan_shared_legacy
+            created = False
+
+            def create_after_scan(layout):
+                nonlocal created
+                if not created:
+                    created = True
+                    legacy.parent.mkdir(parents=True)
+                    legacy.write_bytes(b"")
+                    return [], None
+                return original(layout)
+
+            with mock.patch.object(
+                private_state, "_scan_shared_legacy", side_effect=create_after_scan
+            ), self.assertRaisesRegex(
+                private_state.GitPrivateStateError, "different inodes"
+            ):
+                with private_state.cleanup_lock(repo):
+                    self.fail("distinct late legacy lock was not blocked")
 
     def test_cleanup_handoff_rejects_legacy_path_inode_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

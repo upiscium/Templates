@@ -1279,23 +1279,6 @@ def _identity_unlink(item: MigrationFile) -> None:
         os.close(parent_fd)
 
 
-def _unlink_identity_path(path: Path, identity: tuple[int, int], what: str) -> None:
-    parent_fd = _open_anchored_parent(path)
-    try:
-        metadata = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
-        if ((metadata.st_dev, metadata.st_ino) != identity or
-                not stat.S_ISREG(metadata.st_mode)):
-            raise GitPrivateStateError(f"{what} identity changed: {path}")
-        os.unlink(path.name, dir_fd=parent_fd)
-        os.fsync(parent_fd)
-    except GitPrivateStateError:
-        raise
-    except OSError as exc:
-        raise GitPrivateStateError(f"cannot remove {what}: {path}") from exc
-    finally:
-        os.close(parent_fd)
-
-
 def _handoff_cleanup_lock(
     legacy: Path, canonical: Path, expected_identity: tuple[int, int]
 ) -> tuple[int, int]:
@@ -1385,6 +1368,70 @@ def _preflight_cleanup_lock_handoff(legacy: Path | None, canonical: Path) -> Non
     if (canonical_meta.st_dev, canonical_meta.st_ino) != (
         legacy_meta.st_dev, legacy_meta.st_ino
     ):
+        raise GitPrivateStateError(
+            "BLOCKED: legacy and canonical cleanup locks use different inodes; "
+            "automatic cutover cannot prove a single cleanup fence"
+        )
+
+
+def _ensure_legacy_cleanup_lock_alias(
+    layout: Topology, canonical: Path, expected_identity: tuple[int, int]
+) -> None:
+    """Keep the historical cleanup pathname as a fence for late legacy callers."""
+    legacy_root = layout.common / LEGACY_NAMESPACE
+    kind = _namespace_kind(legacy_root, foreign_regular=True)
+    if kind == "foreign":
+        return
+    if kind == "absent":
+        parent_fd = _open_dir(layout.common)
+        try:
+            _require_git_admin_descriptor(parent_fd, layout.common)
+            try:
+                os.mkdir(LEGACY_NAMESPACE, 0o700, dir_fd=parent_fd)
+                os.chmod(LEGACY_NAMESPACE, 0o700, dir_fd=parent_fd, follow_symlinks=False)
+                os.fsync(parent_fd)
+            except FileExistsError:
+                pass
+        except OSError as exc:
+            raise GitPrivateStateError(
+                f"cannot create legacy cleanup namespace: {legacy_root}"
+            ) from exc
+        finally:
+            os.close(parent_fd)
+    _require_legacy_dir(legacy_root, "legacy private-state directory")
+    legacy = legacy_root / "cleanup.lock"
+    canonical_metadata = _require_canonical_file(canonical, "canonical cleanup lock")
+    if (canonical_metadata.st_dev, canonical_metadata.st_ino) != expected_identity:
+        raise GitPrivateStateError(f"canonical cleanup lock identity changed: {canonical}")
+    try:
+        legacy_metadata = legacy.lstat()
+    except FileNotFoundError:
+        legacy_parent_fd = _open_anchored_parent(legacy)
+        canonical_parent_fd = _open_anchored_parent(canonical)
+        try:
+            try:
+                os.link(
+                    canonical.name,
+                    legacy.name,
+                    src_dir_fd=canonical_parent_fd,
+                    dst_dir_fd=legacy_parent_fd,
+                    follow_symlinks=False,
+                )
+                os.fsync(legacy_parent_fd)
+            except FileExistsError:
+                pass
+        except OSError as exc:
+            raise GitPrivateStateError(
+                f"cannot establish legacy cleanup lock alias: {legacy}"
+            ) from exc
+        finally:
+            os.close(canonical_parent_fd)
+            os.close(legacy_parent_fd)
+        legacy_metadata = _lstat(legacy, "legacy cleanup lock")
+    if stat.S_ISLNK(legacy_metadata.st_mode) or not stat.S_ISREG(legacy_metadata.st_mode):
+        raise GitPrivateStateError(f"unsafe legacy cleanup lock: {legacy}")
+    _require_owned_mode(legacy, legacy_metadata, 0o600, "legacy cleanup lock")
+    if (legacy_metadata.st_dev, legacy_metadata.st_ino) != expected_identity:
         raise GitPrivateStateError(
             "BLOCKED: legacy and canonical cleanup locks use different inodes; "
             "automatic cutover cannot prove a single cleanup fence"
@@ -1490,7 +1537,14 @@ def prepare(
     pairs = shared_pairs + (_scan_admin_legacy(layout) if admin else [])
     _inspect_pairs(pairs)  # preflight before creating even the migration lock
     if legacy_lock is not None and _legacy_lock_identity is None:
+        legacy_metadata = _require_regular(legacy_lock, "legacy cleanup lock")
+        _require_owned_mode(legacy_lock, legacy_metadata, 0o600, "legacy cleanup lock")
+        expected_legacy_identity = (legacy_metadata.st_dev, legacy_metadata.st_ino)
         with _file_lock(legacy_lock, create=False, nonblocking=True) as lock_identity:
+            if lock_identity != expected_legacy_identity:
+                raise GitPrivateStateError(
+                    f"legacy cleanup lock identity changed before handoff: {legacy_lock}"
+                )
             prepare(
                 root,
                 admin=admin,
@@ -1533,11 +1587,10 @@ def prepare(
             _ensure_namespace(layout.common, (name,))
         if admin:
             _ensure_namespace(layout.admin, ("automation-maintenance",))
-        legacy_lock_identity = None
         if legacy_lock is not None:
             if _legacy_lock_identity is None:
                 raise GitPrivateStateError("legacy cleanup lock is not held for handoff")
-            legacy_lock_identity = _handoff_cleanup_lock(
+            _handoff_cleanup_lock(
                 legacy_lock,
                 layout.common / NAMESPACE / "cleanup.lock",
                 _legacy_lock_identity,
@@ -1561,8 +1614,6 @@ def prepare(
                 raise GitPrivateStateError(f"legacy private-state record changed: {item.source}")
         for item in inspected:
             _identity_unlink(item)
-        if legacy_lock is not None and legacy_lock_identity is not None:
-            _unlink_identity_path(legacy_lock, legacy_lock_identity, "legacy cleanup lock")
         _remove_known_empty_legacy_directories(layout)
 
 
@@ -1699,26 +1750,38 @@ def _unlink_locked(path: Path, *, expected_identity: tuple[int, int] | None = No
 
 @contextmanager
 def cleanup_lock(root: Path):
-    """Cut over legacy cleanup locking, then acquire only the canonical lock."""
+    """Acquire one cleanup fence while preserving the legacy lock alias."""
     layout = topology(root)
     _validate_canonical(layout)
     _, legacy = _scan_shared_legacy(layout)
-    # Lock old consumers out while migrating cleanup/discard evidence.
-    legacy_context = (_file_lock(legacy, create=False, nonblocking=True)
-                      if legacy is not None else nullcontext())
-    with legacy_context as legacy_identity:
+    if legacy is not None:
+        legacy_metadata = _require_regular(legacy, "legacy cleanup lock")
+        _require_owned_mode(legacy, legacy_metadata, 0o600, "legacy cleanup lock")
+        expected_legacy_identity = (legacy_metadata.st_dev, legacy_metadata.st_ino)
+        with _file_lock(legacy, create=False, nonblocking=True) as legacy_identity:
+            if legacy_identity != expected_legacy_identity:
+                raise GitPrivateStateError(
+                    f"legacy cleanup lock identity changed before handoff: {legacy}"
+                )
+            # Lock old consumers out while migrating cleanup/discard evidence.
+            prepare(
+                root,
+                common_dir=layout.common,
+                admin_dir=layout.admin,
+                _legacy_lock_identity=legacy_identity,
+            )
+            # The legacy descriptor and canonical path now name the same inode.
+            yield
+        return
+
+    canonical = layout.common / NAMESPACE / "cleanup.lock"
+    _ensure_namespace(layout.common, ())
+    with _file_lock(canonical, create=True, exact=True) as canonical_identity:
+        _ensure_legacy_cleanup_lock_alias(layout, canonical, canonical_identity)
         prepare(
             root,
             common_dir=layout.common,
             admin_dir=layout.admin,
-            _legacy_lock_identity=legacy_identity,
+            _legacy_lock_identity=canonical_identity,
         )
-        if legacy is not None:
-            # The open legacy descriptor now names the same inode as the
-            # canonical path and remains held for the whole caller operation.
-            yield
-        else:
-            with _file_lock(
-                layout.common / NAMESPACE / "cleanup.lock", create=True, exact=True
-            ):
-                yield
+        yield
