@@ -404,8 +404,13 @@ def _verified_modules(root: Path, revision: str):
             loaded["git_private_state"]._GIT_EXECUTABLE = str(git)
             loaded["task_lifecycle"].gh = lambda *args, cwd, check=True: _pinned_run(
                 ["gh", *args], cwd=cwd, check=check)
-            loaded["agent_core"].gh = lambda *args, cwd=None: _pinned_run(
-                ["gh", *args], cwd=cwd).stdout.strip()
+            def verified_agent_gh(*args: str, cwd: Path | None = None,
+                                  input_text: str | None = None) -> str:
+                return _pinned_run(
+                    ["gh", *args], cwd=cwd, input_text=input_text
+                ).stdout.strip()
+
+            loaded["agent_core"].gh = verified_agent_gh
             yield loaded
         except BridgeError:
             raise
