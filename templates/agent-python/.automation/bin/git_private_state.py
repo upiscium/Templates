@@ -27,6 +27,7 @@ FIXED_AUTHORITY_FILES = {
     "post-merge-publication-recovery.json",
     "source-recovery-proof.json",
     "publication-recovery.json",
+    "lost-ignored-task-state.json",
 }
 LOCK_FILES = {"cleanup.lock", "migration.lock"}
 TEMP_RE = re.compile(r"\.(?:migrate|record)\.[0-9]+\.[0-9a-f]{16}")
@@ -111,6 +112,11 @@ def publication_recovery_receipt(root: Path) -> Path:
 def post_merge_publication_recovery_receipt(root: Path) -> Path:
     """Return the protected post-merge receipt for this worktree."""
     return admin_maintenance(root) / "post-merge-publication-recovery.json"
+
+
+def lost_ignored_task_state_receipt(root: Path) -> Path:
+    """Return the protected lost-Task-State receipt for this worktree."""
+    return admin_maintenance(root) / "lost-ignored-task-state.json"
 
 
 def cleanup_receipt(root: Path, task: str) -> Path:
@@ -718,6 +724,45 @@ def _validate_legacy_content(path: Path, content: bytes) -> None:
             ))
             and (value.get("issue_sha256") is None or _valid_digest(value.get("issue_sha256")))
             and _valid_absolute_path(value.get("implementation_source"))
+        )
+    elif name == "lost-ignored-task-state.json":
+        required = {
+            "schema_version", "kind", "repository", "task_id", "worktree", "branch",
+            "head", "tree", "base_branch", "base_revision", "default_revision",
+            "remote_branch_head", "pr_number", "pr_state", "pr_draft", "pr_head_ref",
+            "pr_head_oid", "pr_base_ref", "pr_base_oid", "issue_sha256",
+            "implementation_source", "implementation_revision", "reconstructed_file_sha256",
+        }
+        reconstructed = value.get("reconstructed_file_sha256")
+        valid = (
+            set(value) == required
+            and isinstance(value.get("schema_version"), int)
+            and not isinstance(value.get("schema_version"), bool)
+            and value.get("schema_version") == 1
+            and value.get("kind") == "lost-ignored-task-state"
+            and _valid_repository(value.get("repository"))
+            and _valid_task_id(value.get("task_id"))
+            and _valid_absolute_path(value.get("worktree"))
+            and _valid_task_branch(value.get("branch"), value.get("task_id"))
+            and all(_valid_oid(value.get(field)) for field in (
+                "head", "tree", "base_revision", "default_revision", "remote_branch_head",
+                "pr_head_oid", "pr_base_oid", "implementation_revision",
+            ))
+            and _valid_nonempty(value.get("base_branch"))
+            and isinstance(value.get("pr_number"), int)
+            and not isinstance(value.get("pr_number"), bool)
+            and value.get("pr_number") > 0
+            and value.get("pr_state") == "OPEN"
+            and value.get("pr_draft") is True
+            and _valid_nonempty(value.get("pr_head_ref"))
+            and _valid_nonempty(value.get("pr_base_ref"))
+            and _valid_digest(value.get("issue_sha256"))
+            and _valid_absolute_path(value.get("implementation_source"))
+            and isinstance(reconstructed, dict)
+            and set(reconstructed) == {"task.md", "issue.json", "contract.json"}
+            and all(_valid_digest(reconstructed.get(field)) for field in (
+                "task.md", "issue.json", "contract.json",
+            ))
         )
     elif name == "source-recovery-proof.json":
         required = {

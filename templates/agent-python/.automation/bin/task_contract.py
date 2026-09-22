@@ -333,6 +333,11 @@ def _refreshed_state(root: Path, state: str, issue: int, old_digest: str, new_di
 def _placeholder_state(root: Path, state_text: str | None = None) -> str:
     template = root / ".automation" / "templates" / "task-state.md"
     if not template.is_file():
+        # The Templates source checkout is not itself an Agent Core consumer.
+        # Source-side Admin recovery and resume checks still validate the same
+        # canonical schema against the source component template.
+        template = root / "components" / "agent-core" / ".automation" / "templates" / "task-state.md"
+    if not template.is_file():
         raise ContractError(f"missing Task State template: {template}")
     state = lifecycle.state_path(root)
     if state_text is None:
