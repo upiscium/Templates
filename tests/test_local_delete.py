@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import tempfile
 import unittest
@@ -105,6 +106,110 @@ class LocalDeleteTest(unittest.TestCase):
                 (target / "escape").unlink(missing_ok=True)
                 (outside / "keep").unlink(missing_ok=True)
                 outside.rmdir()
+
+    def test_recursive_delete_rejects_a_same_device_top_level_mount_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / ".build" / "default"
+            target.mkdir(parents=True)
+            artifact = target / "artifact"
+            artifact.write_text("artifact", encoding="utf-8")
+            mounted_inode = target.stat().st_ino
+
+            def mount_id(descriptor: int) -> int:
+                return 200 if os.fstat(descriptor).st_ino == mounted_inode else 100
+
+            with (
+                mock.patch.object(local_delete, "_mount_id", side_effect=mount_id),
+                self.assertRaisesRegex(local_delete.LocalDeleteError, "mounted path"),
+            ):
+                local_delete.delete_target(root, ".build/default", True)
+
+            self.assertTrue(target.exists())
+            self.assertTrue(artifact.exists())
+
+    def test_recursive_delete_rejects_a_same_device_nested_mount_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / ".build"
+            nested = target / "default"
+            nested.mkdir(parents=True)
+            artifact = nested / "artifact"
+            artifact.write_text("artifact", encoding="utf-8")
+            mounted_inode = nested.stat().st_ino
+
+            def mount_id(descriptor: int) -> int:
+                return 200 if os.fstat(descriptor).st_ino == mounted_inode else 100
+
+            with (
+                mock.patch.object(local_delete, "_mount_id", side_effect=mount_id),
+                self.assertRaisesRegex(local_delete.LocalDeleteError, "mounted path"),
+            ):
+                local_delete.delete_target(root, ".build", True)
+
+            self.assertTrue(target.exists())
+            self.assertTrue(artifact.exists())
+
+    def test_recursive_delete_rejects_a_same_device_file_mount_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / ".build"
+            target.mkdir()
+            mounted_file = target / "artifact"
+            mounted_file.write_text("artifact", encoding="utf-8")
+            mounted_inode = mounted_file.stat().st_ino
+
+            def mount_id(descriptor: int) -> int:
+                return 200 if os.fstat(descriptor).st_ino == mounted_inode else 100
+
+            with (
+                mock.patch.object(local_delete, "_mount_id", side_effect=mount_id),
+                self.assertRaisesRegex(local_delete.LocalDeleteError, "mounted path"),
+            ):
+                local_delete.delete_target(root, ".build", True)
+
+            self.assertTrue(target.exists())
+            self.assertTrue(mounted_file.exists())
+
+    def test_delete_rejects_a_same_device_parent_mount_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parent = root / ".build"
+            target = parent / "default"
+            target.mkdir(parents=True)
+            mounted_inode = parent.stat().st_ino
+
+            def mount_id(descriptor: int) -> int:
+                return 200 if os.fstat(descriptor).st_ino == mounted_inode else 100
+
+            with (
+                mock.patch.object(local_delete, "_mount_id", side_effect=mount_id),
+                self.assertRaisesRegex(local_delete.LocalDeleteError, "mounted path"),
+            ):
+                local_delete.delete_target(root, ".build/default", True)
+
+            self.assertTrue(target.exists())
+
+    def test_mount_identity_failure_is_fail_closed_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / ".build"
+            target.mkdir()
+            artifact = target / "artifact"
+            artifact.write_text("artifact", encoding="utf-8")
+
+            with (
+                mock.patch.object(
+                    local_delete,
+                    "_mount_id",
+                    side_effect=local_delete.LocalDeleteError("mount identity unavailable"),
+                ),
+                self.assertRaisesRegex(local_delete.LocalDeleteError, "mount identity"),
+            ):
+                local_delete.delete_target(root, ".build", True)
+
+            self.assertTrue(target.exists())
+            self.assertTrue(artifact.exists())
 
     def test_recursive_delete_rejects_new_entries_after_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

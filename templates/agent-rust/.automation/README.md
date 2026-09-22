@@ -21,10 +21,12 @@ separate OpenCode configuration work.
 Bounded Task-local filesystem deletion is exposed only through
 `just agent::local-delete <relative-target> [recursive]`. The operation requires
 the exact current initialized Task worktree and uses descriptor-anchored,
-no-follow validation; raw `rm` and `rmdir` remain denied at every Agent Core
-permission surface. As with the other Agent Core local-filesystem guards,
-hostile processes running as the same effective user are outside this trust
-boundary.
+no-follow validation with Linux mount-identity pinning; raw `rm` and `rmdir`
+remain denied at every Agent Core permission surface. Mount identity is
+fail-closed when unavailable, so same-filesystem bind mounts cannot cross the
+worktree boundary. As with the other Agent Core local-filesystem guards,
+hostile processes replacing pathnames as the same effective user are outside
+this trust boundary.
 
 ## Post-merge finalization
 

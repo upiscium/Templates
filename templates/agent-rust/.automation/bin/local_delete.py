@@ -28,6 +28,7 @@ class LocalDeleteError(RuntimeError):
 
 
 _TARGET_RE = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*\Z")
+_MOUNT_ID_RE = re.compile(r"mnt_id:\s+([0-9]+)\s*\Z")
 _PROTECTED_NAMES = frozenset(
     {
         ".git",
@@ -48,22 +49,85 @@ class EntryIdentity:
     device: int
     inode: int
     mode: int
+    mount_id: int
 
 
 DirectorySnapshot = dict[str, dict[str, EntryIdentity]]
 
 
-def _identity(metadata: os.stat_result) -> EntryIdentity:
-    return EntryIdentity(metadata.st_dev, metadata.st_ino, metadata.st_mode)
+def _require_linux_mount_identity() -> None:
+    if not sys.platform.startswith("linux"):
+        raise LocalDeleteError("local-delete requires Linux mount identity support")
+    if not hasattr(os, "O_PATH") or not hasattr(os, "O_NOFOLLOW"):
+        raise LocalDeleteError("platform lacks the required no-follow mount APIs")
+
+
+def _mount_id(descriptor: int) -> int:
+    """Return the Linux mount namespace identity for an open descriptor."""
+    _require_linux_mount_identity()
+    matches: list[int] = []
+    try:
+        with open(f"/proc/self/fdinfo/{descriptor}", "r", encoding="ascii") as stream:
+            for line in stream:
+                if line.startswith("mnt_id:"):
+                    match = _MOUNT_ID_RE.fullmatch(line)
+                    if match is None:
+                        raise LocalDeleteError("Linux mount identity is malformed")
+                    matches.append(int(match.group(1)))
+    except (OSError, UnicodeError) as exc:
+        raise LocalDeleteError("cannot read Linux mount identity") from exc
+    if len(matches) != 1:
+        raise LocalDeleteError("Linux mount identity is unavailable")
+    return matches[0]
+
+
+def _identity(metadata: os.stat_result, mount_id: int) -> EntryIdentity:
+    return EntryIdentity(metadata.st_dev, metadata.st_ino, metadata.st_mode, mount_id)
+
+
+def _descriptor_identity(descriptor: int, relative: str) -> EntryIdentity:
+    try:
+        metadata = os.fstat(descriptor)
+        mount_id = _mount_id(descriptor)
+    except LocalDeleteError:
+        raise
+    except OSError as exc:
+        raise LocalDeleteError(f"cannot inspect descriptor safely: {relative}") from exc
+    return _identity(metadata, mount_id)
 
 
 def _require_identity(
+    actual: EntryIdentity,
+    expected: EntryIdentity,
+    relative: str,
+) -> None:
+    if actual != expected:
+        raise LocalDeleteError(f"path changed during deletion: {relative}")
+
+
+def _require_same_mount(
+    actual: EntryIdentity,
+    expected: EntryIdentity,
+    relative: str,
+) -> None:
+    if actual.device != expected.device or actual.mount_id != expected.mount_id:
+        raise LocalDeleteError(f"mounted path is not permitted: {relative}")
+
+
+def _require_metadata_identity(
     metadata: os.stat_result,
     expected: EntryIdentity,
     relative: str,
 ) -> None:
-    actual = _identity(metadata)
-    if actual != expected:
+    if (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+    ) != (
+        expected.device,
+        expected.inode,
+        expected.mode,
+    ):
         raise LocalDeleteError(f"path changed during deletion: {relative}")
 
 
@@ -85,17 +149,17 @@ def parse_relative_target(raw: str) -> tuple[str, ...]:
 
 
 def _nofollow_directory_flags() -> int:
-    nofollow = getattr(os, "O_NOFOLLOW", None)
-    if nofollow is None or not hasattr(os, "O_DIRECTORY"):
+    _require_linux_mount_identity()
+    if not hasattr(os, "O_DIRECTORY"):
         raise LocalDeleteError("platform lacks the required no-follow directory API")
-    return os.O_RDONLY | os.O_DIRECTORY | nofollow | getattr(os, "O_CLOEXEC", 0)
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 
 
 def _open_directory(
     name: str | os.PathLike[str],
     *,
     dir_fd: int | None = None,
-    expected_device: int | None = None,
+    expected_mount: EntryIdentity | None = None,
 ) -> int:
     flags = _nofollow_directory_flags()
     descriptor = -1
@@ -104,17 +168,17 @@ def _open_directory(
             descriptor = os.open(name, flags)
         else:
             descriptor = os.open(name, flags, dir_fd=dir_fd)
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISDIR(metadata.st_mode):
+        identity = _descriptor_identity(descriptor, str(name))
+        if not stat.S_ISDIR(identity.mode):
             os.close(descriptor)
             descriptor = -1
             raise LocalDeleteError(f"path component is not a directory: {name}")
-        if expected_device is not None and metadata.st_dev != expected_device:
-            os.close(descriptor)
-            descriptor = -1
-            raise LocalDeleteError(f"mounted path is not permitted: {name}")
+        if expected_mount is not None:
+            _require_same_mount(identity, expected_mount, str(name))
         return descriptor
     except LocalDeleteError:
+        if descriptor >= 0:
+            os.close(descriptor)
         raise
     except OSError as exc:
         if descriptor >= 0:
@@ -127,9 +191,16 @@ def _open_directory(
 def _open_bound_root(root: Path) -> tuple[int, EntryIdentity]:
     descriptor = _open_directory(root)
     try:
-        identity = _identity(os.fstat(descriptor))
-        path_metadata = os.stat(root, follow_symlinks=False)
-        _require_identity(path_metadata, identity, str(root))
+        identity = _descriptor_identity(descriptor, str(root))
+        path_descriptor = _open_directory(root)
+        try:
+            _require_identity(
+                _descriptor_identity(path_descriptor, str(root)),
+                identity,
+                str(root),
+            )
+        finally:
+            os.close(path_descriptor)
         return descriptor, identity
     except LocalDeleteError:
         os.close(descriptor)
@@ -141,12 +212,16 @@ def _open_bound_root(root: Path) -> tuple[int, EntryIdentity]:
 
 def _assert_bound_root(root: Path, descriptor: int, expected: EntryIdentity) -> None:
     try:
-        descriptor_metadata = os.fstat(descriptor)
-        path_metadata = os.stat(root, follow_symlinks=False)
+        descriptor_identity = _descriptor_identity(descriptor, str(root))
+        path_descriptor = _open_directory(root)
+        try:
+            path_identity = _descriptor_identity(path_descriptor, str(root))
+        finally:
+            os.close(path_descriptor)
     except OSError as exc:
         raise LocalDeleteError("current worktree root changed during deletion") from exc
-    _require_identity(descriptor_metadata, expected, str(root))
-    _require_identity(path_metadata, expected, str(root))
+    _require_identity(descriptor_identity, expected, str(root))
+    _require_identity(path_identity, expected, str(root))
 
 
 def _open_parent(
@@ -167,14 +242,14 @@ def _open_parent(
         except OSError as exc:
             raise LocalDeleteError("cannot duplicate bound worktree-root descriptor") from exc
     try:
-        actual_root = os.fstat(current)
-        _require_identity(actual_root, root_identity or _identity(actual_root), str(root))
-        bound_identity = root_identity or _identity(actual_root)
+        actual_root = _descriptor_identity(current, str(root))
+        bound_identity = root_identity or actual_root
+        _require_identity(actual_root, bound_identity, str(root))
         for component in parts[:-1]:
             next_descriptor = _open_directory(
                 component,
                 dir_fd=current,
-                expected_device=bound_identity.device,
+                expected_mount=bound_identity,
             )
             os.close(current)
             current = next_descriptor
@@ -188,8 +263,8 @@ def _entry_metadata(
     parent_fd: int,
     name: str,
     relative: str,
-    expected_device: int,
-) -> os.stat_result:
+    expected_mount: EntryIdentity,
+) -> tuple[os.stat_result, EntryIdentity]:
     try:
         metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError as exc:
@@ -198,11 +273,27 @@ def _entry_metadata(
         raise LocalDeleteError(f"cannot inspect target safely: {relative}") from exc
     if stat.S_ISLNK(metadata.st_mode):
         raise LocalDeleteError(f"symlink target is not permitted: {relative}")
-    if metadata.st_dev != expected_device:
-        raise LocalDeleteError(f"mounted path is not permitted: {relative}")
+    _require_linux_mount_identity()
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            name,
+            os.O_PATH | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        identity = _descriptor_identity(descriptor, relative)
+        _require_metadata_identity(metadata, identity, relative)
+        _require_same_mount(identity, expected_mount, relative)
+    except LocalDeleteError:
+        raise
+    except OSError as exc:
+        raise LocalDeleteError(f"cannot inspect target descriptor safely: {relative}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     if not (stat.S_ISREG(metadata.st_mode) or stat.S_ISDIR(metadata.st_mode)):
         raise LocalDeleteError(f"special-file target is not permitted: {relative}")
-    return metadata
+    return metadata, identity
 
 
 def _check_child_name(name: str, relative: str) -> None:
@@ -220,7 +311,7 @@ def _directory_names(directory_fd: int, relative: str, phase: str) -> list[str]:
 def _preflight_directory(
     directory_fd: int,
     relative: str,
-    expected_device: int,
+    expected_mount: EntryIdentity,
     snapshot: DirectorySnapshot,
 ) -> None:
     entries: dict[str, EntryIdentity] = {}
@@ -228,16 +319,21 @@ def _preflight_directory(
     for name in _directory_names(directory_fd, relative, "safely"):
         child = f"{relative}/{name}"
         _check_child_name(name, child)
-        metadata = _entry_metadata(directory_fd, name, child, expected_device)
-        entries[name] = _identity(metadata)
+        metadata, identity = _entry_metadata(directory_fd, name, child, expected_mount)
+        entries[name] = identity
         if stat.S_ISDIR(metadata.st_mode):
             child_fd = _open_directory(
                 name,
                 dir_fd=directory_fd,
-                expected_device=expected_device,
+                expected_mount=expected_mount,
             )
             try:
-                _preflight_directory(child_fd, child, expected_device, snapshot)
+                _require_identity(
+                    _descriptor_identity(child_fd, child),
+                    identity,
+                    child,
+                )
+                _preflight_directory(child_fd, child, expected_mount, snapshot)
             finally:
                 os.close(child_fd)
 
@@ -245,7 +341,7 @@ def _preflight_directory(
 def _revalidate_directory(
     directory_fd: int,
     relative: str,
-    expected_device: int,
+    expected_mount: EntryIdentity,
     snapshot: DirectorySnapshot,
 ) -> None:
     expected_entries = snapshot.get(relative)
@@ -256,17 +352,17 @@ def _revalidate_directory(
         raise LocalDeleteError(f"directory contents changed during deletion: {relative}")
     for name, expected in expected_entries.items():
         child = f"{relative}/{name}"
-        metadata = _entry_metadata(directory_fd, name, child, expected_device)
-        _require_identity(metadata, expected, child)
+        metadata, identity = _entry_metadata(directory_fd, name, child, expected_mount)
+        _require_identity(identity, expected, child)
         if stat.S_ISDIR(metadata.st_mode):
             child_fd = _open_directory(
                 name,
                 dir_fd=directory_fd,
-                expected_device=expected_device,
+                expected_mount=expected_mount,
             )
             try:
-                _require_identity(os.fstat(child_fd), expected, child)
-                _revalidate_directory(child_fd, child, expected_device, snapshot)
+                _require_identity(_descriptor_identity(child_fd, child), expected, child)
+                _revalidate_directory(child_fd, child, expected_mount, snapshot)
             finally:
                 os.close(child_fd)
 
@@ -276,20 +372,18 @@ def _open_file_for_delete(
     name: str,
     relative: str,
     expected: EntryIdentity,
-    expected_device: int,
+    expected_mount: EntryIdentity,
 ) -> int:
-    flags = (
-        getattr(os, "O_PATH", os.O_RDONLY)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-    )
+    _require_linux_mount_identity()
+    flags = os.O_PATH | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
     descriptor = -1
     try:
         descriptor = os.open(name, flags, dir_fd=parent_fd)
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_dev != expected_device:
+        identity = _descriptor_identity(descriptor, relative)
+        if not stat.S_ISREG(identity.mode):
             raise LocalDeleteError(f"file changed during deletion: {relative}")
-        _require_identity(metadata, expected, relative)
+        _require_same_mount(identity, expected_mount, relative)
+        _require_identity(identity, expected, relative)
         return descriptor
     except LocalDeleteError:
         if descriptor >= 0:
@@ -304,35 +398,41 @@ def _open_file_for_delete(
 def _delete_directory_contents(
     directory_fd: int,
     relative: str,
-    expected_device: int,
+    expected_mount: EntryIdentity,
     snapshot: DirectorySnapshot,
 ) -> None:
-    _revalidate_directory(directory_fd, relative, expected_device, snapshot)
+    _revalidate_directory(directory_fd, relative, expected_mount, snapshot)
     expected_entries = snapshot[relative]
     for name in list(expected_entries):
-        _revalidate_directory(directory_fd, relative, expected_device, snapshot)
+        _revalidate_directory(directory_fd, relative, expected_mount, snapshot)
         child = f"{relative}/{name}"
         expected = expected_entries.get(name)
         if expected is None:
             raise LocalDeleteError(f"directory contents changed during deletion: {relative}")
-        metadata = _entry_metadata(directory_fd, name, child, expected_device)
-        _require_identity(metadata, expected, child)
+        metadata, identity = _entry_metadata(directory_fd, name, child, expected_mount)
+        _require_identity(identity, expected, child)
         if stat.S_ISDIR(metadata.st_mode):
             child_fd = _open_directory(
                 name,
                 dir_fd=directory_fd,
-                expected_device=expected_device,
+                expected_mount=expected_mount,
             )
             try:
-                _require_identity(os.fstat(child_fd), expected, child)
-                _delete_directory_contents(child_fd, child, expected_device, snapshot)
-                _revalidate_directory(child_fd, child, expected_device, snapshot)
-                _require_identity(os.fstat(child_fd), expected, child)
+                _require_identity(_descriptor_identity(child_fd, child), expected, child)
+                _delete_directory_contents(child_fd, child, expected_mount, snapshot)
+                _revalidate_directory(child_fd, child, expected_mount, snapshot)
+                _require_identity(_descriptor_identity(child_fd, child), expected, child)
             finally:
                 os.close(child_fd)
             try:
+                _, current_identity = _entry_metadata(
+                    directory_fd,
+                    name,
+                    child,
+                    expected_mount,
+                )
                 _require_identity(
-                    _entry_metadata(directory_fd, name, child, expected_device),
+                    current_identity,
                     expected,
                     child,
                 )
@@ -345,11 +445,17 @@ def _delete_directory_contents(
                 name,
                 child,
                 expected,
-                expected_device,
+                expected_mount,
             )
             try:
+                _, current_identity = _entry_metadata(
+                    directory_fd,
+                    name,
+                    child,
+                    expected_mount,
+                )
                 _require_identity(
-                    _entry_metadata(directory_fd, name, child, expected_device),
+                    current_identity,
                     expected,
                     child,
                 )
@@ -359,7 +465,7 @@ def _delete_directory_contents(
             finally:
                 os.close(file_fd)
         del expected_entries[name]
-    _revalidate_directory(directory_fd, relative, expected_device, snapshot)
+    _revalidate_directory(directory_fd, relative, expected_mount, snapshot)
 
 
 def delete_target(
@@ -380,19 +486,24 @@ def delete_target(
     )
     try:
         relative = "/".join(parts)
-        metadata = _entry_metadata(parent_fd, name, relative, bound_root.device)
-        target_identity = _identity(metadata)
+        metadata, target_identity = _entry_metadata(parent_fd, name, relative, bound_root)
         if stat.S_ISREG(metadata.st_mode):
             file_fd = _open_file_for_delete(
                 parent_fd,
                 name,
                 relative,
                 target_identity,
-                bound_root.device,
+                bound_root,
             )
             try:
+                _, current_identity = _entry_metadata(
+                    parent_fd,
+                    name,
+                    relative,
+                    bound_root,
+                )
                 _require_identity(
-                    _entry_metadata(parent_fd, name, relative, bound_root.device),
+                    current_identity,
                     target_identity,
                     relative,
                 )
@@ -406,10 +517,14 @@ def delete_target(
         target_fd = _open_directory(
             name,
             dir_fd=parent_fd,
-            expected_device=bound_root.device,
+            expected_mount=bound_root,
         )
         try:
-            _require_identity(os.fstat(target_fd), target_identity, relative)
+            _require_identity(
+                _descriptor_identity(target_fd, relative),
+                target_identity,
+                relative,
+            )
             if not recursive:
                 names = _directory_names(target_fd, relative, "safely")
                 if names:
@@ -421,21 +536,27 @@ def delete_target(
                 # entry is removed. Deletion itself repeats the no-follow
                 # checks to keep the descriptor anchor across the mutation.
                 snapshot: DirectorySnapshot = {}
-                _preflight_directory(target_fd, relative, bound_root.device, snapshot)
+                _preflight_directory(target_fd, relative, bound_root, snapshot)
                 _delete_directory_contents(
                     target_fd,
                     relative,
-                    bound_root.device,
+                    bound_root,
                     snapshot,
                 )
-                _revalidate_directory(target_fd, relative, bound_root.device, snapshot)
-            _require_identity(os.fstat(target_fd), target_identity, relative)
+                _revalidate_directory(target_fd, relative, bound_root, snapshot)
+            _require_identity(_descriptor_identity(target_fd, relative), target_identity, relative)
         finally:
             os.close(target_fd)
 
         try:
+            _, current_identity = _entry_metadata(
+                parent_fd,
+                name,
+                relative,
+                bound_root,
+            )
             _require_identity(
-                _entry_metadata(parent_fd, name, relative, bound_root.device),
+                current_identity,
                 target_identity,
                 relative,
             )
