@@ -262,24 +262,40 @@ class LocalDeleteTest(unittest.TestCase):
             self.assertEqual(result["task"], "174")
             self.assertFalse(target.exists())
 
-    def test_guarded_delete_rejects_terminal_tasks(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory).resolve()
-            record = lifecycle.WorktreeRecord(root, "task/174-local-delete", "a" * 40)
-            with (
-                mock.patch.object(local_delete.lifecycle, "current_worktree", return_value=record),
-                mock.patch.object(
-                    local_delete.lifecycle, "state_path", return_value=root / "task.md"
-                ),
-                mock.patch.object(
-                    local_delete.lifecycle, "extract_identity_value", return_value="174"
-                ),
-                mock.patch.object(local_delete.lifecycle, "require_local_task", return_value=record),
-                mock.patch.object(local_delete.lifecycle, "require_resolved_contract"),
-                mock.patch.object(local_delete.lifecycle, "state_status", return_value="merged"),
-            ):
-                with self.assertRaisesRegex(local_delete.LocalDeleteError, "terminal"):
-                    local_delete.guarded_local_delete(root, ".build/default", True)
+    def test_guarded_delete_allows_only_the_explicit_implementing_state(self) -> None:
+        self.assertEqual(local_delete._MUTABLE_TASK_STATES, frozenset({"implementing"}))
+        rejected_states = sorted(
+            set(lifecycle.VALID_STATES) - local_delete._MUTABLE_TASK_STATES
+        )
+        for status in rejected_states:
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                record = lifecycle.WorktreeRecord(root, "task/174-local-delete", "a" * 40)
+                target = root / ".build" / "default"
+                target.mkdir(parents=True)
+                with (
+                    mock.patch.object(
+                        local_delete.lifecycle, "current_worktree", return_value=record
+                    ),
+                    mock.patch.object(
+                        local_delete.lifecycle, "state_path", return_value=root / "task.md"
+                    ),
+                    mock.patch.object(
+                        local_delete.lifecycle, "extract_identity_value", return_value="174"
+                    ),
+                    mock.patch.object(
+                        local_delete.lifecycle, "require_local_task", return_value=record
+                    ),
+                    mock.patch.object(local_delete.lifecycle, "require_resolved_contract"),
+                    mock.patch.object(
+                        local_delete.lifecycle, "state_status", return_value=status
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        local_delete.LocalDeleteError, "explicit mutable state"
+                    ):
+                        local_delete.guarded_local_delete(root, ".build/default", True)
+                self.assertTrue(target.exists())
 
 
 if __name__ == "__main__":

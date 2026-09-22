@@ -41,7 +41,7 @@ _PROTECTED_NAMES = frozenset(
         "opencode.json",
     }
 )
-_TERMINAL_TASK_STATES = {"merged", "cancelled"}
+_MUTABLE_TASK_STATES = frozenset({"implementing"})
 
 
 @dataclass(frozen=True)
@@ -589,8 +589,12 @@ def _require_task_worktree(
         if record != current:
             raise LocalDeleteError("Task worktree identity changed during validation")
         lifecycle.require_resolved_contract(record, task)
-        if lifecycle.state_status(state) in _TERMINAL_TASK_STATES:
-            raise LocalDeleteError("local-delete is unavailable for a terminal Task")
+        status = lifecycle.state_status(state)
+        if status not in _MUTABLE_TASK_STATES:
+            raise LocalDeleteError(
+                "local-delete requires the Task to be in an explicit mutable state "
+                f"({', '.join(sorted(_MUTABLE_TASK_STATES))}); found {status}"
+            )
         _assert_bound_root(root, root_fd, root_identity)
         return record, task, root_fd, root_identity
     except BaseException:
