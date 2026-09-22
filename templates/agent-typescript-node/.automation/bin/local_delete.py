@@ -568,52 +568,75 @@ def delete_target(
         os.close(parent_fd)
 
 
-def _require_task_worktree(
+def _resolve_task_candidate(
     root: Path,
-) -> tuple[lifecycle.WorktreeRecord, str, int, EntryIdentity]:
-    """Revalidate Task identity immediately before the destructive operation."""
+) -> tuple[Path, lifecycle.WorktreeRecord, str]:
+    """Resolve only enough trusted identity to locate the canonical lifecycle lock."""
     root = root.resolve(strict=True)
-    root_fd, root_identity = _open_bound_root(root)
+    current = lifecycle.current_worktree(root)
+    if current.path != root:
+        raise LocalDeleteError("local-delete must run from the exact current Task worktree")
+    state = lifecycle.state_path(root)
     try:
-        current = lifecycle.current_worktree(root)
-        if current.path != root:
-            raise LocalDeleteError("local-delete must run from the exact current Task worktree")
-        state = lifecycle.state_path(root)
-        try:
-            task = lifecycle.extract_identity_value(state, "Task ID")
-        except (OSError, UnicodeError) as exc:
-            raise LocalDeleteError("local-delete requires an identified Task worktree") from exc
-        if not task:
-            raise LocalDeleteError("local-delete requires an identified Task worktree")
-        record = lifecycle.require_local_task(root, task)
-        if record != current:
-            raise LocalDeleteError("Task worktree identity changed during validation")
-        lifecycle.require_resolved_contract(record, task)
-        status = lifecycle.state_status(state)
-        if status not in _MUTABLE_TASK_STATES:
-            raise LocalDeleteError(
-                "local-delete requires the Task to be in an explicit mutable state "
-                f"({', '.join(sorted(_MUTABLE_TASK_STATES))}); found {status}"
-            )
-        _assert_bound_root(root, root_fd, root_identity)
-        return record, task, root_fd, root_identity
-    except BaseException:
-        os.close(root_fd)
-        raise
+        task = lifecycle.extract_identity_value(state, "Task ID")
+    except (OSError, UnicodeError) as exc:
+        raise LocalDeleteError("local-delete requires an identified Task worktree") from exc
+    if not task:
+        raise LocalDeleteError("local-delete requires an identified Task worktree")
+    record = lifecycle.require_local_task(root, task)
+    if record != current:
+        raise LocalDeleteError("Task worktree identity changed during lock resolution")
+    return root, record, task
+
+
+def _require_locked_mutable_task(
+    root: Path,
+    candidate: lifecycle.WorktreeRecord,
+    candidate_task: str,
+) -> tuple[lifecycle.WorktreeRecord, str, int, EntryIdentity]:
+    """Revalidate all mutation authority after the canonical lifecycle lock is held."""
+    current = lifecycle.current_worktree(root)
+    if current.path != root:
+        raise LocalDeleteError("local-delete must run from the exact current Task worktree")
+    state = lifecycle.state_path(root)
+    try:
+        task = lifecycle.extract_identity_value(state, "Task ID")
+    except (OSError, UnicodeError) as exc:
+        raise LocalDeleteError("local-delete requires an identified Task worktree") from exc
+    if not task or task != candidate_task:
+        raise LocalDeleteError("Task identity changed while acquiring the lifecycle lock")
+    record = lifecycle.require_local_task(root, task)
+    if record != current or record != candidate:
+        raise LocalDeleteError("Task worktree identity changed while holding the lifecycle lock")
+    lifecycle.require_resolved_contract(record, task)
+    status = lifecycle.state_status(state)
+    if status not in _MUTABLE_TASK_STATES:
+        raise LocalDeleteError(
+            "local-delete requires the Task to be in an explicit mutable state "
+            f"({', '.join(sorted(_MUTABLE_TASK_STATES))}); found {status}"
+        )
+    root_fd, root_identity = _open_bound_root(root)
+    return record, task, root_fd, root_identity
 
 
 def guarded_local_delete(root: Path, raw_target: str, recursive: bool) -> dict[str, object]:
-    record, task, root_fd, root_identity = _require_task_worktree(root)
-    try:
-        target = delete_target(
-            record.path,
-            raw_target,
-            recursive,
-            root_fd=root_fd,
-            root_identity=root_identity,
+    root, candidate, candidate_task = _resolve_task_candidate(root)
+    with lifecycle.work_units_lock(candidate):
+        record, task, root_fd, root_identity = _require_locked_mutable_task(
+            root,
+            candidate,
+            candidate_task,
         )
-    finally:
-        os.close(root_fd)
+        try:
+            target = delete_target(
+                record.path,
+                raw_target,
+                recursive,
+                root_fd=root_fd,
+                root_identity=root_identity,
+            )
+        finally:
+            os.close(root_fd)
     return {
         "task": task,
         "worktree": str(record.path),

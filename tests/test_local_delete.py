@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from contextlib import contextmanager, nullcontext
 import importlib.util
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -26,6 +28,38 @@ local_delete = load_module("local_delete", BIN / "local_delete.py")
 
 
 class LocalDeleteTest(unittest.TestCase):
+    @staticmethod
+    def _write_task_state(root: Path, status: str = "implementing") -> Path:
+        state_directory = root / ".task-state"
+        state_directory.mkdir()
+        state = state_directory / "task.md"
+        state.write_text(
+            "\n".join(
+                (
+                    "# Task State",
+                    "",
+                    "- Task ID: 174",
+                    "- Branch: task/174-local-delete",
+                    f"- Worktree: {root}",
+                    "",
+                    "## Current state",
+                    "",
+                    f"- Status: {status}",
+                    "",
+                    "## Evidence",
+                    "",
+                    "None yet.",
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+        return state
+
+    @staticmethod
+    def _task_record(root: Path) -> lifecycle.WorktreeRecord:
+        return lifecycle.WorktreeRecord(root.resolve(), "task/174-local-delete", "a" * 40)
+
     def test_target_parser_rejects_root_escape_and_shell_syntax(self) -> None:
         for raw in (
             ".",
@@ -254,6 +288,9 @@ class LocalDeleteTest(unittest.TestCase):
                 mock.patch.object(local_delete.lifecycle, "require_local_task", return_value=record),
                 mock.patch.object(local_delete.lifecycle, "require_resolved_contract"),
                 mock.patch.object(local_delete.lifecycle, "state_status", return_value="implementing"),
+                mock.patch.object(
+                    local_delete.lifecycle, "work_units_lock", return_value=nullcontext()
+                ),
             ):
                 target = root / ".build" / "default"
                 target.mkdir(parents=True)
@@ -290,12 +327,125 @@ class LocalDeleteTest(unittest.TestCase):
                     mock.patch.object(
                         local_delete.lifecycle, "state_status", return_value=status
                     ),
+                    mock.patch.object(
+                        local_delete.lifecycle, "work_units_lock", return_value=nullcontext()
+                    ),
                 ):
                     with self.assertRaisesRegex(
                         local_delete.LocalDeleteError, "explicit mutable state"
                     ):
                         local_delete.guarded_local_delete(root, ".build/default", True)
                 self.assertTrue(target.exists())
+
+    def test_delete_holds_canonical_lock_until_mutation_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            state = self._write_task_state(root)
+            record = self._task_record(root)
+            target = root / ".build" / "default"
+            target.mkdir(parents=True)
+            (target / "artifact").write_text("artifact", encoding="utf-8")
+            delete_paused = threading.Event()
+            resume_delete = threading.Event()
+            transition_started = threading.Event()
+            transition_lock_acquired = threading.Event()
+            local_errors: list[BaseException] = []
+            transition_errors: list[BaseException] = []
+            local_result: list[dict[str, object]] = []
+            original_delete = local_delete.delete_target
+            original_work_units_lock = lifecycle.work_units_lock
+
+            @contextmanager
+            def tracked_work_units_lock(locked_record: lifecycle.WorktreeRecord):
+                with original_work_units_lock(locked_record) as directory_fd:
+                    if transition_started.is_set():
+                        transition_lock_acquired.set()
+                    yield directory_fd
+
+            def paused_delete(*args, **kwargs):
+                delete_paused.set()
+                if not resume_delete.wait(5):
+                    raise AssertionError("delete did not receive its resume signal")
+                return original_delete(*args, **kwargs)
+
+            def run_delete() -> None:
+                try:
+                    local_result.append(
+                        local_delete.guarded_local_delete(root, ".build/default", True)
+                    )
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    local_errors.append(exc)
+
+            def run_transition() -> None:
+                try:
+                    transition_started.set()
+                    lifecycle.task_state_set(root, "174", "verification-pending")
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    transition_errors.append(exc)
+
+            with (
+                mock.patch.object(local_delete.lifecycle, "current_worktree", return_value=record),
+                mock.patch.object(local_delete.lifecycle, "require_local_task", return_value=record),
+                mock.patch.object(local_delete.lifecycle, "require_resolved_contract"),
+                mock.patch.object(local_delete.lifecycle, "assert_task_identity"),
+                mock.patch.object(local_delete.lifecycle, "work_units_lock", tracked_work_units_lock),
+                mock.patch.object(local_delete, "delete_target", side_effect=paused_delete),
+            ):
+                delete_thread = threading.Thread(target=run_delete)
+                transition_thread = threading.Thread(target=run_transition)
+                delete_thread.start()
+                self.assertTrue(delete_paused.wait(5))
+                self.assertEqual(lifecycle.state_status(state), "implementing")
+                transition_thread.start()
+                self.assertTrue(transition_started.is_set())
+                self.assertFalse(transition_lock_acquired.wait(0.2))
+                resume_delete.set()
+                delete_thread.join(5)
+                transition_thread.join(5)
+
+            self.assertFalse(delete_thread.is_alive())
+            self.assertFalse(transition_thread.is_alive())
+            self.assertEqual(local_errors, [])
+            self.assertEqual(transition_errors, [])
+            self.assertEqual(local_result[0]["status"], "deleted")
+            self.assertTrue(transition_lock_acquired.is_set())
+            self.assertFalse(target.exists())
+            self.assertEqual(lifecycle.state_status(state), "verification-pending")
+
+    def test_transition_wins_lock_and_local_delete_revalidates_fresh_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            state = self._write_task_state(root)
+            record = self._task_record(root)
+            target = root / ".build" / "default"
+            target.mkdir(parents=True)
+            artifact = target / "artifact"
+            artifact.write_text("artifact", encoding="utf-8")
+            transition_errors: list[BaseException] = []
+
+            def run_transition() -> None:
+                try:
+                    lifecycle.task_state_set(root, "174", "verification-pending")
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    transition_errors.append(exc)
+
+            with (
+                mock.patch.object(local_delete.lifecycle, "current_worktree", return_value=record),
+                mock.patch.object(local_delete.lifecycle, "require_local_task", return_value=record),
+                mock.patch.object(local_delete.lifecycle, "require_resolved_contract"),
+                mock.patch.object(local_delete.lifecycle, "assert_task_identity"),
+            ):
+                transition_thread = threading.Thread(target=run_transition)
+                transition_thread.start()
+                transition_thread.join(5)
+                self.assertFalse(transition_thread.is_alive())
+                self.assertEqual(transition_errors, [])
+                self.assertEqual(lifecycle.state_status(state), "verification-pending")
+                with self.assertRaisesRegex(local_delete.LocalDeleteError, "explicit mutable state"):
+                    local_delete.guarded_local_delete(root, ".build/default", True)
+
+            self.assertTrue(target.exists())
+            self.assertTrue(artifact.exists())
 
 
 if __name__ == "__main__":
