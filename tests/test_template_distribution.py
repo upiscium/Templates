@@ -88,6 +88,15 @@ class TemplateDistributionTest(unittest.TestCase):
                 (destination / "LICENSE").read_bytes(),
                 (ROOT / "components" / "agent-core" / "LICENSE").read_bytes(),
             )
+            self.assertEqual(
+                (destination / "opencode-contract-permissions.toml").read_bytes(),
+                (
+                    ROOT
+                    / "templates"
+                    / "agent-python"
+                    / "opencode-contract-permissions.toml"
+                ).read_bytes(),
+            )
 
             source_mode = (ROOT / "templates" / "agent-python" / ".automation" / "bin" / "agent_core.py").stat().st_mode
             target_mode = (destination / ".automation" / "bin" / "agent_core.py").stat().st_mode

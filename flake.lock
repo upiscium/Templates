@@ -41,11 +41,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1789570020,
-        "narHash": "sha256-G63vX8ezbKHjuTfFDzCOde79283xh/WNkkjmXQziB+g=",
+        "lastModified": 1789994405,
+        "narHash": "sha256-iE3slAUjjp+K0qqvXmJFGNzYhuUKAG+UkIC+m6uQttA=",
         "owner": "upiscium",
         "repo": "OpencodeContract",
-        "rev": "8c718bfebd835e3b2192b8c675319fe655c6ebce",
+        "rev": "edbe4e553e8de183acc11578dd485a5f97917338",
         "type": "github"
       },
       "original": {

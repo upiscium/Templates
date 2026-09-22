@@ -129,7 +129,9 @@
       "gh issue edit *": "deny",
       "gh release *": "deny",
       "sudo *": "deny",
+      "rm *": "deny",
       "rm -rf *": "deny",
+      "rmdir *": "deny",
       "nix store delete *": "deny"
     }
   }
