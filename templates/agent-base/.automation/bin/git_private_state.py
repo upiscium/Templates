@@ -1,7 +1,7 @@
 """Owned, fail-closed storage for Agent Core's Git-private runtime state."""
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 import fcntl
 import hashlib
@@ -881,6 +881,7 @@ def _scan_admin_legacy(layout: Topology) -> list[tuple[Path, Path]]:
     kind = _namespace_kind(root, foreign_regular=True)
     if kind != "directory":
         return []
+    _require_legacy_dir(root, "legacy private-state directory")
     entries = list(root.iterdir())
     if any(entry.name != "automation-maintenance" for entry in entries):
         unknown = next(entry for entry in entries if entry.name != "automation-maintenance")
@@ -1126,6 +1127,70 @@ def _inspect_pairs(pairs: list[tuple[Path, Path]]) -> list[MigrationFile]:
     return inspected
 
 
+def _reject_unlocked_admin_migration(
+    pairs: list[tuple[Path, Path]], layout: Topology, *, admin: bool
+) -> None:
+    if admin or layout.admin_is_common:
+        return
+    target = next(
+        (
+            target
+            for _, target in pairs
+            if target.parent.parent == layout.admin / NAMESPACE
+        ),
+        None,
+    )
+    if target is not None:
+        raise GitPrivateStateError(
+            f"admin-scoped private-state migration requires admin=True: {target}"
+        )
+
+
+def _durably_validate_canonical(item: MigrationFile) -> tuple[int, int]:
+    """Validate and durably re-publish a canonical destination before source removal."""
+    parent_fd = _open_anchored_parent(item.target)
+    descriptor: int | None = None
+    try:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        descriptor = os.open(item.target.name, flags, dir_fd=parent_fd)
+        metadata = _require_canonical_file_descriptor(
+            descriptor, item.target, "canonical private-state record"
+        )
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if (metadata.st_dev, metadata.st_ino, metadata.st_size) != (
+            after.st_dev, after.st_ino, after.st_size
+        ):
+            raise GitPrivateStateError(
+                f"canonical private-state record changed while reading: {item.target}"
+            )
+        if b"".join(chunks) != item.content:
+            raise GitPrivateStateError(f"canonical private-state record changed: {item.target}")
+        os.fsync(descriptor)
+        os.fsync(parent_fd)
+        return after.st_dev, after.st_ino
+    except GitPrivateStateError:
+        raise
+    except OSError as exc:
+        raise GitPrivateStateError(
+            f"cannot durably validate canonical private-state record: {item.target}"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent_fd)
+
+
 def _exclusive_publish(path: Path, content: bytes, mode: int) -> tuple[int, int]:
     parent_fd = _open_anchored_parent(path)
     temporary = f".migrate.{os.getpid()}.{secrets.token_hex(8)}"
@@ -1258,14 +1323,34 @@ def exclusive_write_bytes(
         return _exclusive_publish(path, content, 0o600)
 
 
-def _identity_unlink(item: MigrationFile) -> None:
+def _identity_unlink(item: MigrationFile, expected_target_identity: tuple[int, int]) -> None:
     if read_bytes(item.source, "legacy private-state record") != item.content:
         raise GitPrivateStateError(f"legacy private-state record changed: {item.source}")
     metadata = _require_legacy_record(item.source, "legacy private-state record")
     if (metadata.st_dev, metadata.st_ino) != item.identity:
         raise GitPrivateStateError(f"legacy private-state identity changed: {item.source}")
-    parent_fd = _open_anchored_parent(item.source)
+    target_parent_fd: int | None = None
+    parent_fd: int | None = None
     try:
+        target_parent_fd = _open_anchored_parent(item.target)
+        parent_fd = _open_anchored_parent(item.source)
+        try:
+            target_metadata = os.stat(
+                item.target.name, dir_fd=target_parent_fd, follow_symlinks=False
+            )
+        except OSError as exc:
+            raise GitPrivateStateError(
+                f"canonical private-state record identity changed: {item.target}"
+            ) from exc
+        if (
+            not stat.S_ISREG(target_metadata.st_mode)
+            or target_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(target_metadata.st_mode) != 0o600
+            or (target_metadata.st_dev, target_metadata.st_ino) != expected_target_identity
+        ):
+            raise GitPrivateStateError(
+                f"canonical private-state record identity changed: {item.target}"
+            )
         current = os.stat(item.source.name, dir_fd=parent_fd, follow_symlinks=False)
         if (current.st_dev, current.st_ino) != item.identity or not stat.S_ISREG(current.st_mode):
             raise GitPrivateStateError(f"legacy private-state identity changed: {item.source}")
@@ -1276,7 +1361,10 @@ def _identity_unlink(item: MigrationFile) -> None:
     except OSError as exc:
         raise GitPrivateStateError(f"cannot remove legacy private-state record: {item.source}") from exc
     finally:
-        os.close(parent_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        if target_parent_fd is not None:
+            os.close(target_parent_fd)
 
 
 def _handoff_cleanup_lock(
@@ -1286,9 +1374,11 @@ def _handoff_cleanup_lock(
     _require_owned_mode(legacy, legacy_meta, 0o600, "legacy cleanup lock")
     if (legacy_meta.st_dev, legacy_meta.st_ino) != expected_identity:
         raise GitPrivateStateError(f"legacy cleanup lock identity changed: {legacy}")
-    legacy_parent_fd = _open_anchored_parent(legacy)
-    canonical_parent_fd = _open_anchored_parent(canonical)
-    try:
+    with ExitStack() as stack:
+        legacy_parent_fd = _open_anchored_parent(legacy)
+        stack.callback(os.close, legacy_parent_fd)
+        canonical_parent_fd = _open_anchored_parent(canonical)
+        stack.callback(os.close, canonical_parent_fd)
         legacy_fd = os.open(
             legacy.name,
             os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
@@ -1302,9 +1392,6 @@ def _handoff_cleanup_lock(
             os.fsync(legacy_fd)
         finally:
             os.close(legacy_fd)
-    finally:
-        os.close(legacy_parent_fd)
-    try:
         try:
             canonical_meta = os.stat(
                 canonical.name, dir_fd=canonical_parent_fd, follow_symlinks=False
@@ -1325,6 +1412,46 @@ def _handoff_cleanup_lock(
                     "BLOCKED: legacy and canonical cleanup locks use different inodes; "
                     "automatic cutover cannot prove a single cleanup fence"
                 )
+            canonical_fd: int | None = None
+            try:
+                canonical_fd = os.open(
+                    canonical.name,
+                    os.O_RDWR
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=canonical_parent_fd,
+                )
+                opened = _require_canonical_file_descriptor(
+                    canonical_fd, canonical, "canonical cleanup lock"
+                )
+                if (opened.st_dev, opened.st_ino) != expected_identity:
+                    raise GitPrivateStateError(
+                        "BLOCKED: legacy and canonical cleanup locks use different inodes; "
+                        "automatic cutover cannot prove a single cleanup fence"
+                    )
+                os.fsync(canonical_fd)
+                os.fsync(canonical_parent_fd)
+                try:
+                    published = os.stat(
+                        canonical.name, dir_fd=canonical_parent_fd, follow_symlinks=False
+                    )
+                except OSError as exc:
+                    raise GitPrivateStateError(
+                        f"canonical cleanup lock identity changed during handoff: {canonical}"
+                    ) from exc
+                if (published.st_dev, published.st_ino) != expected_identity:
+                    raise GitPrivateStateError(
+                        f"canonical cleanup lock identity changed during handoff: {canonical}"
+                    )
+            except GitPrivateStateError:
+                raise
+            except OSError as exc:
+                raise GitPrivateStateError(
+                    f"cannot durably validate canonical cleanup lock: {canonical}"
+                ) from exc
+            finally:
+                if canonical_fd is not None:
+                    os.close(canonical_fd)
         else:
             try:
                 source_fd = _open_anchored_parent(legacy)
@@ -1350,8 +1477,6 @@ def _handoff_cleanup_lock(
                 raise GitPrivateStateError(
                     f"cannot establish cleanup lock handoff: {canonical}"
                 ) from exc
-    finally:
-        os.close(canonical_parent_fd)
     return expected_identity
 
 
@@ -1436,6 +1561,30 @@ def _ensure_legacy_cleanup_lock_alias(
             "BLOCKED: legacy and canonical cleanup locks use different inodes; "
             "automatic cutover cannot prove a single cleanup fence"
         )
+
+
+def _validate_held_cleanup_lock_paths(
+    paths: tuple[Path, ...], expected_identity: tuple[int, int]
+) -> None:
+    if not paths:
+        raise GitPrivateStateError("held cleanup lock paths are missing")
+    for path in dict.fromkeys(paths):
+        if _namespace_marker(path)[1] == NAMESPACE:
+            metadata = _require_canonical_file(path, "canonical cleanup lock")
+        else:
+            metadata = _require_regular(path, "legacy cleanup lock")
+            _require_owned_mode(path, metadata, 0o600, "legacy cleanup lock")
+            if metadata.st_mode & 0o111:
+                raise GitPrivateStateError(f"unsafe legacy cleanup lock mode: {path}")
+        if (metadata.st_dev, metadata.st_ino) != expected_identity:
+            raise GitPrivateStateError(f"cleanup lock identity changed: {path}")
+
+
+def _cleanup_lock_paths(layout: Topology, canonical: Path) -> tuple[Path, ...]:
+    legacy_root = layout.common / LEGACY_NAMESPACE
+    if _namespace_kind(legacy_root, foreign_regular=True) == "foreign":
+        return (canonical,)
+    return (canonical, legacy_root / "cleanup.lock")
 
 
 def _remove_known_empty_legacy_directories(layout: Topology) -> None:
@@ -1524,6 +1673,7 @@ def prepare(
     common_dir: Path | None = None,
     admin_dir: Path | None = None,
     _legacy_lock_identity: tuple[int, int] | None = None,
+    _held_cleanup_lock_paths: tuple[Path, ...] | None = None,
     _allow_incomplete_recovery: bool = False,
 ) -> None:
     """Validate and migrate known legacy state before a state mutation."""
@@ -1532,10 +1682,31 @@ def prepare(
         if common_dir is not None
         else topology(root)
     )
+    if _legacy_lock_identity is not None:
+        _validate_held_cleanup_lock_paths(
+            _held_cleanup_lock_paths or (), _legacy_lock_identity
+        )
     _validate_canonical(layout, allow_incomplete_recovery=_allow_incomplete_recovery)
     shared_pairs, legacy_lock = _scan_shared_legacy(layout)
-    pairs = shared_pairs + (_scan_admin_legacy(layout) if admin else [])
+    admin_pairs = _scan_admin_legacy(layout) if not layout.admin_is_common else []
+    pairs = shared_pairs + (admin_pairs if admin else [])
+    _reject_unlocked_admin_migration(shared_pairs + admin_pairs, layout, admin=admin)
     _inspect_pairs(pairs)  # preflight before creating even the migration lock
+    if legacy_lock is None and _legacy_lock_identity is None:
+        _ensure_namespace(layout.common, ())
+        canonical = layout.common / NAMESPACE / "cleanup.lock"
+        with _file_lock(canonical, create=True, exact=True) as canonical_identity:
+            _ensure_legacy_cleanup_lock_alias(layout, canonical, canonical_identity)
+            prepare(
+                root,
+                admin=admin,
+                common_dir=layout.common,
+                admin_dir=layout.admin,
+                _legacy_lock_identity=canonical_identity,
+                _held_cleanup_lock_paths=_cleanup_lock_paths(layout, canonical),
+                _allow_incomplete_recovery=_allow_incomplete_recovery,
+            )
+        return
     if legacy_lock is not None and _legacy_lock_identity is None:
         legacy_metadata = _require_regular(legacy_lock, "legacy cleanup lock")
         _require_owned_mode(legacy_lock, legacy_metadata, 0o600, "legacy cleanup lock")
@@ -1551,6 +1722,7 @@ def prepare(
                 common_dir=layout.common,
                 admin_dir=layout.admin,
                 _legacy_lock_identity=lock_identity,
+                _held_cleanup_lock_paths=(legacy_lock,),
                 _allow_incomplete_recovery=_allow_incomplete_recovery,
             )
         return
@@ -1558,6 +1730,8 @@ def prepare(
     _preflight_cleanup_lock_handoff(
         legacy_lock, layout.common / NAMESPACE / "cleanup.lock"
     )
+    if _legacy_lock_identity is None:
+        raise GitPrivateStateError("cleanup lock is not held for migration")
     _ensure_namespace(layout.common, ())
     admin_lock_context = nullcontext()
     if admin and not layout.admin_is_common:
@@ -1568,6 +1742,9 @@ def prepare(
     with _file_lock(
         layout.common / NAMESPACE / "migration.lock", create=True, exact=True
     ), admin_lock_context:
+        _validate_held_cleanup_lock_paths(
+            _held_cleanup_lock_paths, _legacy_lock_identity
+        )
         # Repeat all classification under the migration lock.
         _recover_canonical_temps(layout, include_admin=admin)
         _validate_canonical(layout, allow_incomplete_recovery=_allow_incomplete_recovery)
@@ -1581,7 +1758,11 @@ def prepare(
         ):
             raise GitPrivateStateError("legacy cleanup lock changed during migration")
         shared_pairs, legacy_lock = rescanned_pairs, rescanned_legacy_lock
-        pairs = shared_pairs + (_scan_admin_legacy(layout) if admin else [])
+        admin_pairs = _scan_admin_legacy(layout) if not layout.admin_is_common else []
+        _reject_unlocked_admin_migration(
+            shared_pairs + admin_pairs, layout, admin=admin
+        )
+        pairs = shared_pairs + (admin_pairs if admin else [])
         inspected = _inspect_pairs(pairs)
         for name in SHARED_DIRS:
             _ensure_namespace(layout.common, (name,))
@@ -1595,6 +1776,13 @@ def prepare(
                 layout.common / NAMESPACE / "cleanup.lock",
                 _legacy_lock_identity,
             )
+        removal_lock_paths = list(_held_cleanup_lock_paths or ())
+        removal_lock_paths.append(layout.common / NAMESPACE / "cleanup.lock")
+        if legacy_lock is not None:
+            removal_lock_paths.append(legacy_lock)
+        _validate_held_cleanup_lock_paths(
+            tuple(removal_lock_paths), _legacy_lock_identity
+        )
         for item in inspected:
             try:
                 item.target.lstat()
@@ -1602,18 +1790,20 @@ def prepare(
                 _exclusive_publish(item.target, item.content, 0o600)
         _validate_canonical(layout, allow_incomplete_recovery=_allow_incomplete_recovery)
         # No source is removed until every destination is durable and equivalent.
+        target_identities: dict[Path, tuple[int, int]] = {}
         for item in inspected:
-            _require_canonical_file(item.target, "canonical private-state record")
-            if read_bytes(item.target, "canonical private-state record") != item.content:
-                raise GitPrivateStateError(f"canonical private-state record changed: {item.target}")
+            target_identities[item.source] = _durably_validate_canonical(item)
         for item in inspected:
             metadata = _require_legacy_record(item.source, "legacy private-state record")
             if (metadata.st_dev, metadata.st_ino) != item.identity or read_bytes(
                 item.source, "legacy private-state record"
             ) != item.content:
                 raise GitPrivateStateError(f"legacy private-state record changed: {item.source}")
+        _validate_held_cleanup_lock_paths(
+            tuple(removal_lock_paths), _legacy_lock_identity
+        )
         for item in inspected:
-            _identity_unlink(item)
+            _identity_unlink(item, target_identities[item.source])
         _remove_known_empty_legacy_directories(layout)
 
 
@@ -1769,6 +1959,7 @@ def cleanup_lock(root: Path):
                 common_dir=layout.common,
                 admin_dir=layout.admin,
                 _legacy_lock_identity=legacy_identity,
+                _held_cleanup_lock_paths=(legacy,),
             )
             # The legacy descriptor and canonical path now name the same inode.
             yield
@@ -1783,5 +1974,6 @@ def cleanup_lock(root: Path):
             common_dir=layout.common,
             admin_dir=layout.admin,
             _legacy_lock_identity=canonical_identity,
+            _held_cleanup_lock_paths=_cleanup_lock_paths(layout, canonical),
         )
         yield
