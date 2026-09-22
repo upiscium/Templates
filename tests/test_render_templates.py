@@ -96,6 +96,16 @@ class RenderTemplatesTest(unittest.TestCase):
             ["missing: .opencode/agents/plan.md"],
         )
 
+    def test_check_detects_missing_generated_permission_manifest(self) -> None:
+        manifest = self.root / "components" / "agent-core" / "opencode-contract-permissions.toml"
+        manifest.write_text("profile = \"agent-core\"\n", encoding="utf-8")
+        output = render_template(self.root, self.spec())
+        (output / "opencode-contract-permissions.toml").unlink()
+        self.assertEqual(
+            check_template(self.root, self.spec()),
+            ["missing: opencode-contract-permissions.toml"],
+        )
+
     def test_minimum_just_version_stays_in_sync(self) -> None:
         root = Path(__file__).resolve().parents[1]
         paths = [root / "Justfile", root / "components" / "agent-core" / "Justfile"]

@@ -38,7 +38,7 @@ class OpencodeContractIntegrationTest(unittest.TestCase):
         node = self.lock["nodes"]["opencodeContract"]
         self.assertEqual("upiscium", node["locked"]["owner"])
         self.assertEqual("OpencodeContract", node["locked"]["repo"])
-        self.assertEqual("8c718bfebd835e3b2192b8c675319fe655c6ebce", node["locked"]["rev"])
+        self.assertEqual("edbe4e553e8de183acc11578dd485a5f97917338", node["locked"]["rev"])
         self.assertEqual("github", node["locked"]["type"])
         self.assertRegex(node["locked"]["rev"], r"^[0-9a-f]{40}$")
         self.assertEqual(["nixpkgs"], node["inputs"]["nixpkgs"])
