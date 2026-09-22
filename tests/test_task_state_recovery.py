@@ -525,6 +525,10 @@ class TaskStateRecoveryTest(unittest.TestCase):
                 "merged",
                 lambda raw: [[{**raw, "state": "closed", "merged_at": "2026-01-01T00:00:00Z"}]],
             ),
+            (
+                "missing-merged-at",
+                lambda raw: [[{key: value for key, value in raw.items() if key != "merged_at"}]],
+            ),
             ("empty-merged-at", lambda raw: [[{**raw, "merged_at": ""}]]),
             ("malformed-merged-at", lambda raw: [[{**raw, "merged_at": "not-a-timestamp"}]]),
             ("ready", lambda raw: [[{**raw, "draft": False}]]),
