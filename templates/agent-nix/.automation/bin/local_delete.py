@@ -593,6 +593,7 @@ def _require_locked_mutable_task(
     root: Path,
     candidate: lifecycle.WorktreeRecord,
     candidate_task: str,
+    directory_fd: int,
 ) -> tuple[lifecycle.WorktreeRecord, str, int, EntryIdentity]:
     """Revalidate all mutation authority after the canonical lifecycle lock is held."""
     current = lifecycle.current_worktree(root)
@@ -608,7 +609,7 @@ def _require_locked_mutable_task(
     record = lifecycle.require_local_task(root, task)
     if record != current or record != candidate:
         raise LocalDeleteError("Task worktree identity changed while holding the lifecycle lock")
-    lifecycle.require_resolved_contract(record, task)
+    lifecycle.require_resolved_contract(record, task, directory_fd=directory_fd)
     status = lifecycle.state_status(state)
     if status not in _MUTABLE_TASK_STATES:
         raise LocalDeleteError(
@@ -621,11 +622,12 @@ def _require_locked_mutable_task(
 
 def guarded_local_delete(root: Path, raw_target: str, recursive: bool) -> dict[str, object]:
     root, candidate, candidate_task = _resolve_task_candidate(root)
-    with lifecycle.work_units_lock(candidate):
+    with lifecycle.work_units_lock(candidate) as directory_fd:
         record, task, root_fd, root_identity = _require_locked_mutable_task(
             root,
             candidate,
             candidate_task,
+            directory_fd,
         )
         try:
             target = delete_target(

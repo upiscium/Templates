@@ -24,6 +24,7 @@ def load_module(name: str, path: Path):
 
 
 lifecycle = load_module("task_lifecycle", BIN / "task_lifecycle.py")
+task_contract = load_module("task_contract", BIN / "task_contract.py")
 local_delete = load_module("local_delete", BIN / "local_delete.py")
 
 
@@ -336,6 +337,69 @@ class LocalDeleteTest(unittest.TestCase):
                     ):
                         local_delete.guarded_local_delete(root, ".build/default", True)
                 self.assertTrue(target.exists())
+
+    def test_locked_contract_validation_reuses_the_canonical_lock_fd(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            state = self._write_task_state(root)
+            headings = (
+                "Purpose",
+                "Scope",
+                "Prohibited changes",
+                "Dependencies",
+                "Acceptance criteria",
+                "Test plan",
+                "Stop conditions",
+                "Coordination surfaces",
+                "External resources",
+            )
+            state.write_text(
+                state.read_text(encoding="utf-8")
+                + "\n"
+                + "\n".join(f"## {heading}\n\ncontent" for heading in headings)
+                + "\n\ncanonical-contract sha256="
+                + "a" * 64
+                + " issue=174\n",
+                encoding="utf-8",
+            )
+            (root / ".task-state" / "contract.json").write_text("{}\n", encoding="utf-8")
+            record = self._task_record(root)
+            captured_directory_fds: list[int] = []
+
+            def validate_locked(
+                locked_root: Path,
+                locked_task: str,
+                *,
+                require_pristine: bool,
+                directory_fd: int,
+            ) -> dict[str, str]:
+                self.assertEqual(locked_root, root)
+                self.assertEqual(locked_task, "174")
+                self.assertFalse(require_pristine)
+                captured_directory_fds.append(directory_fd)
+                return {"status": "READY"}
+
+            with (
+                mock.patch.object(
+                    task_contract,
+                    "_validate_contract_locked",
+                    side_effect=validate_locked,
+                ),
+                mock.patch.object(
+                    task_contract,
+                    "contract_state_lock",
+                    side_effect=AssertionError("nested contract lock"),
+                ),
+            ):
+                with lifecycle.work_units_lock(record) as directory_fd:
+                    lifecycle.require_resolved_contract(
+                        record,
+                        "174",
+                        directory_fd=directory_fd,
+                    )
+
+            self.assertEqual(len(captured_directory_fds), 1)
+            self.assertGreaterEqual(captured_directory_fds[0], 0)
 
     def test_delete_holds_canonical_lock_until_mutation_finishes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
