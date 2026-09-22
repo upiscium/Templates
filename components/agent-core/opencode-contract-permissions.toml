@@ -86,6 +86,24 @@ classes = ["local-filesystem-delete"]
 [[probes]]
 surface = "task-orchestrator"
 tool = "bash"
+input = "rm -rf .git"
+classes = ["local-filesystem-delete", "repository-history-destruction"]
+
+[[probes]]
+surface = "task-orchestrator"
+tool = "bash"
+input = "rm -rf .build/../.git"
+classes = ["local-filesystem-delete", "repository-history-destruction"]
+
+[[probes]]
+surface = "task-orchestrator"
+tool = "bash"
+input = "rm -rf ."
+classes = ["local-filesystem-delete", "repository-history-destruction"]
+
+[[probes]]
+surface = "task-orchestrator"
+tool = "bash"
 input = "git reset --hard HEAD"
 classes = ["repository-history-destruction"]
 

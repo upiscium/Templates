@@ -21,6 +21,15 @@ permission:
     "just agent::context": allow
     "just project::doctor": allow
     "rm -rf *": ask
+    "rm -rf *.git*": deny
+    "rm -rf *..*": deny
+    "rm -rf /*": deny
+    "rm -rf * /*": deny
+    "rm -rf *~*": deny
+    "rm -rf *$HOME*": deny
+    "rm -rf .": deny
+    "rm -rf ./": deny
+    "rm -rf ./*": deny
     "just agent::task-start-from-issue *": deny
     "just agent::task-start *": deny
     "just agent::contract-check *": deny
@@ -63,6 +72,7 @@ On `NEEDS_APPROVAL` / `NEEDS_DECISION`, this orchestrator is the approval and de
 - never automatically relay or launder a leaf request, and never change the leaf's deny-default profile. A new Depth-1 permission request is valid only after independent re-evaluation and only when the operation is already Ask/allow under this orchestrator's own configured authority.
 - never weaken permissions, widen allowed operations, or execute/authorize work that is outside this role's configured `task:` and `bash:` allowlist.
 - if approved, execute the request (or re-delegate) only for operations already within configured authority, and then continue with bounded follow-up Work Units.
+- For a local-filesystem-delete Ask, require a target proven to stay inside the current Task worktree without absolute paths, parent traversal, `.git` paths, or symlink-resolved escape; reject or block any target that fails that check. Never use this Ask path for repository history, remote, privilege, system-store, or external-directory destruction.
 - if rejected, choose a safe alternative when possible or return `BLOCKED` with cited evidence.
 - a user-rejected Depth-1 permission decision is final for that exact operation within the Task. Record the tool/permission result; never retry, rephrase, re-delegate, or substitute an equivalent operation to verify or bypass the rejection.
 - for `NEEDS_DECISION`, first resolve the ambiguity from the Task Contract and current evidence when possible. If human judgment is still required, call `question` from this Depth-1 session with concrete options, tradeoffs, known facts, and a recommendation; apply the answer and continue the bounded Task.

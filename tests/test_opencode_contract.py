@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+from fnmatch import fnmatchcase
 import re
 import tempfile
 import tomllib
@@ -358,6 +359,46 @@ class OpenCodeContractTest(unittest.TestCase):
             self.assertEqual(global_bash[command], "deny", command)
             self.assertNotIn(command, orchestrator_bash)
 
+    def test_parent_delete_boundary_denies_structural_and_path_escapes(self) -> None:
+        def effective_bash(agent: str, command: str) -> str | None:
+            action = None
+            rules = list(self.config["permission"]["bash"].items())
+            rules.extend(permission_for(agent)["bash"].items())
+            for pattern, candidate in rules:
+                if fnmatchcase(command, pattern):
+                    action = candidate
+            return action
+
+        for command in (
+            "rm -rf .git",
+            "rm -rf .git/objects",
+            "rm -rf ./.git",
+            "rm -rf .build/../.git",
+            "rm -rf ..",
+            "rm -rf ../outside",
+            "rm -rf /",
+            "rm -rf /tmp/agent-core",
+            "rm -rf -- /tmp/agent-core",
+            "rm -rf ~/outside",
+            'rm -rf "$HOME/outside"',
+            "rm -rf .",
+            "rm -rf ./",
+            "rm -rf ./*",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    effective_bash("task-orchestrator", command), "deny", command
+                )
+
+        for command in ("rm -rf .build/default", "rm -rf cache"):
+            with self.subTest(command=command):
+                self.assertEqual(
+                    effective_bash("task-orchestrator", command), "ask", command
+                )
+
+        self.assertEqual(self.config["permission"]["external_directory"]["*"], "deny")
+        self.assertNotIn("external_directory", permission_for("task-orchestrator"))
+
     def test_agent_core_permission_manifest_is_closed_and_semantic(self) -> None:
         manifest = tomllib.loads(
             (CORE / "opencode-contract-permissions.toml").read_text(encoding="utf-8")
@@ -423,9 +464,23 @@ class OpenCodeContractTest(unittest.TestCase):
                 if surface_id == "task-orchestrator":
                     self.assertIn("rm -r .build/default", inputs)
                     self.assertIn("rmdir .build/default", inputs)
+                    self.assertIn("rm -rf .git", inputs)
+                    self.assertIn("rm -rf .build/../.git", inputs)
+                    self.assertIn("rm -rf .", inputs)
                     self.assertIn("git clean -fd", inputs)
                     self.assertIn("git push origin --delete feature", inputs)
                     self.assertIn("gh pr merge 123 --delete-branch", inputs)
+
+        parent_probe_classes = {
+            probe["input"]: set(probe["classes"])
+            for probe in probes_by_surface["task-orchestrator"]
+        }
+        for input_value in ("rm -rf .git", "rm -rf .build/../.git", "rm -rf ."):
+            with self.subTest(input=input_value):
+                self.assertEqual(
+                    parent_probe_classes[input_value],
+                    {"local-filesystem-delete", "repository-history-destruction"},
+                )
 
     def test_fresh_cache_delete_escalation_contract_is_bounded(self) -> None:
         manifest = tomllib.loads(
@@ -454,6 +509,9 @@ class OpenCodeContractTest(unittest.TestCase):
             "final for that exact operation",
             "never retry, rephrase, re-delegate, or substitute",
             "safe alternative",
+            "symlink-resolved escape",
+            "absolute paths",
+            "parent traversal",
         ):
             self.assertIn(phrase, orchestrator, phrase)
 
