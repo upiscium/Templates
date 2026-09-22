@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -319,7 +320,11 @@ class TaskStateRecoveryTest(unittest.TestCase):
                 self.assertFalse((state / "verification.json").exists())
                 self.assertFalse((state / "work-units.json").exists())
                 normalized_states.append(
-                    (state / "task.md").read_bytes().replace(str(target).encode(), b"<target>")
+                    re.sub(
+                        rb"[0-9a-f]{40}",
+                        b"<oid>",
+                        (state / "task.md").read_bytes().replace(str(target).encode(), b"<target>"),
+                    )
                 )
         self.assertEqual(1, len({state for state in normalized_states}))
 
