@@ -926,6 +926,8 @@ None yet.
              mock.patch.object(canonical_agent_core, "pr_for_branch", side_effect=[existing, existing]), \
              mock.patch.object(canonical_agent_core, "_validate_live_pr") as validate, \
              mock.patch.object(canonical_agent_core, "canonical_repository", return_value=self.repository), \
+             mock.patch.object(canonical_agent_core.publication, "publication_evidence_snapshot", return_value={}), \
+             mock.patch.object(canonical_agent_core, "git", return_value=self.head), \
              mock.patch.object(canonical_agent_core, "gh") as gh, \
              mock.patch.object(canonical_agent_core.lifecycle, "mark_task_publication_state") as transition:
             canonical_agent_core.pr_create(self.target, "131")
@@ -980,6 +982,8 @@ None yet.
              mock.patch.object(canonical_agent_core, "pr_prepare"), \
              mock.patch.object(canonical_agent_core, "_publication_context", return_value=(self.branch, context, self.head)), \
              mock.patch.object(canonical_agent_core, "pr_for_branch", side_effect=[captured, replacement]), \
+             mock.patch.object(canonical_agent_core.publication, "publication_evidence_snapshot", return_value={}), \
+             mock.patch.object(canonical_agent_core, "git", return_value=self.head), \
              mock.patch.object(canonical_agent_core, "gh") as gh, \
              mock.patch.object(canonical_agent_core.lifecycle, "mark_task_publication_state") as transition, \
              self.assertRaisesRegex(canonical_agent_core.AutomationError, "identity changed before mutation"):

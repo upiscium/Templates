@@ -11,6 +11,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -532,23 +533,60 @@ def work_units_lock_path(worktree: Path) -> Path:
 
 
 @contextmanager
-def work_units_lock(record: WorktreeRecord):
-    path = work_units_lock_path(record.path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+def state_directory_lock(root: Path):
+    """Pin the real Task State directory and lock its no-follow lock file."""
+    directory = root / ".task-state"
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        directory_fd = os.open(directory, flags)
+    except OSError as exc:
+        raise LifecycleError("Task State directory must be a real local directory") from exc
+    try:
         try:
-            yield
+            metadata = os.fstat(directory_fd)
+        except OSError as exc:
+            raise LifecycleError("Task State directory is not safely accessible") from exc
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise LifecycleError("Task State path is not a directory")
+        lock_flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            lock_flags |= os.O_NOFOLLOW
+        try:
+            lock_fd = os.open("work-units.lock", lock_flags, 0o600, dir_fd=directory_fd)
+        except OSError as exc:
+            raise LifecycleError("Task State lock is not safely accessible") from exc
+        try:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            except OSError as exc:
+                raise LifecycleError("Task State lock is not safely accessible") from exc
+            yield directory_fd
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            os.close(lock_fd)
+    finally:
+        os.close(directory_fd)
+
+
+@contextmanager
+def work_units_lock(record: WorktreeRecord):
+    with state_directory_lock(record.path) as directory_fd:
+        yield directory_fd
 
 
 def atomic_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
-        handle.write(text)
-        temporary = Path(handle.name)
-    temporary.replace(path)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(text)
+        temporary.replace(path)
+    except Exception:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
 
 
 def atomic_json(path: Path, value: dict) -> None:
@@ -594,6 +632,76 @@ def validate_failure_field(name: str, value: str, maximum: int) -> None:
         )
 
 
+def validate_provider_failure_record(value: object, destination: str) -> None:
+    if (
+        destination != "blocked"
+        or not isinstance(value, dict)
+        or set(value) != {"provider", "model", "error"}
+        or not all(isinstance(value.get(name), str) for name in ("provider", "model", "error"))
+    ):
+        raise LifecycleError("provider failure evidence is only valid for a blocked Work Unit")
+    validate_failure_field("provider", value["provider"], 200)
+    validate_failure_field("model", value["model"], 200)
+    validate_failure_field("error", value["error"], 4000)
+
+
+def validate_persisted_work_unit(identifier: object, unit: object) -> None:
+    expected_keys = {
+        "id", "requested_role", "objective", "semantic_sha256", "state",
+        "transitions", "created_at", "updated_at",
+    }
+    transition_keys = {"from", "to", "evidence", "evidence_sha256", "recorded_at"}
+    if not isinstance(identifier, str) or not isinstance(unit, dict) or set(unit) != expected_keys:
+        raise LifecycleError(f"invalid Work Unit record: {identifier}")
+    if (
+        unit["id"] != identifier
+        or not isinstance(unit["requested_role"], str)
+        or unit["requested_role"] not in WORK_UNIT_ROLES
+    ):
+        raise LifecycleError(f"invalid Work Unit identity: {identifier}")
+    objective = unit["objective"]
+    if not isinstance(objective, str):
+        raise LifecycleError(f"invalid Work Unit objective: {identifier}")
+    validate_objective(objective)
+    if unit["semantic_sha256"] != semantic_digest(objective):
+        raise LifecycleError(f"Work Unit objective digest mismatch: {identifier}")
+    if (
+        not isinstance(unit["state"], str)
+        or unit["state"] not in WORK_UNIT_STATES
+        or not isinstance(unit["transitions"], list)
+    ):
+        raise LifecycleError(f"invalid Work Unit state: {identifier}")
+    if not all(isinstance(unit[name], str) and unit[name] for name in ("created_at", "updated_at")):
+        raise LifecycleError(f"invalid Work Unit timestamps: {identifier}")
+    previous = "in-flight"
+    for transition in unit["transitions"]:
+        if (
+            not isinstance(transition, dict)
+            or not transition_keys.issubset(transition)
+            or set(transition) - transition_keys - {"provider_failure"}
+            or not isinstance(transition["from"], str)
+            or not isinstance(transition["to"], str)
+            or transition["from"] != previous
+            or transition["to"] not in WORK_UNIT_TRANSITIONS.get(previous, set())
+        ):
+            raise LifecycleError(f"invalid Work Unit transition chain: {identifier}")
+        evidence = transition["evidence"]
+        if not isinstance(evidence, str):
+            raise LifecycleError(f"invalid Work Unit evidence: {identifier}")
+        validate_evidence(evidence)
+        if transition["evidence_sha256"] != semantic_digest(evidence):
+            raise LifecycleError(f"Work Unit evidence digest mismatch: {identifier}")
+        if not isinstance(transition["recorded_at"], str) or not transition["recorded_at"]:
+            raise LifecycleError(f"invalid Work Unit transition timestamp: {identifier}")
+        if "provider_failure" in transition:
+            validate_provider_failure_record(transition["provider_failure"], transition["to"])
+        previous = transition["to"]
+    if unit["transitions"] and unit["transitions"][-1]["to"] != unit["state"]:
+        raise LifecycleError(f"Work Unit final state mismatch: {identifier}")
+    if not unit["transitions"] and unit["state"] != "in-flight":
+        raise LifecycleError(f"Work Unit has no state transition: {identifier}")
+
+
 def configured_agent_model(worktree: Path, role: str) -> str:
     if role not in WORK_UNIT_ROLES:
         raise LifecycleError(f"invalid persisted Work Unit role: {role!r}")
@@ -635,18 +743,74 @@ def empty_work_units(record: WorktreeRecord, task: str) -> dict:
     }
 
 
-def read_work_units(record: WorktreeRecord, task: str) -> dict:
+def _read_work_units_bytes(record: WorktreeRecord, directory_fd: int | None = None) -> bytes | None:
+    owns_directory_fd = directory_fd is None
+    if owns_directory_fd:
+        directory = record.path / ".task-state"
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            directory_fd = os.open(directory, flags)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise LifecycleError("Task State directory is not safely readable") from exc
+    assert directory_fd is not None
+    try:
+        file_flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            file_flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_NONBLOCK"):
+            file_flags |= os.O_NONBLOCK
+        try:
+            file_fd = os.open("work-units.json", file_flags, dir_fd=directory_fd)
+        except FileNotFoundError:
+            return None
+        try:
+            metadata = os.fstat(file_fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise LifecycleError("Work Unit state file is not regular")
+            with os.fdopen(file_fd, "rb") as stream:
+                file_fd = -1
+                return stream.read()
+        finally:
+            if file_fd >= 0:
+                os.close(file_fd)
+    except LifecycleError:
+        raise
+    except OSError as exc:
+        raise LifecycleError("Work Unit state file is not safely readable") from exc
+    finally:
+        if owns_directory_fd:
+            os.close(directory_fd)
+
+
+def read_work_units(record: WorktreeRecord, task: str, *, directory_fd: int | None = None) -> dict:
     path = work_units_path(record.path)
-    if not path.is_file():
+    raw = _read_work_units_bytes(record, directory_fd)
+    if raw is None:
         return empty_work_units(record, task)
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise LifecycleError(f"invalid Work Unit state JSON: {path}") from exc
+    if not isinstance(value, dict):
+        raise LifecycleError(f"invalid Work Unit state schema: {path}")
+    expected_keys = {"schema_version", "task_id", "worktree", "branch", "units"}
+    if (
+        set(value) != expected_keys
+        or type(value.get("schema_version")) is not int
+        or value.get("schema_version") != 1
+    ):
+        raise LifecycleError(f"invalid Work Unit state schema: {path}")
     expected = {"schema_version": 1, "task_id": task, "worktree": str(record.path), "branch": record.branch}
     mismatches = [key for key, expected_value in expected.items() if value.get(key) != expected_value]
-    if mismatches or not isinstance(value.get("units"), dict):
+    units = value.get("units")
+    if mismatches or not isinstance(units, dict):
         raise LifecycleError("Work Unit state identity mismatch: " + ", ".join(mismatches or ["units"]))
+    for work_unit, unit in units.items():
+        validate_persisted_work_unit(work_unit, unit)
     return value
 
 
@@ -716,9 +880,9 @@ def work_unit_create(root: Path, task: str, role: str, objective: str) -> None:
     record = require_local_task(root, task)
     require_resolved_contract(record, task)
     validate_work_unit_request(role, objective)
-    with work_units_lock(record):
+    with work_units_lock(record) as directory_fd:
         assert_task_identity(record, task)
-        value = read_work_units(record, task)
+        value = read_work_units(record, task, directory_fd=directory_fd)
         work_unit = next_work_unit_id(value, task)
         if work_unit in value["units"]:
             raise LifecycleError(f"Work Unit already exists: {work_unit}")
@@ -738,9 +902,9 @@ def work_unit_register(root: Path, task: str, work_unit: str, role: str, objecti
     if not WORK_UNIT_RE.fullmatch(work_unit):
         raise LifecycleError(f"invalid Work Unit ID: {work_unit!r}")
     validate_work_unit_request(role, objective)
-    with work_units_lock(record):
+    with work_units_lock(record) as directory_fd:
         assert_task_identity(record, task)
-        value = read_work_units(record, task)
+        value = read_work_units(record, task, directory_fd=directory_fd)
         if work_unit in value["units"]:
             raise LifecycleError(f"Work Unit already exists: {work_unit}")
         unit = new_work_unit(work_unit, role, objective)
@@ -825,12 +989,12 @@ def work_unit_state_set(
         if status != "blocked":
             raise LifecycleError("provider failure evidence is only valid for a blocked Work Unit")
         assert provider is not None and model is not None and error is not None
-        validate_failure_field("provider", provider, 200)
-        validate_failure_field("model", model, 200)
-        validate_failure_field("error", error, 4000)
-    with work_units_lock(record):
+        validate_provider_failure_record(
+            {"provider": provider, "model": model, "error": error}, status
+        )
+    with work_units_lock(record) as directory_fd:
         assert_task_identity(record, task)
-        value = read_work_units(record, task)
+        value = read_work_units(record, task, directory_fd=directory_fd)
         unit = value["units"].get(work_unit)
         if unit is None:
             raise LifecycleError(f"unknown Work Unit: {work_unit}")
@@ -874,10 +1038,7 @@ def work_unit_state_set(
     print(json.dumps(unit, sort_keys=True))
 
 
-def state_status(path: Path) -> str:
-    if not path.is_file():
-        raise LifecycleError(f"missing Task State: {path}")
-    text = path.read_text(encoding="utf-8")
+def _state_status_from_text(text: str, path: Path) -> str:
     sections = re.findall(r"(?ms)^## Current state\n\n(.*?)(?=^## |\Z)", text)
     statuses = re.findall(r"(?m)^- Status: ([A-Za-z0-9._-]+)$", text)
     section_statuses = (
@@ -894,6 +1055,16 @@ def state_status(path: Path) -> str:
     ):
         raise LifecycleError(f"invalid or missing Task State status in {path}")
     return statuses[0]
+
+
+def state_status(path: Path) -> str:
+    if not path.is_file():
+        raise LifecycleError(f"missing Task State: {path}")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise LifecycleError(f"cannot read Task State: {path}") from exc
+    return _state_status_from_text(text, path)
 
 
 def set_state_status(path: Path, status: str) -> None:
@@ -1102,8 +1273,29 @@ def task_state_set(root: Path, task: str, status: str) -> None:
     print(json.dumps({"task": task, "status": status}))
 
 
+def _publication_evidence_bytes(record: WorktreeRecord, directory_fd: int) -> dict[str, bytes | None]:
+    import task_contract
+
+    try:
+        result = {
+            name: task_contract._read_state_file(directory_fd, name)
+            for name in ("verification.json", "work-units.json")
+        }
+        task_contract._assert_state_dir_binding(record.path, directory_fd)
+        return result
+    except LifecycleError:
+        raise
+    except OSError as exc:
+        raise LifecycleError("cannot read publication evidence safely") from exc
+
+
 def mark_task_publication_state(
-    record: WorktreeRecord, task: str, expected: str, target: str
+    record: WorktreeRecord,
+    task: str,
+    expected: str,
+    target: str,
+    *,
+    expected_evidence: dict[str, bytes | None] | None = None,
 ) -> str:
     """Narrow transition authority for validated PR creation/readiness."""
     allowed = {
@@ -1114,8 +1306,14 @@ def mark_task_publication_state(
         raise LifecycleError("invalid guarded publication transition")
     validate_task(task)
     require_resolved_contract(record, task)
-    with work_units_lock(record):
+    if expected_evidence is not None and set(expected_evidence) != {"verification.json", "work-units.json"}:
+        raise LifecycleError("guarded publication evidence identity is invalid")
+    with work_units_lock(record) as directory_fd:
         assert_task_identity(record, task)
+        if expected_evidence is not None:
+            actual_evidence = _publication_evidence_bytes(record, directory_fd)
+            if actual_evidence != expected_evidence:
+                raise LifecycleError("publication evidence changed during guarded transition")
         path = state_path(record.path)
         previous = state_status(path)
         if previous == target:
@@ -1218,6 +1416,8 @@ def recover_blocked_publication_ready(
             text = actual.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise LifecycleError("Task State is not valid UTF-8") from exc
+        if _state_status_from_text(text, path) != "blocked":
+            raise LifecycleError("cannot update blocked Task State status")
         updated, count = re.subn(
             r"(?m)^- Status: blocked$", "- Status: publication-ready", text, count=1
         )
@@ -1362,6 +1562,12 @@ def recover_post_merge_publication_pending(
             text = actual.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise LifecycleError("Task State is not valid UTF-8") from exc
+        try:
+            current_status = _state_status_from_text(text, state_path(record.path))
+        except LifecycleError as exc:
+            raise LifecycleError("cannot update post-merge Task State status") from exc
+        if current_status != "draft-pr-created":
+            raise LifecycleError("cannot update post-merge Task State status")
         updated, count = re.subn(
             r"(?m)^- Status: draft-pr-created$",
             "- Status: integration-pending",
@@ -1416,6 +1622,14 @@ def complete_post_merge_publication_recovery(
                 if actual_state != expected_state or actual_evidence != expected_evidence:
                     raise LifecycleError(
                         "post-merge publication subject changed before receipt consumption"
+                    )
+                try:
+                    state_text = actual_state.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise LifecycleError("Task State is not valid UTF-8") from exc
+                if _state_status_from_text(state_text, state_path(record.path)) != "integration-pending":
+                    raise LifecycleError(
+                        "post-merge recovery receipt requires integration-pending Task State"
                     )
                 private_state.unlink(
                     receipt_path,

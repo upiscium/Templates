@@ -724,9 +724,9 @@ def maintenance_review_record(
     receipt = _validate_consumed_receipt(record, task)
     subject = _review_subject(receipt)
     objective = _review_objective(task, role, subject)
-    with lifecycle.work_units_lock(record):
+    with lifecycle.work_units_lock(record) as directory_fd:
         lifecycle.assert_task_identity(record, task)
-        value = lifecycle.read_work_units(record, task)
+        value = lifecycle.read_work_units(record, task, directory_fd=directory_fd)
         for identifier, unit in value.get("units", {}).items():
             if (
                 isinstance(unit, dict)
