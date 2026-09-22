@@ -472,6 +472,10 @@ def _valid_oid(value: object) -> bool:
     return isinstance(value, str) and OID_RE.fullmatch(value) is not None
 
 
+def _valid_schema_version(value: object, expected: int) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value == expected
+
+
 def _valid_digest(value: object) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
@@ -646,7 +650,7 @@ def _validate_legacy_content(path: Path, content: bytes) -> None:
         required = {"schema_version", "task", "status", "worktree", "branch", "local_head", "evidence"}
         valid = (
             set(value) == required
-            and value.get("schema_version") == 1
+            and _valid_schema_version(value.get("schema_version"), 1)
             and value.get("task") == name[:-5]
             and value.get("status") in {"merged", "cancelled"}
             and _valid_branch_worktree(value.get("branch"), value.get("task"), value.get("worktree"))
@@ -661,7 +665,7 @@ def _validate_legacy_content(path: Path, content: bytes) -> None:
         }
         valid = (
             set(value) == required
-            and value.get("schema_version") == 1
+            and _valid_schema_version(value.get("schema_version"), 1)
             and value.get("operation") == "discard-pristine"
             and value.get("task") == name[:-5]
             and value.get("status") == "initialized"
@@ -682,7 +686,7 @@ def _validate_legacy_content(path: Path, content: bytes) -> None:
         }
         valid = (
             set(value) == required
-            and value.get("schema_version") == 1
+            and _valid_schema_version(value.get("schema_version"), 1)
             and value.get("kind") == "blocked-publication-recovery"
             and _valid_repository(value.get("repository"))
             and _valid_task_id(value.get("task_id"))
@@ -712,7 +716,7 @@ def _validate_legacy_content(path: Path, content: bytes) -> None:
         }
         valid = (
             set(value) == required
-            and value.get("schema_version") == 1
+            and _valid_schema_version(value.get("schema_version"), 1)
             and value.get("kind") == "post-merge-publication-recovery"
             and _valid_repository(value.get("repository"))
             and _valid_task_id(value.get("task_id"))
@@ -745,9 +749,7 @@ def _validate_legacy_content(path: Path, content: bytes) -> None:
         reconstructed = value.get("reconstructed_file_sha256")
         valid = (
             set(value) == required
-            and isinstance(value.get("schema_version"), int)
-            and not isinstance(value.get("schema_version"), bool)
-            and value.get("schema_version") == 1
+            and _valid_schema_version(value.get("schema_version"), 1)
             and value.get("kind") == "lost-ignored-task-state"
             and _valid_repository(value.get("repository"))
             and _valid_task_id(value.get("task_id"))
@@ -782,7 +784,7 @@ def _validate_legacy_content(path: Path, content: bytes) -> None:
         }
         valid = (
             set(value) == required
-            and value.get("schema_version") == 1
+            and _valid_schema_version(value.get("schema_version"), 1)
             and value.get("kind") == "source-recovery-proof"
             and _valid_authority_fields(value)
             and _valid_oid(value.get("authority_head"))
@@ -798,9 +800,10 @@ def _validate_legacy_content(path: Path, content: bytes) -> None:
         standard = {"schema_version", "task_id", "branch", "worktree", "authority_nonce", "receipt_sha256"}
         bridge = standard | {"kind", "proof_sha256"}
         valid = (
-            (set(value) == standard and value.get("schema_version") == 1
+            (_valid_schema_version(value.get("schema_version"), 1)
+             and set(value) == standard
              and _valid_authority_fields(value))
-            or (set(value) == bridge and value.get("schema_version") == 2
+            or (set(value) == bridge and _valid_schema_version(value.get("schema_version"), 2)
                 and value.get("kind") == "source-recovery-bridge"
                 and _valid_authority_fields(value)
                 and _valid_digest(value.get("proof_sha256")))
@@ -1514,7 +1517,16 @@ def prepare(
         # Repeat all classification under the migration lock.
         _recover_canonical_temps(layout, include_admin=admin)
         _validate_canonical(layout, allow_incomplete_recovery=_allow_incomplete_recovery)
-        shared_pairs, _ = _scan_shared_legacy(layout)
+        rescanned_pairs, rescanned_legacy_lock = _scan_shared_legacy(layout)
+        if (
+            (legacy_lock is None) != (rescanned_legacy_lock is None)
+            or (
+                legacy_lock is not None
+                and rescanned_legacy_lock != legacy_lock
+            )
+        ):
+            raise GitPrivateStateError("legacy cleanup lock changed during migration")
+        shared_pairs, legacy_lock = rescanned_pairs, rescanned_legacy_lock
         pairs = shared_pairs + (_scan_admin_legacy(layout) if admin else [])
         inspected = _inspect_pairs(pairs)
         for name in SHARED_DIRS:

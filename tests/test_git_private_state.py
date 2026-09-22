@@ -194,6 +194,32 @@ class GitPrivateStateTest(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(source, path.read_bytes())
 
+    def test_legacy_schema_versions_reject_boolean_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.repository(root)
+            cases = (
+                ("cleanup/1.json", self.cleanup_record(repo)),
+                ("discard-pristine/1.json", self.discard_record(repo)),
+                ("publication-recovery.json", self.publication_recovery_record(repo)),
+                (
+                    "post-merge-publication-recovery.json",
+                    self.post_merge_publication_recovery_record(repo),
+                ),
+                ("source-recovery-proof.json", self.proof_record(repo)),
+                ("authority.json", self.authority_record(repo)),
+            )
+            for relative, record in cases:
+                with self.subTest(relative=relative):
+                    record["schema_version"] = True
+                    path = root / relative
+                    with self.assertRaisesRegex(
+                        private_state.GitPrivateStateError, "invalid legacy private-state record"
+                    ):
+                        private_state._validate_legacy_content(
+                            path, json.dumps(record).encode()
+                        )
+
     def test_publication_recovery_path_is_worktree_admin_private(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = self.repository(Path(directory))
@@ -661,6 +687,19 @@ class GitPrivateStateTest(unittest.TestCase):
             self.assertEqual(legacy_lock_identity[0:2], self.identity(canonical_lock)[0:2])
             self.assertEqual(0o600, stat.S_IMODE(canonical_lock.stat().st_mode))
             private_state.prepare(authority_worktree, admin=True)
+
+    def test_legacy_cleanup_lock_appearing_during_rescan_blocks_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(Path(directory))
+            legacy_lock = private_state.common_git_dir(repo) / "opencode/cleanup.lock"
+            with mock.patch.object(
+                private_state,
+                "_scan_shared_legacy",
+                side_effect=[([], None), ([], legacy_lock)],
+            ), self.assertRaisesRegex(
+                private_state.GitPrivateStateError, "legacy cleanup lock changed during migration"
+            ):
+                private_state.prepare(repo)
 
     def test_contended_legacy_cleanup_lock_blocks_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
