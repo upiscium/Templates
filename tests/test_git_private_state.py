@@ -220,6 +220,95 @@ class GitPrivateStateTest(unittest.TestCase):
             private_state.prepare(linked, admin=True)
             self.assertEqual(content, private_state.read_bytes(receipt))
 
+    def test_lost_ignored_task_state_receipt_is_worktree_private_and_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.repository(root)
+            linked = Path(self.valid_worktree(repo, "163-test"))
+            head = command("git", "rev-parse", "HEAD", cwd=linked)
+            receipt = private_state.lost_ignored_task_state_receipt(linked)
+            self.assertEqual(
+                private_state.admin_git_dir(linked)
+                / "agent-core/automation-maintenance/lost-ignored-task-state.json",
+                receipt,
+            )
+            value = {
+                "schema_version": 1,
+                "kind": "lost-ignored-task-state",
+                "repository": "acme/widgets",
+                "task_id": "163",
+                "worktree": str(linked),
+                "branch": "task/163-test",
+                "head": head,
+                "tree": head,
+                "base_branch": "main",
+                "base_revision": head,
+                "default_revision": head,
+                "remote_branch_head": head,
+                "pr_number": 176,
+                "pr_state": "OPEN",
+                "pr_draft": True,
+                "pr_head_ref": "task/163-test",
+                "pr_head_oid": head,
+                "pr_base_ref": "main",
+                "pr_base_oid": head,
+                "issue_sha256": "a" * 64,
+                "implementation_source": str(repo),
+                "implementation_revision": head,
+                "reconstructed_file_sha256": {
+                    "task.md": "b" * 64,
+                    "issue.json": "c" * 64,
+                    "contract.json": "d" * 64,
+                },
+            }
+            private_state.prepare(linked, admin=True)
+            content = json.dumps(value, sort_keys=True).encode()
+            private_state.exclusive_write_bytes(receipt, content)
+            private_state.prepare(linked, admin=True)
+            self.assertEqual(content, private_state.read_bytes(receipt))
+
+    def test_lost_ignored_task_state_receipt_rejects_historical_evidence_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.repository(root)
+            linked = Path(self.valid_worktree(repo, "163-test"))
+            head = command("git", "rev-parse", "HEAD", cwd=linked)
+            value = {
+                "schema_version": 1,
+                "kind": "lost-ignored-task-state",
+                "repository": "acme/widgets",
+                "task_id": "163",
+                "worktree": str(linked),
+                "branch": "task/163-test",
+                "head": head,
+                "tree": head,
+                "base_branch": "main",
+                "base_revision": head,
+                "default_revision": head,
+                "remote_branch_head": head,
+                "pr_number": 176,
+                "pr_state": "OPEN",
+                "pr_draft": True,
+                "pr_head_ref": "task/163-test",
+                "pr_head_oid": head,
+                "pr_base_ref": "main",
+                "pr_base_oid": head,
+                "issue_sha256": "a" * 64,
+                "implementation_source": str(repo),
+                "implementation_revision": head,
+                "reconstructed_file_sha256": {
+                    "task.md": "b" * 64,
+                    "issue.json": "c" * 64,
+                    "contract.json": "d" * 64,
+                    "verification.json": "e" * 64,
+                },
+            }
+            private_state.prepare(linked, admin=True)
+            path = private_state.lost_ignored_task_state_receipt(linked)
+            private_state.write_bytes(path, json.dumps(value).encode())
+            with self.assertRaises(private_state.GitPrivateStateError):
+                private_state.prepare(linked, admin=True)
+
     def test_publication_recovery_rejects_tampered_head_and_boolean_pr_number(self) -> None:
         for field, replacement in (("head", "a" * 40), ("pr_number", True)):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:

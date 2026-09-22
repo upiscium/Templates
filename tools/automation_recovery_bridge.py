@@ -40,6 +40,7 @@ CANONICAL_MODULES = (
     ("agent_core", "components/agent-core/.automation/bin/agent_core.py"),
     ("automation_upgrade", "components/agent-core/.automation/bin/automation_upgrade.py"),
     ("maintenance_lifecycle", "components/agent-core/.automation/bin/maintenance_lifecycle.py"),
+    ("task_state_recovery", "components/agent-core/.automation/bin/task_state_recovery.py"),
 )
 _TRUSTED_GIT: Path | None = None
 _TRUSTED_GH: Path | None = None
@@ -608,6 +609,11 @@ def parser() -> argparse.ArgumentParser:
     resume = sub.add_parser("resume-contract-check")
     resume.add_argument("target", type=Path)
     resume.add_argument("task", type=_issue_argument)
+    lost_state = sub.add_parser("recover-missing-task-state")
+    lost_state.add_argument("target", type=Path)
+    lost_state.add_argument("issue", type=_issue_argument)
+    lost_state.add_argument("pr", type=_issue_argument)
+    lost_state.add_argument("expected_implementation_revision", type=_revision_argument)
     for name in ("maintenance-contract-refresh-inspect", "maintenance-contract-refresh"):
         refresh = sub.add_parser(name)
         refresh.add_argument("target", type=Path)
@@ -2035,15 +2041,16 @@ def main() -> int:
                 "publication-recover",
                 "maintenance-contract-refresh-inspect",
                 "maintenance-contract-refresh",
+                "recover-missing-task-state",
             }
             else args.expected_source_revision if args.command == "bootstrap-upgrade" else None,
         )
         _verify_bootstrap(ROOT, revision)
         _clean_root(ROOT, revision)
         target = args.target.resolve()
-        if args.command in {"maintenance-finalize", "post-merge-publication-recover", "publication-ready-recover", "publication-recover", "bootstrap-upgrade", "maintenance-contract-refresh-inspect", "maintenance-contract-refresh"} and target == ROOT:
+        if args.command in {"maintenance-finalize", "post-merge-publication-recover", "publication-ready-recover", "publication-recover", "bootstrap-upgrade", "maintenance-contract-refresh-inspect", "maintenance-contract-refresh", "recover-missing-task-state"} and target == ROOT:
             raise BridgeError(f"{args.command} target must not be the source root")
-        if args.command in {"maintenance-finalize", "post-merge-publication-recover", "publication-ready-recover", "publication-recover", "bootstrap-upgrade", "maintenance-contract-refresh-inspect", "maintenance-contract-refresh"}:
+        if args.command in {"maintenance-finalize", "post-merge-publication-recover", "publication-ready-recover", "publication-recover", "bootstrap-upgrade", "maintenance-contract-refresh-inspect", "maintenance-contract-refresh", "recover-missing-task-state"}:
             _validate_target_git_configuration(target)
         with maintenance_environment():
             if args.command in {"recover-task-contract-from-issue", "resume-contract-check"}:
@@ -2056,6 +2063,17 @@ def main() -> int:
                     else:
                         result = _check_resume_contract(contract, target, args.task)
                         result["implementationRevision"] = revision
+            elif args.command == "recover-missing-task-state":
+                with _verified_modules(ROOT, revision) as modules:
+                    _clean_root(ROOT, revision)
+                    value = modules["task_state_recovery"].recover_missing_task_state(
+                        ROOT,
+                        target,
+                        args.issue,
+                        int(args.pr),
+                        revision,
+                    )
+                    result = {**value, "implementationRevision": revision}
             elif args.command == "maintenance-finalize":
                 with _verified_modules(ROOT, revision) as modules:
                     _clean_root(ROOT, revision)
