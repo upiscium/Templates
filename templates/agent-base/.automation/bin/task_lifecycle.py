@@ -1771,7 +1771,18 @@ def cleanup_repository(root: Path) -> str:
     return repository
 
 
-def cleanup_prs(root: Path, branch: str, repository: str) -> list[dict]:
+def _repository_identity(value: object, label: str) -> str:
+    if not isinstance(value, str) or value.count("/") != 1:
+        raise LifecycleError(f"cleanup refused: GitHub pull request {label} is invalid")
+    owner, name = value.split("/", 1)
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", owner) or not re.fullmatch(
+        r"[A-Za-z0-9_.-]+", name
+    ):
+        raise LifecycleError(f"cleanup refused: GitHub pull request {label} is invalid")
+    return value
+
+
+def pull_requests_for_branch(root: Path, branch: str, repository: str) -> list[dict]:
     owner = repository.split("/", 1)[0]
     result = gh(
         "api",
@@ -1790,37 +1801,85 @@ def cleanup_prs(root: Path, branch: str, repository: str) -> list[dict]:
         check=False,
     )
     if result.returncode != 0:
-        raise LifecycleError("cleanup refused: cannot reconstruct GitHub pull request evidence")
+        raise LifecycleError("cannot reconstruct GitHub pull request evidence")
     try:
         value = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
-        raise LifecycleError("cleanup refused: GitHub pull request evidence is invalid") from exc
+        raise LifecycleError("GitHub pull request evidence is invalid") from exc
     if not isinstance(value, list) or any(not isinstance(page, list) for page in value):
-        raise LifecycleError("cleanup refused: GitHub pull request evidence is invalid")
+        raise LifecycleError("GitHub pull request evidence is invalid")
     matches = []
     for item in (entry for page in value for entry in page):
         if not isinstance(item, dict):
-            raise LifecycleError("cleanup refused: GitHub pull request evidence is invalid")
+            raise LifecycleError("GitHub pull request evidence is invalid")
         head = item.get("head")
         base = item.get("base")
         head_repo = head.get("repo") if isinstance(head, dict) else None
         if not isinstance(head, dict) or not isinstance(base, dict):
-            raise LifecycleError("cleanup refused: GitHub pull request evidence is invalid")
-        if head.get("ref") != branch:
+            raise LifecycleError("GitHub pull request evidence is invalid")
+        if not isinstance(head_repo, dict) or not isinstance(base.get("repo"), dict):
+            raise LifecycleError("GitHub pull request evidence is invalid")
+        number = item.get("number")
+        state = item.get("state")
+        merged_at = item.get("merged_at")
+        draft = item.get("draft")
+        head_ref = head.get("ref")
+        head_sha = head.get("sha")
+        head_repository = _repository_identity(head_repo.get("full_name"), "head repository")
+        base_ref = base.get("ref")
+        base_sha = base.get("sha")
+        base_repository = _repository_identity(
+            base["repo"].get("full_name"), "base repository"
+        )
+        if (
+            not isinstance(number, int)
+            or isinstance(number, bool)
+            or number < 1
+            or not isinstance(state, str)
+            or not state
+            or (merged_at is not None and not isinstance(merged_at, str))
+            or not isinstance(draft, bool)
+            or not isinstance(head_ref, str)
+            or not head_ref
+            or not isinstance(head_sha, str)
+            or not head_sha
+            or not isinstance(base_ref, str)
+            or not base_ref
+            or not isinstance(base_sha, str)
+            or not base_sha
+        ):
+            raise LifecycleError("GitHub pull request evidence is invalid")
+        if head_ref != branch:
             continue
         matches.append(
             {
-                "number": item.get("number"),
-                "state": "MERGED" if item.get("merged_at") else str(item.get("state", "")).upper(),
-                "headRefName": head.get("ref"),
-                "headRefOid": head.get("sha"),
-                "baseRefName": base.get("ref"),
-                "isCrossRepository": not isinstance(head_repo, dict)
-                or str(head_repo.get("full_name", "")).casefold() != repository.casefold(),
+                "number": number,
+                "state": "MERGED" if merged_at else state.upper(),
+                "merged_at": merged_at,
+                "draft": draft,
+                "headRefName": head_ref,
+                "headRefOid": head_sha,
+                "headRepository": head_repository,
+                "baseRefName": base_ref,
+                "baseRefOid": base_sha,
+                "baseRepository": base_repository,
+                "isCrossRepository": (
+                    head_repository.casefold() != repository.casefold()
+                    or base_repository.casefold() != repository.casefold()
+                ),
                 "mergeCommit": {"oid": item.get("merge_commit_sha")},
             }
         )
     return matches
+
+
+def cleanup_prs(root: Path, branch: str, repository: str) -> list[dict]:
+    try:
+        return pull_requests_for_branch(root, branch, repository)
+    except LifecycleError as exc:
+        if str(exc).startswith("cleanup refused:"):
+            raise
+        raise LifecycleError(f"cleanup refused: {exc}") from exc
 
 
 def merged_cleanup_evidence(

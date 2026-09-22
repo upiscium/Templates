@@ -551,6 +551,7 @@ class PostMergeFinalizationTest(RepositoryFixture):
                     "number": evidence["number"],
                     "state": "closed" if evidence["state"] == "MERGED" else evidence["state"].lower(),
                     "merged_at": "2026-08-30T00:00:00Z" if evidence["state"] == "MERGED" else None,
+                    "draft": bool(evidence.get("draft", False)),
                     "merge_commit_sha": (evidence.get("mergeCommit") or {}).get("oid"),
                     "head": {
                         "ref": evidence["headRefName"],
@@ -561,7 +562,11 @@ class PostMergeFinalizationTest(RepositoryFixture):
                             else "acme/widgets"
                         },
                     },
-                    "base": {"ref": evidence["baseRefName"]},
+                    "base": {
+                        "ref": evidence["baseRefName"],
+                        "sha": "c" * 40,
+                        "repo": {"full_name": "acme/widgets"},
+                    },
                 }
                 return subprocess.CompletedProcess(command_args, 0, json.dumps([[raw]]), "")
             if (
@@ -752,13 +757,18 @@ class PostMergeFinalizationTest(RepositoryFixture):
                 "number": number,
                 "state": "closed",
                 "merged_at": "2026-08-30T00:00:00Z",
+                "draft": False,
                 "merge_commit_sha": "b" * 40,
                 "head": {
                     "ref": branch,
                     "sha": "a" * 40,
                     "repo": {"full_name": "acme/widgets"},
                 },
-                "base": {"ref": "main"},
+                "base": {
+                    "ref": "main",
+                    "sha": "c" * 40,
+                    "repo": {"full_name": "acme/widgets"},
+                },
             }
 
         pages = [[raw(number) for number in range(1, 101)], [raw(101)]]
@@ -780,13 +790,18 @@ class PostMergeFinalizationTest(RepositoryFixture):
                 "number": number,
                 "state": "closed",
                 "merged_at": "2026-08-30T00:00:00Z",
+                "draft": False,
                 "merge_commit_sha": evidence["mergeCommit"]["oid"],
                 "head": {
                     "ref": evidence["headRefName"],
                     "sha": evidence["headRefOid"],
                     "repo": {"full_name": "acme/widgets"},
                 },
-                "base": {"ref": evidence["baseRefName"]},
+                "base": {
+                    "ref": evidence["baseRefName"],
+                    "sha": "c" * 40,
+                    "repo": {"full_name": "acme/widgets"},
+                },
             }
 
         pages = [[raw(number) for number in range(1, 101)], [raw(101)]]
