@@ -184,6 +184,16 @@ class GitPrivateStateTest(unittest.TestCase):
             )
             self.assertFalse((common / "agent-core").exists())
 
+    def test_generated_private_state_files_match_canonical_source(self) -> None:
+        source = (ROOT / "components/agent-core/.automation/bin/git_private_state.py").read_bytes()
+        generated = sorted(
+            ROOT.glob("templates/agent-*/.automation/bin/git_private_state.py")
+        )
+        self.assertEqual(6, len(generated))
+        for path in generated:
+            with self.subTest(path=path):
+                self.assertEqual(source, path.read_bytes())
+
     def test_publication_recovery_path_is_worktree_admin_private(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = self.repository(Path(directory))
@@ -614,7 +624,7 @@ class GitPrivateStateTest(unittest.TestCase):
                 "cleanup/TASK-1.json": json.dumps({
                     "schema_version": 1, "task": "TASK-1", "status": "merged",
                     "worktree": self.valid_worktree(Path(directory), "TASK-1-test"), "branch": "task/TASK-1-test",
-                    "local_head": "a" * 40, "evidence": {"repository": "acme/widgets", "pr": 12, "published_head": "a" * 40, "base_revision": "a" * 40, "upstream": "deleted"},
+                    "local_head": "a" * 40, "evidence": {"repository": "acme/widgets", "pr": 12, "published_head": "a" * 40, "upstream": "deleted"},
                 }).encode(),
                 "integration/pr-12.head": b"a" * 40 + b"\n",
                 "discard-pristine/13.json": json.dumps({

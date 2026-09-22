@@ -16,6 +16,7 @@ BIN = ROOT / "components/agent-core/.automation/bin"
 sys.path.insert(0, str(BIN))
 import task_lifecycle as lifecycle
 import task_contract
+import git_private_state as private_state
 
 spec = importlib.util.spec_from_file_location("post_merge_agent_core", BIN / "agent_core.py")
 assert spec and spec.loader
@@ -850,6 +851,39 @@ class PostMergeFinalizationTest(RepositoryFixture):
         with self.cleanup_run(evidence):
             lifecycle.task_cleanup(self.repo, "TASK-1")
         self.assertFalse(receipt.exists())
+
+    def test_legacy_namespace_cleanup_receipt_migrates_before_retry(self) -> None:
+        task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
+        with self.cleanup_run(evidence, fail_update_ref_once=True), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "injected ref deletion failure"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(task_worktree.exists())
+
+        canonical = lifecycle.cleanup_receipt_path(self.repo, "TASK-1")
+        payload = json.loads(canonical.read_text(encoding="utf-8"))
+        payload["evidence"].pop("base_revision")
+        legacy = private_state.common_git_dir(self.repo) / "opencode/cleanup/TASK-1.json"
+        legacy.parent.mkdir(parents=True)
+        legacy_content = json.dumps(payload).encode()
+        legacy.write_bytes(legacy_content)
+        canonical.unlink()
+        canonical_lock = private_state.common_git_dir(self.repo) / "agent-core/cleanup.lock"
+        canonical_lock.unlink()
+        (private_state.common_git_dir(self.repo) / "opencode/cleanup.lock").write_bytes(b"")
+
+        with self.cleanup_run(evidence, fail_update_ref_once=True), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "injected ref deletion failure"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(legacy.exists())
+        self.assertTrue(canonical.exists())
+        migrated = json.loads(canonical.read_text(encoding="utf-8"))
+        self.assertEqual(evidence["baseRefOid"].lower(), migrated["evidence"]["base_revision"])
+
+        with self.cleanup_run(evidence):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(canonical.exists())
 
     def test_cleanup_rejects_ambiguity_beyond_first_pr_page(self) -> None:
         task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
