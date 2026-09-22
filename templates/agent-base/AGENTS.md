@@ -66,6 +66,7 @@ Automatically permitted operations are restricted to repository inspection, sele
 User approval is required for Task branch push, final merge, cleanup, `/tmp/opencode/**` access, and unclassified shell commands.
 
 Raw Git/GitHub mutations, force push, amend, rebase, destructive reset/clean, direct default-branch push, admin merge, privilege escalation, and destructive store/filesystem operations are prohibited.
+- Raw `rm`/`rmdir` remains denied. Bounded local deletion uses only `just agent::local-delete <relative-target> [recursive]`, whose implementation validates the exact current Task worktree, protected paths, traversal, external paths, and symlink topology before mutation.
 
 ## External paths
 
