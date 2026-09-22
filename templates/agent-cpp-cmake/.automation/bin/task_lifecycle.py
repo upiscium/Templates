@@ -1782,6 +1782,16 @@ def _repository_identity(value: object, label: str) -> str:
     return value
 
 
+def _github_timestamp(value: object) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
 def pull_requests_for_branch(root: Path, branch: str, repository: str) -> list[dict]:
     owner = repository.split("/", 1)[0]
     result = gh(
@@ -1837,7 +1847,8 @@ def pull_requests_for_branch(root: Path, branch: str, repository: str) -> list[d
             or number < 1
             or not isinstance(state, str)
             or not state
-            or (merged_at is not None and not isinstance(merged_at, str))
+            or "merged_at" not in item
+            or (merged_at is not None and not _github_timestamp(merged_at))
             or not isinstance(draft, bool)
             or not isinstance(head_ref, str)
             or not head_ref
