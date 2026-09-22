@@ -94,6 +94,7 @@
       "just agent::work-unit-dispatch-check *": "deny",
       "just agent::work-unit-status *": "deny",
       "just agent::work-unit-state-set *": "deny",
+      "just agent::local-delete *": "deny",
       "just agent::status *": "allow",
       "just agent::verify *": "allow",
       "just agent::commit *": "allow",
@@ -132,6 +133,16 @@
       "rm *": "deny",
       "rm -rf *": "deny",
       "rmdir *": "deny",
+      "rm?*": "deny",
+      "*/rm?*": "deny",
+      "* rm?*": "deny",
+      "*$(*": "deny",
+      "*`*": "deny",
+      "*;*": "deny",
+      "*&*": "deny",
+      "*|*": "deny",
+      "*<*": "deny",
+      "*>*": "deny",
       "nix store delete *": "deny"
     }
   }

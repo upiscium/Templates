@@ -18,6 +18,22 @@ integration head-SHA checkpoints, disposable Task State templates, and common
 safety policy. Repository-local OpenCode agents and permissions are added by the
 separate OpenCode configuration work.
 
+Bounded Task-local filesystem deletion is exposed only through
+`just agent::local-delete <relative-target> [recursive]`. The operation requires
+the exact current initialized Task worktree in the `implementing` state and
+uses descriptor-anchored, no-follow validation with Linux mount-identity
+pinning. It acquires the canonical Task State `work-units.lock` before the
+authoritative identity/contract/state revalidation and holds that lock through
+root binding, complete preflight, and recursive mutation, so lifecycle
+transitions cannot race the delete. Raw `rm` and `rmdir` remain denied at every
+Agent Core permission surface. Publication, verification, review,
+integration-pending, and terminal states fail closed; corrections must use the
+canonical lifecycle transition back to `implementing` first. Mount identity is
+fail-closed when unavailable, so same-filesystem bind mounts cannot cross the
+worktree boundary. As with the other Agent Core local-filesystem guards,
+hostile processes replacing pathnames as the same effective user are outside
+this trust boundary.
+
 ## Post-merge finalization
 
 Task Orchestrators stop at `integration-pending`. After the Main Orchestrator or

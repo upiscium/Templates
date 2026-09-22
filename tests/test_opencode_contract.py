@@ -340,12 +340,18 @@ class OpenCodeContractTest(unittest.TestCase):
         self.assertEqual(global_bash["rm *"], "deny")
         self.assertEqual(global_bash["rm -rf *"], "deny")
         self.assertEqual(global_bash["rmdir *"], "deny")
-        self.assertEqual(orchestrator_bash["rm -rf *"], "ask")
+        for pattern in ("rm?*", "*/rm?*", "* rm?*", "*$(*", "*`*", "*;*", "*&*", "*|*", "*<*", "*>*"):
+            with self.subTest(pattern=pattern):
+                self.assertEqual(global_bash[pattern], "deny")
+        self.assertEqual(global_bash["just agent::local-delete *"], "deny")
+        self.assertEqual(orchestrator_bash["just agent::local-delete *"], "ask")
+        self.assertNotIn("rm -rf *", orchestrator_bash)
 
         for leaf in AGENT_CORE_PERMISSION_LEAVES:
             with self.subTest(leaf=leaf):
                 leaf_bash = permission_for(leaf)["bash"]
                 self.assertEqual(leaf_bash["*"], "deny")
+                self.assertNotIn("just agent::local-delete *", leaf_bash)
                 self.assertNotIn("rm -rf *", leaf_bash)
                 self.assertNotIn("rm -r *", leaf_bash)
                 self.assertNotIn("rmdir *", leaf_bash)
@@ -388,6 +394,19 @@ class OpenCodeContractTest(unittest.TestCase):
             "rm -rf -- /tmp/agent-core",
             "rm -rf ~/outside",
             'rm -rf "$HOME/outside"',
+            'rm -rf "${HOME}/outside"',
+            'rm -rf "$(dirname "$PWD")/outside"',
+            "rm -rf .[g]it",
+            "rm -rf .*",
+            "/bin/rm -rf .git",
+            "/usr/bin/rmdir .git",
+            "env rm -rf .git",
+            "env rmdir .git",
+            "command rm -rf .git",
+            "just agent::local-delete \"$(rm -rf .git)\" true",
+            "just agent::local-delete `rm -rf .git` true",
+            "just agent::local-delete .build/default; rm -rf .git",
+            "env just agent::local-delete \"$(rm -rf .git)\" true",
             "rm -rf .",
             "rm -rf ./",
             "rm -rf ./*",
@@ -398,11 +417,9 @@ class OpenCodeContractTest(unittest.TestCase):
                 )
 
         for command in (
-            "rm -rf .build/default",
-            "rm -fr .build/default",
-            "rm -r .build/default",
-            "rmdir .build/default",
-            "rm -rf cache",
+            "just agent::local-delete .build/default",
+            "just agent::local-delete .build/default true",
+            "just agent::local-delete cache true",
         ):
             with self.subTest(command=command):
                 self.assertEqual(
@@ -410,6 +427,10 @@ class OpenCodeContractTest(unittest.TestCase):
                 )
 
         for command in (
+            "rm -rf .build/default",
+            "rm -fr .build/default",
+            "rm -r .build/default",
+            "rmdir .build/default",
             "rm -fr .git",
             "rm --force --recursive .git",
             "rm -fr ../outside",
@@ -483,14 +504,13 @@ class OpenCodeContractTest(unittest.TestCase):
                     "safe-read-only is conditional and must not force leaf allowlists",
                 )
                 inputs = {probe["input"] for probe in probes}
-                self.assertIn("rm -rf .build/default", inputs)
+                self.assertIn("just agent::local-delete .build/default true", inputs)
                 self.assertIn("git reset --hard HEAD", inputs)
                 self.assertIn("git push --force origin main", inputs)
                 self.assertIn("sudo rm -rf /tmp/agent-core", inputs)
                 self.assertIn("nix store delete /nix/store/example", inputs)
                 if surface_id == "task-orchestrator":
-                    self.assertIn("rm -r .build/default", inputs)
-                    self.assertIn("rmdir .build/default", inputs)
+                    self.assertIn("just agent::local-delete .build/default true", inputs)
                     self.assertIn("rm -rf .git", inputs)
                     self.assertIn("rm -rf .build/../.git", inputs)
                     self.assertIn("rm -rf .", inputs)
@@ -517,14 +537,12 @@ class OpenCodeContractTest(unittest.TestCase):
             probe["input"]
             for probe in manifest["probes"]
             if probe["input"] in {
-                "rm -rf .build/default",
-                "rm -r .build/default",
-                "rmdir .build/default",
+                "just agent::local-delete .build/default true",
             }
         }
         self.assertEqual(
             cache_probes,
-            {"rm -rf .build/default", "rm -r .build/default", "rmdir .build/default"},
+            {"just agent::local-delete .build/default true"},
         )
 
         orchestrator = body_text("task-orchestrator").lower()
@@ -539,6 +557,9 @@ class OpenCodeContractTest(unittest.TestCase):
             "symlink-resolved escape",
             "absolute paths",
             "parent traversal",
+            "protected path",
+            "just agent::local-delete",
+            "raw `rm`/`rmdir`",
         ):
             self.assertIn(phrase, orchestrator, phrase)
 

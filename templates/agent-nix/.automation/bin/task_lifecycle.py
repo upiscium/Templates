@@ -1127,7 +1127,12 @@ def assert_task_identity(record: WorktreeRecord, task: str) -> None:
         raise LifecycleError("Task State identity mismatch: " + ", ".join(missing))
 
 
-def require_resolved_contract(record: WorktreeRecord, task: str) -> None:
+def require_resolved_contract(
+    record: WorktreeRecord,
+    task: str,
+    *,
+    directory_fd: int | None = None,
+) -> None:
     """Block every Task mutation until strict read-only initialization can pass."""
     path = state_path(record.path)
     text = path.read_text(encoding="utf-8")
@@ -1148,7 +1153,7 @@ def require_resolved_contract(record: WorktreeRecord, task: str) -> None:
     if canonical or metadata:
         from task_contract import validate_contract
 
-        validate_contract(record.path, task)
+        validate_contract(record.path, task, directory_fd=directory_fd)
 
 
 def task_start(root: Path, task: str, slug: str, *, quiet: bool = False) -> WorktreeRecord:
