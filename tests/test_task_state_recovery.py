@@ -125,6 +125,53 @@ class TaskStateRecoveryTest(unittest.TestCase):
             ["gh", "api"], 0, json.dumps(payload), ""
         )
 
+    def normalized_pr(self, head: str, base: str | None = None, **changes: object) -> dict:
+        value = {
+            "number": self.PR,
+            "state": "OPEN",
+            "merged_at": None,
+            "draft": True,
+            "headRefName": self.BRANCH,
+            "headRefOid": head,
+            "headRepository": "upiscium/Templates",
+            "baseRefName": "main",
+            "baseRefOid": base or self.BASE,
+            "baseRepository": "upiscium/Templates",
+            "isCrossRepository": False,
+            "mergeCommit": {"oid": None},
+        }
+        value.update(changes)
+        return value
+
+    def rest_pr(self, head: str, base: str | None = None) -> dict:
+        return {
+            "number": self.PR,
+            "state": "open",
+            "merged_at": None,
+            "draft": True,
+            "head": {
+                "ref": self.BRANCH,
+                "sha": head,
+                "repo": {"full_name": "upiscium/Templates"},
+            },
+            "base": {
+                "ref": "main",
+                "sha": base or self.BASE,
+                "repo": {"full_name": "upiscium/Templates"},
+            },
+            "merge_commit_sha": None,
+        }
+
+    def test_generated_recovery_files_match_canonical_source(self) -> None:
+        source = (ROOT / "components/agent-core/.automation/bin/task_state_recovery.py").read_bytes()
+        generated = sorted(
+            ROOT.glob("templates/agent-*/.automation/bin/task_state_recovery.py")
+        )
+        self.assertEqual(6, len(generated))
+        for path in generated:
+            with self.subTest(path=path):
+                self.assertEqual(source, path.read_bytes())
+
     def plan(self, target: Path) -> dict:
         state = (
             f"- Task ID: {self.TASK}\n"
@@ -175,17 +222,7 @@ class TaskStateRecoveryTest(unittest.TestCase):
             "base": self.BASE,
             "default_revision": self.MAIN,
             "remote_head": self.HEAD,
-            "pr": {
-                "number": self.PR,
-                "state": "OPEN",
-                "isDraft": True,
-                "isCrossRepository": False,
-                "headRefName": self.BRANCH,
-                "headRefOid": self.HEAD,
-                "baseRefName": "main",
-                "baseRefOid": self.BASE,
-                "headRepository": {"nameWithOwner": "upiscium/Templates"},
-            },
+            "pr": self.normalized_pr(self.HEAD),
             "issue_digest": "b" * 64,
             "issue_bytes": issue,
             "contract_bytes": contract,
@@ -271,23 +308,15 @@ class TaskStateRecoveryTest(unittest.TestCase):
                     lock.write_bytes(b"")
                     lock.chmod(0o600)
                 target_head = self.git("git", "rev-parse", "HEAD", cwd=target)
-                pull_request = {
-                    "number": self.PR,
-                    "state": "OPEN",
-                    "isDraft": True,
-                    "isCrossRepository": False,
-                    "headRefName": self.BRANCH,
-                    "headRefOid": target_head,
-                    "baseRefName": "main",
-                    "baseRefOid": base,
-                    "headRepository": {"nameWithOwner": "upiscium/Templates"},
-                }
+                pull_request = self.normalized_pr(target_head, base)
                 pull_request_before = json.loads(json.dumps(pull_request))
                 tracked_before = self.git(
                     "git", "status", "--porcelain=v1", "--untracked-files=all", cwd=target
                 )
                 with (
-                    mock.patch.object(recovery, "_gh_json", return_value=[pull_request]),
+                    mock.patch.object(
+                        recovery.lifecycle, "pull_requests_for_branch", return_value=[pull_request]
+                    ),
                     mock.patch.object(recovery, "_issue_runner", return_value=self.issue_runner()),
                     mock.patch.object(recovery.lifecycle, "remote_branch_head", return_value=target_head),
                 ):
@@ -434,20 +463,13 @@ class TaskStateRecoveryTest(unittest.TestCase):
             legacy_private_state = recovery.private_state.admin_git_dir(target) / "opencode/automation-maintenance/legacy.json"
             legacy_private_state.parent.mkdir(parents=True)
             legacy_private_state.write_bytes(b"historical private state\n")
-            pull_request = {
-                "number": self.PR,
-                "state": "OPEN",
-                "isDraft": True,
-                "isCrossRepository": False,
-                "headRefName": self.BRANCH,
-                "headRefOid": target_head,
-                "baseRefName": "main",
-                "baseRefOid": base,
-                "headRepository": {"nameWithOwner": "upiscium/Templates"},
-            }
+            rest_payload = self.rest_pr(target_head, base)
+            rest_response = subprocess.CompletedProcess(
+                ["gh", "api"], 0, json.dumps([[rest_payload]]), ""
+            )
             before = self.git("git", "status", "--porcelain=v1", "--untracked-files=all", cwd=target)
             with (
-                mock.patch.object(recovery, "_gh_json", return_value=[pull_request]),
+                mock.patch.object(recovery.lifecycle, "gh", return_value=rest_response),
                 mock.patch.object(recovery, "_issue_runner", return_value=self.issue_runner()),
                 mock.patch.object(recovery.lifecycle, "remote_branch_head", return_value=target_head),
             ):
@@ -481,61 +503,140 @@ class TaskStateRecoveryTest(unittest.TestCase):
             self.assertTrue(receipt.is_file())
             self.assertEqual(legacy_private_state.read_bytes(), b"historical private state\n")
 
-    def test_pull_request_identity_failures_reject_before_recovery(self) -> None:
-        cases = (
-            ("missing", lambda _pr: []),
-            ("ambiguous", lambda pr: [pr, dict(pr)]),
-            ("closed", lambda pr: [{**pr, "state": "CLOSED"}]),
-            ("ready", lambda pr: [{**pr, "isDraft": False}]),
-            ("cross-repository", lambda pr: [{**pr, "isCrossRepository": True}]),
-            ("wrong-head-ref", lambda pr: [{**pr, "headRefName": "task/163-other"}]),
-            ("wrong-head-oid", lambda pr: [{**pr, "headRefOid": "f" * 40}]),
-            ("wrong-base-ref", lambda pr: [{**pr, "baseRefName": "release"}]),
-            ("wrong-base-oid", lambda pr: [{**pr, "baseRefOid": "f" * 40}]),
-            (
-                "foreign-head-repository",
-                lambda pr: [{**pr, "headRepository": {"nameWithOwner": "other/repository"}}],
-            ),
+    def test_real_rest_pr_payload_is_normalized_for_recovery(self) -> None:
+        payload = self.rest_pr(self.HEAD, self.BASE)
+        response = subprocess.CompletedProcess(
+            ["gh", "api"], 0, json.dumps([[payload]]), ""
         )
-        for name, response in cases:
+        with mock.patch.object(recovery.lifecycle, "gh", return_value=response) as query:
+            normalized = recovery.lifecycle.pull_requests_for_branch(
+                Path("/tmp/163"), self.BRANCH, "uPiscium/Templates"
+            )
+        self.assertEqual(
+            normalized,
+            [
+                self.normalized_pr(self.HEAD),
+            ],
+        )
+        self.assertEqual(query.call_args.args[:4], ("api", "--method", "GET", "--paginate"))
+        self.assertIn("repos/uPiscium/Templates/pulls", query.call_args.args)
+        self.assertIn("head=uPiscium:task/163-worktree-dispatch", query.call_args.args)
+
+    def test_pull_request_identity_failures_reject_before_recovery(self) -> None:
+        def copy_payload(payload: dict) -> dict:
+            return json.loads(json.dumps(payload))
+
+        cases = (
+            ("missing", lambda _raw: []),
+            ("duplicate", lambda raw: [[raw, copy_payload(raw)]]),
+            ("wrong-number", lambda raw: [[{**raw, "number": 999}]]),
+            ("closed", lambda raw: [[{**raw, "state": "closed"}]]),
+            ("invalid-state", lambda raw: [[{**raw, "state": "merged"}]]),
+            (
+                "open-merged",
+                lambda raw: [[{**raw, "state": "open", "merged_at": "2026-01-01T00:00:00Z"}]],
+            ),
+            (
+                "merged",
+                lambda raw: [[{**raw, "state": "closed", "merged_at": "2026-01-01T00:00:00Z"}]],
+            ),
+            (
+                "missing-merged-at",
+                lambda raw: [[{key: value for key, value in raw.items() if key != "merged_at"}]],
+            ),
+            ("empty-merged-at", lambda raw: [[{**raw, "merged_at": ""}]]),
+            ("malformed-merged-at", lambda raw: [[{**raw, "merged_at": "not-a-timestamp"}]]),
+            ("ready", lambda raw: [[{**raw, "draft": False}]]),
+            (
+                "missing-head-repository",
+                lambda raw: [[{**raw, "head": {key: value for key, value in raw["head"].items() if key != "repo"}}]],
+            ),
+            (
+                "wrong-head-repository",
+                lambda raw: [[
+                    {
+                        **raw,
+                        "head": {**raw["head"], "repo": {"full_name": "other/repository"}},
+                    }
+                ]],
+            ),
+            (
+                "cross-repository",
+                lambda raw: [[
+                    {
+                        **raw,
+                        "base": {**raw["base"], "repo": {"full_name": "other/repository"}},
+                    }
+                ]],
+            ),
+            (
+                "wrong-head-ref",
+                lambda raw: [[{**raw, "head": {**raw["head"], "ref": "task/163-other"}}]],
+            ),
+            (
+                "wrong-head-sha",
+                lambda raw: [[{**raw, "head": {**raw["head"], "sha": "f" * 40}}]],
+            ),
+            (
+                "wrong-base-ref",
+                lambda raw: [[{**raw, "base": {**raw["base"], "ref": "release"}}]],
+            ),
+            (
+                "wrong-base-sha",
+                lambda raw: [[{**raw, "base": {**raw["base"], "sha": "f" * 40}}]],
+            ),
+            (
+                "wrong-base-repository",
+                lambda raw: [[
+                    {
+                        **raw,
+                        "base": {**raw["base"], "repo": {"full_name": "other/repository"}},
+                    }
+                ]],
+            ),
+            ("malformed", lambda _raw: {"not": "pages"}),
+            ("api-failure", None),
+        )
+        for name, response_factory in cases:
             with self.subTest(case=name), tempfile.TemporaryDirectory() as directory:
                 _repository, source, target, base, _main, implementation = self.exact_fixture(Path(directory))
                 target_head = self.git("git", "rev-parse", "HEAD", cwd=target)
-                pull_request = {
-                    "number": self.PR,
-                    "state": "OPEN",
-                    "isDraft": True,
-                    "isCrossRepository": False,
-                    "headRefName": self.BRANCH,
-                    "headRefOid": target_head,
-                    "baseRefName": "main",
-                    "baseRefOid": base,
-                    "headRepository": {"nameWithOwner": "upiscium/Templates"},
-                }
+                raw = self.rest_pr(target_head, base)
+                if response_factory is None:
+                    response = subprocess.CompletedProcess(
+                        ["gh", "api"], 1, "", "GitHub API failure\n"
+                    )
+                else:
+                    response = subprocess.CompletedProcess(
+                        ["gh", "api"], 0, json.dumps(response_factory(raw)), ""
+                    )
+                receipt = recovery.private_state.lost_ignored_task_state_receipt(target)
+                before = self.git(
+                    "git", "status", "--porcelain=v1", "--untracked-files=all", cwd=target
+                )
                 with (
-                    mock.patch.object(recovery, "_gh_json", return_value=response(pull_request)),
-                    mock.patch.object(recovery.lifecycle, "remote_branch_head", return_value=target_head),
+                    mock.patch.object(recovery.lifecycle, "gh", return_value=response),
                 ):
                     with self.assertRaises(recovery.TaskStateRecoveryError):
-                        recovery._plan(source, target, self.TASK, self.PR, implementation)
+                        recovery.recover_missing_task_state(
+                            source, target, self.TASK, self.PR, implementation
+                        )
+                self.assertFalse((target / ".task-state").exists())
+                self.assertFalse(receipt.exists())
+                self.assertEqual(
+                    before,
+                    self.git("git", "status", "--porcelain=v1", "--untracked-files=all", cwd=target),
+                )
 
     def test_remote_branch_and_dirty_target_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             _repository, source, target, base, _main, implementation = self.exact_fixture(Path(directory))
             target_head = self.git("git", "rev-parse", "HEAD", cwd=target)
-            pull_request = {
-                "number": self.PR,
-                "state": "OPEN",
-                "isDraft": True,
-                "isCrossRepository": False,
-                "headRefName": self.BRANCH,
-                "headRefOid": target_head,
-                "baseRefName": "main",
-                "baseRefOid": base,
-                "headRepository": {"nameWithOwner": "upiscium/Templates"},
-            }
+            pull_request = self.normalized_pr(target_head, base)
             with (
-                mock.patch.object(recovery, "_gh_json", return_value=[pull_request]),
+                mock.patch.object(
+                    recovery.lifecycle, "pull_requests_for_branch", return_value=[pull_request]
+                ),
                 mock.patch.object(recovery.lifecycle, "remote_branch_head", return_value=None),
             ):
                 with self.assertRaisesRegex(recovery.TaskStateRecoveryError, "remote Task branch"):

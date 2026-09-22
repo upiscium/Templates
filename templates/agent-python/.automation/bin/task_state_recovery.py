@@ -43,18 +43,6 @@ def _git(root: Path, *args: str, check: bool = True) -> str:
     return lifecycle.git(*args, cwd=root, check=check)
 
 
-def _gh_json(root: Path, *args: str) -> object:
-    result = lifecycle.gh(*args, cwd=root, check=False)
-    if result.returncode:
-        raise TaskStateRecoveryError(
-            result.stderr.strip() or result.stdout.strip() or f"GitHub CLI exit {result.returncode}"
-        )
-    try:
-        return json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise TaskStateRecoveryError("GitHub response is not valid JSON") from exc
-
-
 def _issue_runner(command: list[str], *, cwd: Path, **_: object):
     if not command or command[0] != "gh":
         raise TaskStateRecoveryError("Issue authority runner accepts only GitHub CLI commands")
@@ -185,25 +173,10 @@ def _read_receipt(path: Path) -> tuple[bytes, dict] | None:
 
 
 def _pull_request(target: Path, repository: str, branch: str, requested: int) -> dict:
-    fields = (
-        "number,state,isDraft,headRefName,headRefOid,baseRefName,baseRefOid,"
-        "isCrossRepository,headRepository"
-    )
-    value = _gh_json(
-        target,
-        "pr",
-        "list",
-        "--repo",
-        repository,
-        "--head",
-        branch,
-        "--state",
-        "all",
-        "--limit",
-        "100",
-        "--json",
-        fields,
-    )
+    try:
+        value = lifecycle.pull_requests_for_branch(target, branch, repository)
+    except lifecycle.LifecycleError as exc:
+        raise TaskStateRecoveryError(str(exc)) from exc
     if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], dict):
         raise TaskStateRecoveryError("exactly one pull request for the Task branch is required")
     pr = value[0]
@@ -310,13 +283,15 @@ def _plan(
     pr = _pull_request(target, target_repository, branch, requested_pr)
     if (
         pr.get("state") != "OPEN"
-        or pr.get("isDraft") is not True
+        or pr.get("draft") is not True
         or pr.get("isCrossRepository") is not False
         or pr.get("headRefName") != branch
         or pr.get("headRefOid") != target_head
         or pr.get("baseRefName") != source["branch"]
-        or not isinstance(pr.get("headRepository"), dict)
-        or pr["headRepository"].get("nameWithOwner") != target_repository
+        or not isinstance(pr.get("headRepository"), str)
+        or pr["headRepository"].casefold() != target_repository.casefold()
+        or not isinstance(pr.get("baseRepository"), str)
+        or pr["baseRepository"].casefold() != target_repository.casefold()
     ):
         raise TaskStateRecoveryError("pull request is not the exact same-repository open Draft target")
     remote_head = lifecycle.remote_branch_head(record)

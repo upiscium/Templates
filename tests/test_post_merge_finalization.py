@@ -16,6 +16,7 @@ BIN = ROOT / "components/agent-core/.automation/bin"
 sys.path.insert(0, str(BIN))
 import task_lifecycle as lifecycle
 import task_contract
+import git_private_state as private_state
 
 spec = importlib.util.spec_from_file_location("post_merge_agent_core", BIN / "agent_core.py")
 assert spec and spec.loader
@@ -471,7 +472,10 @@ class DefaultBranchSynchronizationTest(RepositoryFixture):
         ]
         with mock.patch.object(lifecycle, "run", side_effect=responses) as observed:
             self.assertEqual(lifecycle.default_branch(self.repo), "main")
-        self.assertEqual(observed.call_args_list[1].kwargs["remove_env"], ("GH_REPO",))
+        self.assertEqual(
+            observed.call_args_list[1].kwargs["remove_env"],
+            ("GH_REPO", "GH_HOST", "GH_ENTERPRISE_TOKEN"),
+        )
 
 
 class PostMergeFinalizationTest(RepositoryFixture):
@@ -495,12 +499,13 @@ class PostMergeFinalizationTest(RepositoryFixture):
     def merged_evidence(self, task_worktree: Path, merge_oid: str, **changes: object) -> dict:
         value = {
             "number": 93,
-            "state": "MERGED",
-            "headRefName": command("git", "branch", "--show-current", cwd=task_worktree),
-            "headRefOid": command("git", "rev-parse", "HEAD", cwd=task_worktree),
-            "baseRefName": "main",
-            "isCrossRepository": False,
-            "mergeCommit": {"oid": merge_oid},
+                "state": "MERGED",
+                "headRefName": command("git", "branch", "--show-current", cwd=task_worktree),
+                "headRefOid": command("git", "rev-parse", "HEAD", cwd=task_worktree),
+                "baseRefName": "main",
+                "baseRefOid": command("git", "rev-parse", "main", cwd=task_worktree),
+                "isCrossRepository": False,
+                "mergeCommit": {"oid": merge_oid},
         }
         value.update(changes)
         return value
@@ -551,6 +556,7 @@ class PostMergeFinalizationTest(RepositoryFixture):
                     "number": evidence["number"],
                     "state": "closed" if evidence["state"] == "MERGED" else evidence["state"].lower(),
                     "merged_at": "2026-08-30T00:00:00Z" if evidence["state"] == "MERGED" else None,
+                    "draft": bool(evidence.get("draft", False)),
                     "merge_commit_sha": (evidence.get("mergeCommit") or {}).get("oid"),
                     "head": {
                         "ref": evidence["headRefName"],
@@ -561,7 +567,11 @@ class PostMergeFinalizationTest(RepositoryFixture):
                             else "acme/widgets"
                         },
                     },
-                    "base": {"ref": evidence["baseRefName"]},
+                    "base": {
+                        "ref": evidence["baseRefName"],
+                        "sha": evidence.get("baseRefOid", "c" * 40),
+                        "repo": {"full_name": "acme/widgets"},
+                    },
                 }
                 return subprocess.CompletedProcess(command_args, 0, json.dumps([[raw]]), "")
             if (
@@ -752,13 +762,18 @@ class PostMergeFinalizationTest(RepositoryFixture):
                 "number": number,
                 "state": "closed",
                 "merged_at": "2026-08-30T00:00:00Z",
+                "draft": False,
                 "merge_commit_sha": "b" * 40,
                 "head": {
                     "ref": branch,
                     "sha": "a" * 40,
                     "repo": {"full_name": "acme/widgets"},
                 },
-                "base": {"ref": "main"},
+                "base": {
+                    "ref": "main",
+                    "sha": "c" * 40,
+                    "repo": {"full_name": "acme/widgets"},
+                },
             }
 
         pages = [[raw(number) for number in range(1, 101)], [raw(101)]]
@@ -772,6 +787,104 @@ class PostMergeFinalizationTest(RepositoryFixture):
         self.assertIn("--paginate", query.call_args.args)
         self.assertIn("--slurp", query.call_args.args)
 
+    def test_cleanup_rejects_malformed_pr_base_sha(self) -> None:
+        task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
+        raw = {
+            "number": evidence["number"],
+            "state": "closed",
+            "merged_at": "2026-08-30T00:00:00Z",
+            "draft": False,
+            "merge_commit_sha": evidence["mergeCommit"]["oid"],
+            "head": {
+                "ref": evidence["headRefName"],
+                "sha": evidence["headRefOid"],
+                "repo": {"full_name": "acme/widgets"},
+            },
+            "base": {
+                "ref": evidence["baseRefName"],
+                "sha": "not-a-sha",
+                "repo": {"full_name": "acme/widgets"},
+            },
+        }
+        with self.cleanup_run(evidence, pr_pages=[[raw]]), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "does not match the Task"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertTrue(task_worktree.exists())
+
+    def test_cleanup_rejects_pr_base_sha_outside_default_branch_history(self) -> None:
+        task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
+        raw = {
+            "number": evidence["number"],
+            "state": "closed",
+            "merged_at": "2026-08-30T00:00:00Z",
+            "draft": False,
+            "merge_commit_sha": evidence["mergeCommit"]["oid"],
+            "head": {
+                "ref": evidence["headRefName"],
+                "sha": evidence["headRefOid"],
+                "repo": {"full_name": "acme/widgets"},
+            },
+            "base": {
+                "ref": evidence["baseRefName"],
+                "sha": "d" * 40,
+                "repo": {"full_name": "acme/widgets"},
+            },
+        }
+        with self.cleanup_run(evidence, pr_pages=[[raw]]), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "not trusted default-branch history"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertTrue(task_worktree.exists())
+
+    def test_legacy_merged_cleanup_receipt_is_upgraded_on_retry(self) -> None:
+        task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
+        with self.cleanup_run(evidence, fail_update_ref_once=True), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "injected ref deletion failure"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(task_worktree.exists())
+        receipt = lifecycle.cleanup_receipt_path(self.repo, "TASK-1")
+        payload = json.loads(receipt.read_text(encoding="utf-8"))
+        payload["evidence"].pop("base_revision")
+        receipt.write_text(json.dumps(payload), encoding="utf-8")
+        with self.cleanup_run(evidence):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(receipt.exists())
+
+    def test_legacy_namespace_cleanup_receipt_migrates_before_retry(self) -> None:
+        task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
+        with self.cleanup_run(evidence, fail_update_ref_once=True), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "injected ref deletion failure"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(task_worktree.exists())
+
+        canonical = lifecycle.cleanup_receipt_path(self.repo, "TASK-1")
+        payload = json.loads(canonical.read_text(encoding="utf-8"))
+        payload["evidence"].pop("base_revision")
+        legacy = private_state.common_git_dir(self.repo) / "opencode/cleanup/TASK-1.json"
+        legacy.parent.mkdir(parents=True)
+        legacy_content = json.dumps(payload).encode()
+        legacy.write_bytes(legacy_content)
+        canonical.unlink()
+        canonical_lock = private_state.common_git_dir(self.repo) / "agent-core/cleanup.lock"
+        canonical_lock.unlink()
+        (private_state.common_git_dir(self.repo) / "opencode/cleanup.lock").write_bytes(b"")
+
+        with self.cleanup_run(evidence, fail_update_ref_once=True), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "injected ref deletion failure"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(legacy.exists())
+        self.assertTrue(canonical.exists())
+        migrated = json.loads(canonical.read_text(encoding="utf-8"))
+        self.assertEqual(evidence["baseRefOid"].lower(), migrated["evidence"]["base_revision"])
+
+        with self.cleanup_run(evidence):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(canonical.exists())
+
     def test_cleanup_rejects_ambiguity_beyond_first_pr_page(self) -> None:
         task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
 
@@ -780,13 +893,18 @@ class PostMergeFinalizationTest(RepositoryFixture):
                 "number": number,
                 "state": "closed",
                 "merged_at": "2026-08-30T00:00:00Z",
+                "draft": False,
                 "merge_commit_sha": evidence["mergeCommit"]["oid"],
                 "head": {
                     "ref": evidence["headRefName"],
                     "sha": evidence["headRefOid"],
                     "repo": {"full_name": "acme/widgets"},
                 },
-                "base": {"ref": evidence["baseRefName"]},
+                "base": {
+                    "ref": evidence["baseRefName"],
+                    "sha": "c" * 40,
+                    "repo": {"full_name": "acme/widgets"},
+                },
             }
 
         pages = [[raw(number) for number in range(1, 101)], [raw(101)]]
