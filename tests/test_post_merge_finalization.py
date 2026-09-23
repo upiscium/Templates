@@ -1105,7 +1105,11 @@ class PostMergeFinalizationTest(RepositoryFixture):
             dict(evidence, headRefOid="b" * 40),
             dict(evidence, baseRefName="release"),
             dict(evidence, number=94),
+            dict(evidence, number=True),
             dict(evidence, isCrossRepository=True),
+            dict(evidence, isCrossRepository=None),
+            dict(evidence, isCrossRepository=0),
+            {key: value for key, value in evidence.items() if key != "isCrossRepository"},
             dict(evidence, mergeCommit=None),
         )
         for invalid in invalid_values:
@@ -1113,12 +1117,27 @@ class PostMergeFinalizationTest(RepositoryFixture):
                 with mock.patch.object(agent_core, "pr_details", return_value=invalid):
                     with self.assertRaises(agent_core.AutomationError):
                         agent_core.merged_pr_evidence(self.repo, "TASK-1", "93")
+        for invalid in (None, []):
+            with self.subTest(invalid_details=invalid):
+                with mock.patch.object(agent_core, "pr_details", return_value=invalid):
+                    with self.assertRaisesRegex(agent_core.AutomationError, "invalid pull request details"):
+                        agent_core.merged_pr_evidence(self.repo, "TASK-1", "93")
         with (
             mock.patch.object(agent_core, "pr_details", return_value=evidence),
             mock.patch.object(agent_core, "prs_for_branch", return_value=[]),
             self.assertRaisesRegex(agent_core.AutomationError, "missing or ambiguous"),
         ):
             agent_core.merged_pr_evidence(self.repo, "TASK-1", "93")
+
+    def test_pr_list_rejects_malformed_records_and_boolean_numbers(self) -> None:
+        for value in (
+            [None],
+            [{"number": True, "headRefName": "task/TASK-1-demo"}],
+        ):
+            with self.subTest(value=value):
+                with mock.patch.object(agent_core, "gh", return_value=json.dumps(value)):
+                    with self.assertRaises(agent_core.AutomationError):
+                        agent_core.prs_for_branch(self.repo, "task/TASK-1-demo")
 
     def test_wrong_task_states_cannot_jump_to_merged(self) -> None:
         task_worktree = self.start_task()

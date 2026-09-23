@@ -860,9 +860,12 @@ def prs_for_branch(root: Path, branch: str) -> list[dict]:
         )
     except json.JSONDecodeError as exc:
         raise AutomationError("invalid pull request list returned by GitHub") from exc
-    if not isinstance(value, list):
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
         raise AutomationError("invalid pull request list returned by GitHub")
-    return [item for item in value if item.get("headRefName") == branch]
+    matches = [item for item in value if item.get("headRefName") == branch]
+    for item in matches:
+        _validated_pr_number(item)
+    return matches
 
 
 def merged_pr_evidence(root: Path, task: str, pr: str) -> tuple[lifecycle.WorktreeRecord, dict]:
@@ -883,8 +886,10 @@ def merged_pr_evidence(root: Path, task: str, pr: str) -> tuple[lifecycle.Worktr
     if branch is None:
         raise AutomationError("registered Task worktree is detached")
     data = pr_details(root, pr)
+    if not isinstance(data, dict):
+        raise AutomationError("invalid pull request details returned by GitHub")
     base = default_branch(root)
-    if data.get("number") != requested:
+    if _validated_pr_number(data) != requested:
         raise AutomationError("GitHub returned a different pull request")
     if data.get("state") != "MERGED":
         raise AutomationError("pull request is not merged")
@@ -911,7 +916,7 @@ def merged_pr_evidence(root: Path, task: str, pr: str) -> tuple[lifecycle.Worktr
             raise AutomationError("Task State published head does not match the registered Task HEAD")
     if data.get("baseRefName") != base:
         raise AutomationError("pull request base is not the repository default branch")
-    if data.get("isCrossRepository"):
+    if data.get("isCrossRepository") is not False:
         raise AutomationError("cross-repository pull requests cannot finalize a local Task")
     merge_oid = (data.get("mergeCommit") or {}).get("oid")
     if not isinstance(merge_oid, str) or not re.fullmatch(r"[0-9a-fA-F]{40,64}", merge_oid):
