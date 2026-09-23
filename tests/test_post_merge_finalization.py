@@ -1100,6 +1100,7 @@ class PostMergeFinalizationTest(RepositoryFixture):
             dict(evidence, state="OPEN"),
             dict(evidence, state="CLOSED"),
             dict(evidence, headRefName="task/OTHER-demo"),
+            dict(evidence, headRefOid="b" * 40),
             dict(evidence, baseRefName="release"),
             dict(evidence, number=94),
             dict(evidence, isCrossRepository=True),
@@ -1156,6 +1157,44 @@ class PostMergeFinalizationTest(RepositoryFixture):
             lifecycle.state_status(task_worktree / ".task-state/task.md"),
             "integration-pending",
         )
+
+    def test_head_identity_must_remain_exact_during_revalidation(self) -> None:
+        task_worktree, _, evidence = self.prepare()
+        moved = dict(evidence, headRefOid="b" * 40)
+        with (
+            mock.patch.object(agent_core, "pr_details", side_effect=[evidence, moved]),
+            mock.patch.object(
+                agent_core,
+                "prs_for_branch",
+                return_value=[{"number": 93, "headRefName": evidence["headRefName"]}],
+            ),
+            self.assertRaisesRegex(agent_core.AutomationError, "head"),
+        ):
+            agent_core.integrate_finalize(self.repo, "TASK-1", "93")
+        self.assertEqual(
+            lifecycle.state_status(task_worktree / ".task-state/task.md"),
+            "integration-pending",
+        )
+
+    def test_persisted_published_head_must_match_finalization_head(self) -> None:
+        task_worktree, _, evidence = self.prepare()
+        state = task_worktree / ".task-state/task.md"
+        state.write_text(
+            state.read_text(encoding="utf-8").replace(
+                "- Published head SHA: none", "- Published head SHA: " + "b" * 40
+            ),
+            encoding="utf-8",
+        )
+        with (
+            mock.patch.object(agent_core, "pr_details", return_value=evidence),
+            mock.patch.object(
+                agent_core,
+                "prs_for_branch",
+                return_value=[{"number": 93, "headRefName": evidence["headRefName"]}],
+            ),
+            self.assertRaisesRegex(agent_core.AutomationError, "published head"),
+        ):
+            agent_core.merged_pr_evidence(self.repo, "TASK-1", "93")
 
     def test_just_exposes_finalize_without_raw_git(self) -> None:
         recipe = (ROOT / "components/agent-core/.automation/just/integrate.just").read_text(encoding="utf-8")

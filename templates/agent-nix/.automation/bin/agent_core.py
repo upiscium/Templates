@@ -885,6 +885,25 @@ def merged_pr_evidence(root: Path, task: str, pr: str) -> tuple[lifecycle.Worktr
         raise AutomationError("pull request is not merged")
     if data.get("headRefName") != branch:
         raise AutomationError("pull request head does not match the registered Task branch")
+    task_head = record.head
+    published_head = data.get("headRefOid")
+    if (
+        not isinstance(task_head, str)
+        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", task_head)
+        or not isinstance(published_head, str)
+        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", published_head)
+        or published_head.casefold() != task_head.casefold()
+    ):
+        raise AutomationError("pull request head does not match the registered Task HEAD")
+    recorded_head = lifecycle.extract_identity_value(
+        lifecycle.state_path(record.path), "Published head SHA"
+    )
+    if recorded_head and recorded_head.casefold() != "none":
+        if (
+            not re.fullmatch(r"[0-9a-fA-F]{40,64}", recorded_head)
+            or recorded_head.casefold() != task_head.casefold()
+        ):
+            raise AutomationError("Task State published head does not match the registered Task HEAD")
     if data.get("baseRefName") != base:
         raise AutomationError("pull request base is not the repository default branch")
     if data.get("isCrossRepository"):
@@ -930,6 +949,7 @@ def integrate_finalize(root: Path, task: str, pr: str) -> None:
             value.get("number"),
             value.get("state"),
             value.get("headRefName"),
+            value.get("headRefOid"),
             value.get("baseRefName"),
             (value.get("mergeCommit") or {}).get("oid"),
             value.get("isCrossRepository"),
