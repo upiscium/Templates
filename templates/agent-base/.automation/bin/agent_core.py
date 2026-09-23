@@ -286,13 +286,13 @@ def commit_task(root: Path, task: str, message: str) -> None:
     ensure_task_branch(root, task)
     record = lifecycle.current_worktree(root)
     with lifecycle.work_units_lock(record):
-        status = lifecycle.state_status(lifecycle.state_path(root))
-        if status in {"integration-pending", "merged", "cancelled"}:
-            raise AutomationError(f"Task commits are not allowed while status is {status}")
         paths = pending_paths(root)
         if not paths:
             raise AutomationError("no Task changes to commit")
         reject_unsafe_paths(root, paths)
+        status = lifecycle.state_status(lifecycle.state_path(root))
+        if status in {"integration-pending", "merged", "cancelled"}:
+            raise AutomationError(f"Task commits are not allowed while status is {status}")
         run(["git", "add", "--", *paths], cwd=root)
         run(["git", "diff", "--cached", "--check"], cwd=root)
         staged = git("diff", "--cached", "--name-only", cwd=root).splitlines()
