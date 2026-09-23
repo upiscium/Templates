@@ -345,6 +345,18 @@ class TaskLifecycleTest(unittest.TestCase):
              self.assertRaisesRegex(lifecycle.LifecycleError, "requires Task status integration-pending"):
             lifecycle.mark_task_merged_from_integration(record, "225")
 
+    def test_guarded_finalize_rejects_task_head_movement_under_lock(self) -> None:
+        record = lifecycle.WorktreeRecord(Path("/task"), "task/225-recovery", "a" * 40)
+        moved = lifecycle.WorktreeRecord(record.path, record.branch, "b" * 40)
+        with (
+            mock.patch.object(lifecycle, "work_units_lock", return_value=nullcontext()),
+            mock.patch.object(lifecycle, "worktree_for_task", return_value=moved),
+            self.assertRaisesRegex(lifecycle.LifecycleError, "identity changed"),
+        ):
+            lifecycle.mark_task_merged_from_integration(
+                record, "225", expected_head=record.head
+            )
+
     def test_batch_conflict_detects_dependency_and_shared_resources(self) -> None:
         summaries = [
             {

@@ -1654,13 +1654,41 @@ def complete_post_merge_publication_recovery(
     return "consumed"
 
 
-def mark_task_merged_from_integration(record: WorktreeRecord, task: str) -> str:
+def mark_task_merged_from_integration(
+    record: WorktreeRecord,
+    task: str,
+    *,
+    expected_head: str | None = None,
+) -> str:
     """Dedicated terminal transition used only after guarded merge reconciliation."""
     validate_task(task)
-    require_resolved_contract(record, task)
-    with work_units_lock(record):
-        assert_task_identity(record, task)
-        path = state_path(record.path)
+    with work_units_lock(record) as directory_fd:
+        current = record
+        if expected_head is not None:
+            if not re.fullmatch(r"[0-9a-fA-F]{40,64}", expected_head):
+                raise LifecycleError("finalization expected Task HEAD is invalid")
+            current = worktree_for_task(record.path, task)
+            if (
+                current.path != record.path
+                or current.branch != record.branch
+                or not isinstance(current.head, str)
+                or current.head.casefold() != expected_head.casefold()
+            ):
+                raise LifecycleError("Task worktree identity changed before finalization")
+            local_head = git("rev-parse", "--verify", "HEAD^{commit}", cwd=current.path)
+            if local_head.casefold() != expected_head.casefold():
+                raise LifecycleError("Task HEAD changed before finalization")
+            recorded_head = extract_identity_value(
+                state_path(current.path), "Published head SHA"
+            )
+            if recorded_head and recorded_head.casefold() != "none":
+                if recorded_head.casefold() != expected_head.casefold():
+                    raise LifecycleError(
+                        "Task State published head changed before finalization"
+                    )
+        assert_task_identity(current, task)
+        require_resolved_contract(current, task, directory_fd=directory_fd)
+        path = state_path(current.path)
         previous = state_status(path)
         if previous == "merged":
             return "already-finalized"

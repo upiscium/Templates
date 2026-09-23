@@ -962,7 +962,9 @@ def integrate_finalize(root: Path, task: str, pr: str) -> None:
         lifecycle.require_synchronized_default_branch_revision(
             root, synchronized["branch"], revision
         )
-        outcome = lifecycle.mark_task_merged_from_integration(record, task)
+        outcome = lifecycle.mark_task_merged_from_integration(
+            record, task, expected_head=record.head
+        )
     except lifecycle.LifecycleError as exc:
         raise AutomationError(str(exc)) from exc
     print(
