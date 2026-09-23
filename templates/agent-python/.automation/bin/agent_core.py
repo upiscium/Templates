@@ -284,18 +284,23 @@ def verify(root: Path, task: str) -> None:
 
 def commit_task(root: Path, task: str, message: str) -> None:
     ensure_task_branch(root, task)
-    paths = pending_paths(root)
-    if not paths:
-        raise AutomationError("no Task changes to commit")
-    reject_unsafe_paths(root, paths)
-    run(["git", "add", "--", *paths], cwd=root)
-    run(["git", "diff", "--cached", "--check"], cwd=root)
-    staged = git("diff", "--cached", "--name-only", cwd=root).splitlines()
-    reject_unsafe_paths(root, staged)
-    commit_message = message.strip() or f"task: {task}"
-    if task not in commit_message:
-        commit_message = f"{commit_message}\n\nTask: {task}"
-    run(["git", "commit", "-m", commit_message], cwd=root)
+    record = lifecycle.current_worktree(root)
+    with lifecycle.work_units_lock(record):
+        status = lifecycle.state_status(lifecycle.state_path(root))
+        if status in {"integration-pending", "merged", "cancelled"}:
+            raise AutomationError(f"Task commits are not allowed while status is {status}")
+        paths = pending_paths(root)
+        if not paths:
+            raise AutomationError("no Task changes to commit")
+        reject_unsafe_paths(root, paths)
+        run(["git", "add", "--", *paths], cwd=root)
+        run(["git", "diff", "--cached", "--check"], cwd=root)
+        staged = git("diff", "--cached", "--name-only", cwd=root).splitlines()
+        reject_unsafe_paths(root, staged)
+        commit_message = message.strip() or f"task: {task}"
+        if task not in commit_message:
+            commit_message = f"{commit_message}\n\nTask: {task}"
+        run(["git", "commit", "-m", commit_message], cwd=root)
     print(git("rev-parse", "HEAD", cwd=root))
 
 
@@ -958,12 +963,28 @@ def integrate_finalize(root: Path, task: str, pr: str) -> None:
         raise AutomationError("pull request or Task identity changed during finalization")
     if not merge_commit_is_ancestor(root, merge_oid, revision):
         raise AutomationError("merge identity changed during finalization")
+
+    def validate_terminal_evidence() -> None:
+        try:
+            lifecycle.require_synchronized_default_branch_revision(
+                root, synchronized["branch"], revision
+            )
+        except lifecycle.LifecycleError as exc:
+            raise AutomationError(str(exc)) from exc
+        terminal_record, terminal = merged_pr_evidence(root, task, pr)
+        if terminal_record != record or fingerprint(terminal) != fingerprint(evidence):
+            raise AutomationError("pull request or Task identity changed before terminal transition")
+        if not merge_commit_is_ancestor(root, merge_oid, revision):
+            raise AutomationError("merge identity changed before terminal transition")
+
     try:
-        lifecycle.require_synchronized_default_branch_revision(
-            root, synchronized["branch"], revision
-        )
         outcome = lifecycle.mark_task_merged_from_integration(
-            record, task, expected_head=record.head
+            record,
+            task,
+            expected_head=record.head,
+            validate_before_write=validate_terminal_evidence,
+            default_branch=synchronized["branch"],
+            default_revision=revision,
         )
     except lifecycle.LifecycleError as exc:
         raise AutomationError(str(exc)) from exc

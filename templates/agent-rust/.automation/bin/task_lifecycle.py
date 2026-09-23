@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from collections.abc import Callable
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 import fcntl
 import hashlib
@@ -578,6 +579,96 @@ def state_directory_lock(root: Path):
 def work_units_lock(record: WorktreeRecord):
     with state_directory_lock(record.path) as directory_fd:
         yield directory_fd
+
+
+def _safe_ref_parent(common: Path, branch: str) -> Path:
+    refs = common / "refs"
+    heads = refs / "heads"
+    for directory in (common, refs, heads):
+        try:
+            metadata = directory.lstat()
+        except OSError as exc:
+            raise LifecycleError("terminal ref directory is unavailable") from exc
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise LifecycleError("terminal ref directory is unsafe")
+    current = heads
+    for part in branch.split("/")[:-1]:
+        current = current / part
+        try:
+            current.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        try:
+            metadata = current.lstat()
+        except OSError as exc:
+            raise LifecycleError("terminal ref directory is unavailable") from exc
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise LifecycleError("terminal ref directory is unsafe")
+    return current
+
+
+@contextmanager
+def terminal_ref_locks(
+    record: WorktreeRecord,
+    *,
+    default_branch: str | None,
+    default_revision: str | None,
+):
+    """Hold exact Task/default ref locks through a terminal state write."""
+    branch = record.branch
+    if branch is None or record.head is None:
+        raise LifecycleError("terminal Task ref identity is incomplete")
+    refs = [(branch, record.head)]
+    if (default_branch is None) != (default_revision is None):
+        raise LifecycleError("terminal default ref identity is incomplete")
+    if default_branch is not None and default_revision is not None:
+        refs.append((default_branch, default_revision))
+    if len({name for name, _ in refs}) != len(refs):
+        raise LifecycleError("terminal Task and default refs must be distinct")
+    common = common_git_dir(record.path)
+    acquired: list[tuple[int, Path, os.stat_result]] = []
+    try:
+        for name, revision in sorted(refs):
+            validate_branch_name(name)
+            parent = _safe_ref_parent(common, name)
+            lock = parent / (name.rsplit("/", 1)[-1] + ".lock")
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                descriptor = os.open(lock, flags, 0o600)
+            except OSError as exc:
+                raise LifecycleError(
+                    "terminal refs are concurrently locked or unavailable"
+                ) from exc
+            try:
+                os.write(descriptor, (revision + "\n").encode("ascii", "strict"))
+                os.fsync(descriptor)
+                acquired.append((descriptor, lock, os.fstat(descriptor)))
+            except Exception:
+                os.close(descriptor)
+                lock.unlink(missing_ok=True)
+                raise
+        yield
+    finally:
+        cleanup_error: LifecycleError | None = None
+        for descriptor, lock, locked in reversed(acquired):
+            os.close(descriptor)
+            try:
+                current = lock.lstat()
+            except OSError as exc:
+                cleanup_error = LifecycleError("terminal ref lock changed unexpectedly")
+                cleanup_error.__cause__ = exc
+                continue
+            if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (
+                locked.st_dev,
+                locked.st_ino,
+            ):
+                cleanup_error = LifecycleError("terminal ref lock changed unexpectedly")
+                continue
+            lock.unlink()
+        if cleanup_error is not None:
+            raise cleanup_error
 
 
 def atomic_text(path: Path, text: str) -> None:
@@ -1659,45 +1750,69 @@ def mark_task_merged_from_integration(
     task: str,
     *,
     expected_head: str | None = None,
+    validate_before_write: Callable[[], None] | None = None,
+    default_branch: str | None = None,
+    default_revision: str | None = None,
 ) -> str:
     """Dedicated terminal transition used only after guarded merge reconciliation."""
     validate_task(task)
+    current = record
+    if expected_head is not None:
+        if not re.fullmatch(r"[0-9a-fA-F]{40,64}", expected_head):
+            raise LifecycleError("finalization expected Task HEAD is invalid")
+        current = worktree_for_task(record.path, task)
+        if (
+            current.path != record.path
+            or current.branch != record.branch
+            or not isinstance(current.head, str)
+            or current.head.casefold() != expected_head.casefold()
+        ):
+            raise LifecycleError("Task worktree identity changed before finalization")
     with work_units_lock(record) as directory_fd:
-        current = record
-        if expected_head is not None:
-            if not re.fullmatch(r"[0-9a-fA-F]{40,64}", expected_head):
-                raise LifecycleError("finalization expected Task HEAD is invalid")
-            current = worktree_for_task(record.path, task)
-            if (
-                current.path != record.path
-                or current.branch != record.branch
-                or not isinstance(current.head, str)
-                or current.head.casefold() != expected_head.casefold()
-            ):
-                raise LifecycleError("Task worktree identity changed before finalization")
-            local_head = git("rev-parse", "--verify", "HEAD^{commit}", cwd=current.path)
-            if local_head.casefold() != expected_head.casefold():
-                raise LifecycleError("Task HEAD changed before finalization")
-            recorded_head = extract_identity_value(
-                state_path(current.path), "Published head SHA"
+        ref_context = (
+            terminal_ref_locks(
+                record,
+                default_branch=default_branch,
+                default_revision=default_revision,
             )
-            if recorded_head and recorded_head.casefold() != "none":
-                if recorded_head.casefold() != expected_head.casefold():
-                    raise LifecycleError(
-                        "Task State published head changed before finalization"
-                    )
-        assert_task_identity(current, task)
-        require_resolved_contract(current, task, directory_fd=directory_fd)
-        path = state_path(current.path)
-        previous = state_status(path)
-        if previous == "merged":
-            return "already-finalized"
-        if previous != "integration-pending":
-            raise LifecycleError(
-                "post-merge finalization requires Task status integration-pending or merged; "
-                f"found {previous}"
-            )
-        set_state_status(path, "merged")
+            if expected_head is not None
+            else nullcontext()
+        )
+        with ref_context:
+            if expected_head is not None:
+                current = worktree_for_task(record.path, task)
+                if (
+                    current.path != record.path
+                    or current.branch != record.branch
+                    or not isinstance(current.head, str)
+                    or current.head.casefold() != expected_head.casefold()
+                ):
+                    raise LifecycleError("Task worktree identity changed before finalization")
+                local_head = git("rev-parse", "--verify", "HEAD^{commit}", cwd=current.path)
+                if local_head.casefold() != expected_head.casefold():
+                    raise LifecycleError("Task HEAD changed before finalization")
+                recorded_head = extract_identity_value(
+                    state_path(current.path), "Published head SHA"
+                )
+                if recorded_head and recorded_head.casefold() != "none":
+                    if recorded_head.casefold() != expected_head.casefold():
+                        raise LifecycleError(
+                            "Task State published head changed before finalization"
+                        )
+            assert_task_identity(current, task)
+            require_resolved_contract(current, task, directory_fd=directory_fd)
+            if validate_before_write is not None:
+                validate_before_write()
+            path = state_path(current.path)
+            previous = state_status(path)
+            if previous == "merged":
+                return "already-finalized"
+            if previous != "integration-pending":
+                raise LifecycleError(
+                    "post-merge finalization requires Task status integration-pending or merged; "
+                    f"found {previous}"
+                )
+            set_state_status(path, "merged")
     return "finalized"
 
 

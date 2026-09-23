@@ -523,7 +523,9 @@ class PostMergeFinalizationTest(RepositoryFixture):
 
     def finalize(self, evidence: dict, task: str = "TASK-1") -> None:
         with (
-            mock.patch.object(agent_core, "pr_details", side_effect=[evidence, evidence]),
+            mock.patch.object(
+                agent_core, "pr_details", side_effect=[evidence, evidence, evidence]
+            ),
             mock.patch.object(
                 agent_core,
                 "prs_for_branch",

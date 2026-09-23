@@ -1073,29 +1073,10 @@ def _mark_maintenance_merged(
 
 
 def _safe_ref_parent(common: Path, branch: str) -> Path:
-    refs = common / "refs"
-    heads = refs / "heads"
-    for directory in (common, refs, heads):
-        try:
-            metadata = directory.lstat()
-        except OSError as exc:
-            raise MaintenanceError("maintenance ref directory is unavailable") from exc
-        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-            raise MaintenanceError("maintenance ref directory is unsafe")
-    current = heads
-    for part in branch.split("/")[:-1]:
-        current = current / part
-        try:
-            current.mkdir(mode=0o700)
-        except FileExistsError:
-            pass
-        try:
-            metadata = current.lstat()
-        except OSError as exc:
-            raise MaintenanceError("maintenance ref directory is unavailable") from exc
-        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-            raise MaintenanceError("maintenance ref directory is unsafe")
-    return current
+    try:
+        return lifecycle._safe_ref_parent(common, branch)
+    except lifecycle.LifecycleError as exc:
+        raise MaintenanceError(str(exc).replace("terminal", "maintenance", 1)) from exc
 
 
 @contextmanager
@@ -1105,65 +1086,15 @@ def _terminal_ref_locks(
     default_branch: str | None,
     default_revision: str | None,
 ):
-    """Hold Git's exact Task/default ref locks through terminal state commit."""
-    branch = record.branch
-    if branch is None or record.head is None:
-        raise MaintenanceError("maintenance Task ref identity is incomplete")
-    refs = [(branch, record.head)]
-    if (default_branch is None) != (default_revision is None):
-        raise MaintenanceError("maintenance default ref identity is incomplete")
-    if default_branch is not None and default_revision is not None:
-        refs.append((default_branch, default_revision))
-    if len({name for name, _ in refs}) != len(refs):
-        raise MaintenanceError("maintenance Task and default refs must be distinct")
-    common = lifecycle.common_git_dir(record.path)
-    acquired: list[tuple[int, Path, os.stat_result]] = []
     try:
-        for name, revision in sorted(refs):
-            lifecycle.validate_branch_name(name)
-            parent = _safe_ref_parent(common, name)
-            lock = parent / (name.rsplit("/", 1)[-1] + ".lock")
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            try:
-                descriptor = os.open(lock, flags, 0o600)
-            except OSError as exc:
-                raise MaintenanceError(
-                    "maintenance refs are concurrently locked or unavailable"
-                ) from exc
-            try:
-                os.write(descriptor, (revision + "\n").encode("ascii", "strict"))
-                os.fsync(descriptor)
-                acquired.append((descriptor, lock, os.fstat(descriptor)))
-            except Exception:
-                os.close(descriptor)
-                lock.unlink(missing_ok=True)
-                raise
-        yield
-    finally:
-        cleanup_error: MaintenanceError | None = None
-        for descriptor, lock, locked in reversed(acquired):
-            os.close(descriptor)
-            try:
-                current = lock.lstat()
-            except OSError as exc:
-                cleanup_error = MaintenanceError(
-                    "maintenance ref lock changed unexpectedly"
-                )
-                cleanup_error.__cause__ = exc
-                continue
-            if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != (
-                locked.st_dev,
-                locked.st_ino,
-            ):
-                cleanup_error = MaintenanceError(
-                    "maintenance ref lock changed unexpectedly"
-                )
-                continue
-            lock.unlink()
-        if cleanup_error is not None:
-            raise cleanup_error
+        with lifecycle.terminal_ref_locks(
+            record,
+            default_branch=default_branch,
+            default_revision=default_revision,
+        ):
+            yield
+    except lifecycle.LifecycleError as exc:
+        raise MaintenanceError(str(exc).replace("terminal", "maintenance", 1)) from exc
 
 
 def _publication_section(text: str) -> list[str] | None:
