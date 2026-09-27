@@ -530,11 +530,12 @@ def recover_missing_task_state(
     implementation_revision: str,
 ) -> dict:
     """Recover only missing canonical Task authority; never mutate the Task/PR."""
-    if isinstance(requested_pr, bool):
-        raise TaskStateRecoveryError("pull request number must be positive")
-    requested_pr = int(requested_pr)
-    if requested_pr < 1:
-        raise TaskStateRecoveryError("pull request number must be positive")
+    if (
+        not isinstance(requested_pr, int)
+        or isinstance(requested_pr, bool)
+        or requested_pr < 1
+    ):
+        raise TaskStateRecoveryError("pull request number must be a positive integer")
     target = target.resolve()
     receipt_path = private_state.lost_ignored_task_state_receipt(target)
     existing_receipt = _read_receipt(receipt_path)

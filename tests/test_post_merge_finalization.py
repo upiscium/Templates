@@ -1111,6 +1111,8 @@ class PostMergeFinalizationTest(RepositoryFixture):
             dict(evidence, isCrossRepository=0),
             {key: value for key, value in evidence.items() if key != "isCrossRepository"},
             dict(evidence, mergeCommit=None),
+            dict(evidence, mergeCommit="not-an-object"),
+            dict(evidence, mergeCommit=[]),
         )
         for invalid in invalid_values:
             with self.subTest(invalid=invalid):
@@ -1129,15 +1131,28 @@ class PostMergeFinalizationTest(RepositoryFixture):
         ):
             agent_core.merged_pr_evidence(self.repo, "TASK-1", "93")
 
-    def test_pr_list_rejects_malformed_records_and_boolean_numbers(self) -> None:
-        for value in (
-            [None],
-            [{"number": True, "headRefName": "task/TASK-1-demo"}],
+    def test_finalization_enumerates_branch_prs_through_paginated_rest_api(self) -> None:
+        branch = "task/TASK-1-demo"
+        with (
+            mock.patch.object(
+                lifecycle, "cleanup_repository", return_value="acme/widgets"
+            ),
+            mock.patch.object(
+                lifecycle, "pull_requests_for_branch", return_value=[]
+            ) as enumerate_prs,
         ):
+            self.assertEqual([], agent_core.prs_for_branch(self.repo, branch))
+        enumerate_prs.assert_called_once_with(self.repo, branch, "acme/widgets")
+
+    def test_pr_details_rejects_malformed_json_and_non_object_payloads(self) -> None:
+        for value in ("not-json", "[]"):
             with self.subTest(value=value):
-                with mock.patch.object(agent_core, "gh", return_value=json.dumps(value)):
-                    with self.assertRaises(agent_core.AutomationError):
-                        agent_core.prs_for_branch(self.repo, "task/TASK-1-demo")
+                with mock.patch.object(agent_core, "gh", return_value=value):
+                    with self.assertRaisesRegex(
+                        agent_core.AutomationError,
+                        "invalid pull request details",
+                    ):
+                        agent_core.pr_details(self.repo, "93")
 
     def test_wrong_task_states_cannot_jump_to_merged(self) -> None:
         task_worktree = self.start_task()

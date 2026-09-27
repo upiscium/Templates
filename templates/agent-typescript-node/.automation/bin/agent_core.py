@@ -775,7 +775,21 @@ def cleanup(root: Path, task: str) -> None:
 
 
 def pr_details(root: Path, pr: str) -> dict:
-    data = json.loads(gh("pr", "view", pr, "--json", "number,title,body,baseRefName,headRefName,headRefOid,isDraft,isCrossRepository,mergeCommit,mergeable,statusCheckRollup,state", cwd=root))
+    try:
+        data = json.loads(
+            gh(
+                "pr",
+                "view",
+                pr,
+                "--json",
+                "number,title,body,baseRefName,headRefName,headRefOid,isDraft,isCrossRepository,mergeCommit,mergeable,statusCheckRollup,state",
+                cwd=root,
+            )
+        )
+    except json.JSONDecodeError as exc:
+        raise AutomationError("invalid pull request details returned by GitHub") from exc
+    if not isinstance(data, dict):
+        raise AutomationError("invalid pull request details returned by GitHub")
     return data
 
 
@@ -843,29 +857,10 @@ def validate_pr_number(pr: str) -> int:
 
 def prs_for_branch(root: Path, branch: str) -> list[dict]:
     try:
-        value = json.loads(
-            gh(
-                "pr",
-                "list",
-                "--state",
-                "all",
-                "--head",
-                branch,
-                "--limit",
-                "100",
-                "--json",
-                "number,headRefName,baseRefName",
-                cwd=root,
-            )
-        )
-    except json.JSONDecodeError as exc:
-        raise AutomationError("invalid pull request list returned by GitHub") from exc
-    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
-        raise AutomationError("invalid pull request list returned by GitHub")
-    matches = [item for item in value if item.get("headRefName") == branch]
-    for item in matches:
-        _validated_pr_number(item)
-    return matches
+        repository = lifecycle.cleanup_repository(root)
+        return lifecycle.pull_requests_for_branch(root, branch, repository)
+    except lifecycle.LifecycleError as exc:
+        raise AutomationError(str(exc)) from exc
 
 
 def merged_pr_evidence(root: Path, task: str, pr: str) -> tuple[lifecycle.WorktreeRecord, dict]:
@@ -918,7 +913,8 @@ def merged_pr_evidence(root: Path, task: str, pr: str) -> tuple[lifecycle.Worktr
         raise AutomationError("pull request base is not the repository default branch")
     if data.get("isCrossRepository") is not False:
         raise AutomationError("cross-repository pull requests cannot finalize a local Task")
-    merge_oid = (data.get("mergeCommit") or {}).get("oid")
+    merge_commit = data.get("mergeCommit")
+    merge_oid = merge_commit.get("oid") if isinstance(merge_commit, dict) else None
     if not isinstance(merge_oid, str) or not re.fullmatch(r"[0-9a-fA-F]{40,64}", merge_oid):
         raise AutomationError("merged pull request has no valid merge commit identity")
     matches = prs_for_branch(root, branch)

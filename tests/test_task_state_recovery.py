@@ -38,6 +38,21 @@ class TaskStateRecoveryTest(unittest.TestCase):
     BASE = "f9a9ba13e2366e21703847f9edf411e1cb2052a2"
     MAIN = "36dc3a5b0290ce1c4f6e708920a4f234eb6b92b4"
 
+    def test_recovery_rejects_non_integer_pr_numbers_before_io(self) -> None:
+        for requested_pr in (True, 1.0, 1.9, "1", 0, -1):
+            with self.subTest(requested_pr=requested_pr):
+                with self.assertRaisesRegex(
+                    recovery.TaskStateRecoveryError,
+                    "pull request number must be a positive integer",
+                ):
+                    recovery.recover_missing_task_state(
+                        ROOT,
+                        Path("/path/that/must/not/be-read"),
+                        self.TASK,
+                        requested_pr,
+                        self.MAIN,
+                    )
+
     @staticmethod
     def git(*args: str, cwd: Path) -> str:
         result = subprocess.run(args, cwd=cwd, text=True, capture_output=True, check=False)
@@ -529,6 +544,12 @@ class TaskStateRecoveryTest(unittest.TestCase):
         cases = (
             ("missing", lambda _raw: []),
             ("duplicate", lambda raw: [[raw, copy_payload(raw)]]),
+            (
+                "duplicate across pages",
+                lambda raw: [[copy_payload(raw)], [copy_payload(raw)]],
+            ),
+            ("boolean-number", lambda raw: [[{**raw, "number": True}]]),
+            ("non-object-entry", lambda _raw: [[None]]),
             ("wrong-number", lambda raw: [[{**raw, "number": 999}]]),
             ("closed", lambda raw: [[{**raw, "state": "closed"}]]),
             ("invalid-state", lambda raw: [[{**raw, "state": "merged"}]]),
