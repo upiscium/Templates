@@ -306,6 +306,7 @@ class PublicationMetadataTest(unittest.TestCase):
 
     def test_live_validation_uses_terminal_lf_helper(self) -> None:
         pr = {
+            "number": 19,
             "headRefName": "task/19", "baseRefName": "main", "headRefOid": self.HEAD,
             "title": "19: title", "body": "canonical body", "isDraft": True,
             "isCrossRepository": False, "state": "OPEN",
@@ -346,6 +347,54 @@ class PublicationMetadataTest(unittest.TestCase):
                         body="canonical body",
                         draft=True,
                     )
+
+    def test_live_validation_and_edit_target_require_positive_pr_numbers(self) -> None:
+        valid = {
+            "number": 19,
+            "headRefName": "task/19",
+            "baseRefName": "main",
+            "headRefOid": self.HEAD,
+            "title": "19: title",
+            "body": "canonical body",
+            "isDraft": True,
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+        for number in (True, 0, -1, None):
+            with self.subTest(number=number):
+                invalid = {**valid, "number": number}
+                with self.assertRaisesRegex(agent_core.AutomationError, "identity is invalid"):
+                    agent_core._validate_live_pr(
+                        invalid,
+                        branch="task/19",
+                        base="main",
+                        head=self.HEAD,
+                        title="19: title",
+                        body="canonical body",
+                        draft=True,
+                    )
+                with self.assertRaisesRegex(agent_core.AutomationError, "pull request identity is invalid"):
+                    agent_core._validate_edit_target(
+                        invalid, branch="task/19", base="main", head=self.HEAD
+                    )
+
+    def test_pr_ready_rejects_missing_pr_number_before_mutation(self) -> None:
+        root = Path("/repo")
+        context = {"status": "draft-pr-created", "repository": "acme/widgets"}
+        with (
+            mock.patch.object(agent_core, "verify"),
+            mock.patch.object(
+                agent_core, "_publication_context", return_value=("task/TASK-1-demo", context, self.HEAD)
+            ),
+            mock.patch.object(
+                agent_core,
+                "_validated_local_metadata",
+                return_value=("title", root / "body", "body"),
+            ),
+            mock.patch.object(agent_core, "pr_for_branch", return_value={"state": "OPEN"}),
+            self.assertRaisesRegex(agent_core.AutomationError, "identity is invalid"),
+        ):
+            agent_core.pr_ready(root, "TASK-1")
 
     def test_edit_target_requires_exact_boolean_pr_flags(self) -> None:
         pr = {

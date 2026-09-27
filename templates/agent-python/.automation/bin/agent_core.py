@@ -425,6 +425,9 @@ def _base_revision(root: Path) -> str:
 
 
 def _validate_live_pr(pr: dict, *, branch: str, base: str, head: str, title: str, body: str, draft: bool) -> None:
+    if not isinstance(pr, dict):
+        raise AutomationError("live pull request metadata is invalid")
+    _validated_pr_number(pr)
     expected = {
         "headRefName": branch, "baseRefName": base, "headRefOid": head,
         "title": title, "isDraft": draft, "isCrossRepository": False, "state": "OPEN",
@@ -451,6 +454,9 @@ def _validated_pr_number(pr: dict) -> int:
 
 
 def _validate_edit_target(pr: dict, *, branch: str, base: str, head: str) -> None:
+    if not isinstance(pr, dict):
+        raise AutomationError("pull request repair target identity is invalid")
+    _validated_pr_number(pr)
     expected = {
         "headRefName": branch, "baseRefName": base, "headRefOid": head,
         "isDraft": True, "isCrossRepository": False, "state": "OPEN",
@@ -460,8 +466,6 @@ def _validate_edit_target(pr: dict, *, branch: str, base: str, head: str) -> Non
         mismatches
         or type(pr.get("isDraft")) is not bool
         or type(pr.get("isCrossRepository")) is not bool
-        or not isinstance(pr.get("number"), int)
-        or isinstance(pr.get("number"), bool)
     ):
         raise AutomationError("pull request repair target identity is invalid: " + ", ".join(mismatches or ["number"]))
 
@@ -707,10 +711,9 @@ def pr_ready(root: Path, task: str, expected_pr_number: int | None = None) -> No
     pr = pr_for_branch(root, branch, repository)
     if not pr:
         raise AutomationError(f"no pull request for {branch}")
-    number = pr["number"]
+    number = _validated_pr_number(pr)
     base = default_branch(root)
     if expected_pr_number is not None:
-        number = _validated_pr_number(pr)
         if number != expected_pr_number:
             raise AutomationError("pull request identity changed before mutation")
 
