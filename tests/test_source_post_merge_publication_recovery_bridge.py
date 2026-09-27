@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -46,6 +47,41 @@ class PostMergePublicationRecoveryBridgeTest(unittest.TestCase):
         ):
             bridge._merged_publication_pr({}, self.target, {}, True)
         listing.assert_not_called()
+
+    def test_source_pr_list_rejects_malformed_merge_timestamps(self) -> None:
+        valid = {
+            "number": 367,
+            "state": "closed",
+            "merged_at": "2026-09-27T00:00:00Z",
+            "draft": False,
+            "head": {
+                "ref": "task/225-vulkan-development-environment",
+                "sha": "a" * 40,
+                "repo": {"full_name": "upiscium/Terreate"},
+            },
+            "base": {
+                "ref": "main",
+                "sha": "b" * 40,
+                "repo": {"full_name": "upiscium/Terreate"},
+            },
+            "merge_commit_sha": "c" * 40,
+        }
+        invalid = (
+            {**valid, "state": "open"},
+            {**valid, "merged_at": "not-a-timestamp"},
+            {**valid, "merge_commit_sha": None},
+        )
+        for pr in invalid:
+            with self.subTest(pr=pr):
+                with (
+                    mock.patch.object(
+                        bridge,
+                        "_pinned_run",
+                        return_value=mock.Mock(stdout=json.dumps([[pr]]), returncode=0),
+                    ),
+                    self.assertRaises(bridge.BridgeError),
+                ):
+                    bridge._source_pr_list(self.target, self.repository, self.branch)
 
     def setUp(self) -> None:
         self.target = Path("/tmp/terreate-task-225")

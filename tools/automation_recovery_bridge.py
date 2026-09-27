@@ -20,6 +20,7 @@ import sys
 import tempfile
 from collections.abc import Mapping
 from contextlib import contextmanager, redirect_stdout
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -1081,6 +1082,16 @@ def _post_merge_remote_branch_head(
     return head
 
 
+def _valid_github_timestamp(value: object) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
 def _publication_snapshot(modules: dict, target: Path, task: str) -> dict:
     lifecycle = modules["task_lifecycle"]
     agent_core = modules["agent_core"]
@@ -1749,8 +1760,10 @@ def _source_pr_list(target: Path, repository: str, branch: str) -> list[dict]:
         if item.get("state") not in {"open", "closed"} or not isinstance(item.get("draft"), bool):
             raise BridgeError("GitHub pull request list contains invalid state evidence")
         merged_at = item.get("merged_at")
-        if "merged_at" not in item or (merged_at is not None and not isinstance(merged_at, str)):
+        if "merged_at" not in item or (merged_at is not None and not _valid_github_timestamp(merged_at)):
             raise BridgeError("GitHub pull request list contains invalid merge evidence")
+        if merged_at is not None and item.get("state") != "closed":
+            raise BridgeError("GitHub pull request merge state is inconsistent")
         head = item.get("head")
         base = item.get("base")
         if not isinstance(head, dict) or not isinstance(base, dict):
