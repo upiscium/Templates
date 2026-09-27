@@ -186,6 +186,7 @@ def _pull_request(target: Path, repository: str, branch: str, requested: int) ->
 
 
 def _prove_base(target: Path, target_head: str, current_main: str, pr: dict) -> str:
+    current_main = _oid(current_main, "synchronized default branch")
     parents = _git(target, "rev-list", "--parents", "-n", "1", target_head).split()
     if len(parents) != 2 or parents[0] != target_head:
         raise TaskStateRecoveryError("Task HEAD must have exactly one mechanically provable parent")
@@ -193,10 +194,12 @@ def _prove_base(target: Path, target_head: str, current_main: str, pr: dict) -> 
     bases = [item for item in _git(target, "merge-base", "--all", target_head, current_main).splitlines() if item]
     if bases != [parent]:
         raise TaskStateRecoveryError("Task original base is ambiguous or does not match its parent")
-    if pr.get("baseRefOid") != parent:
-        raise TaskStateRecoveryError("pull request base revision does not match the proven original base")
     if pr.get("baseRefName") != "main":
         raise TaskStateRecoveryError("pull request base branch is not main")
+    if _oid(pr.get("baseRefOid"), "pull request base revision") != current_main:
+        raise TaskStateRecoveryError(
+            "pull request base revision does not match the synchronized default branch"
+        )
     return parent
 
 
@@ -350,7 +353,7 @@ def _plan(
         "pr_head_ref": branch,
         "pr_head_oid": target_head,
         "pr_base_ref": "main",
-        "pr_base_oid": base,
+        "pr_base_oid": pr["baseRefOid"],
         "issue_sha256": issue_digest,
         "implementation_source": str(source_root.resolve()),
         "implementation_revision": implementation_revision,
