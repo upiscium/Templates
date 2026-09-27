@@ -883,6 +883,7 @@ def integrate_check(root: Path, pr: str) -> None:
 
 
 def integrate_merge(root: Path, pr: str) -> None:
+    pr = str(validate_pr_number(pr))
     checkpoint = integration_checkpoint(root, pr)
     if not checkpoint.exists() or checkpoint.is_symlink() or not checkpoint.is_file():
         raise AutomationError("run integrate::check before merge")
@@ -902,7 +903,10 @@ def integrate_merge(root: Path, pr: str) -> None:
 def validate_pr_number(pr: str) -> int:
     if not re.fullmatch(r"[1-9][0-9]*", pr):
         raise AutomationError(f"invalid pull request number: {pr!r}")
-    return int(pr)
+    try:
+        return int(pr)
+    except ValueError as exc:
+        raise AutomationError("invalid pull request number") from exc
 
 
 def prs_for_branch(root: Path, branch: str) -> list[dict]:

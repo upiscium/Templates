@@ -87,7 +87,7 @@ class AgentCoreSafetyTest(unittest.TestCase):
                     self.validate_details(details)
 
     def test_invalid_integration_pr_argument_is_rejected_before_github_lookup(self) -> None:
-        for pr in ("--repo=attacker/target", "0", "12trailing"):
+        for pr in ("--repo=attacker/target", "0", "12trailing", "9" * 5000):
             with self.subTest(pr=pr):
                 with (
                     mock.patch.object(agent_core, "pr_details") as details,
@@ -95,6 +95,14 @@ class AgentCoreSafetyTest(unittest.TestCase):
                 ):
                     agent_core.validate_integration(Path("/repo"), pr)
                 details.assert_not_called()
+
+    def test_integrate_merge_rejects_oversized_pr_before_checkpoint_path_access(self) -> None:
+        with (
+            mock.patch.object(agent_core, "integration_checkpoint") as checkpoint,
+            self.assertRaises(agent_core.AutomationError),
+        ):
+            agent_core.integrate_merge(Path("/repo"), "9" * 5000)
+        checkpoint.assert_not_called()
 
     def test_base_revision_requires_trusted_default_branch_history(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

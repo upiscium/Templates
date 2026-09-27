@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -19,6 +20,24 @@ spec.loader.exec_module(lifecycle)
 
 
 class TaskLifecycleTest(unittest.TestCase):
+    def test_pull_requests_for_branch_wraps_json_integer_parse_errors(self) -> None:
+        result = subprocess.CompletedProcess(
+            [], 0, "[[{\"number\": 999999999999999999999}]]", ""
+        )
+        with (
+            mock.patch.object(lifecycle, "gh", return_value=result),
+            mock.patch.object(
+                lifecycle.json, "loads", side_effect=ValueError("integer digit limit")
+            ),
+            self.assertRaisesRegex(
+                lifecycle.LifecycleError,
+                "GitHub pull request evidence is invalid",
+            ),
+        ):
+            lifecycle.pull_requests_for_branch(
+                Path("/repo"), "task/TASK-1-demo", "acme/widgets"
+            )
+
     def test_full_git_object_id_validator_accepts_only_sha1_or_sha256_width(self) -> None:
         for width in (40, 64):
             self.assertIsNotNone(lifecycle.OID_RE.fullmatch("a" * width))

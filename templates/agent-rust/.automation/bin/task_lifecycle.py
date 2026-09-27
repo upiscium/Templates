@@ -1974,7 +1974,7 @@ def pull_requests_for_branch(root: Path, branch: str, repository: str) -> list[d
         raise LifecycleError("cannot reconstruct GitHub pull request evidence")
     try:
         value = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
+    except ValueError as exc:
         raise LifecycleError("GitHub pull request evidence is invalid") from exc
     if not isinstance(value, list) or any(not isinstance(page, list) for page in value):
         raise LifecycleError("GitHub pull request evidence is invalid")
