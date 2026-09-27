@@ -23,6 +23,67 @@ spec.loader.exec_module(agent_core)
 
 
 class AgentCoreSafetyTest(unittest.TestCase):
+    @staticmethod
+    def valid_integration_details() -> dict:
+        return {
+            "number": 12,
+            "state": "OPEN",
+            "baseRefName": "main",
+            "headRefName": "task/TASK-1-demo",
+            "headRefOid": "a" * 40,
+            "isDraft": False,
+            "isCrossRepository": False,
+            "mergeable": "MERGEABLE",
+            "statusCheckRollup": [],
+        }
+
+    def validate_details(self, details: object) -> dict:
+        with (
+            mock.patch.object(agent_core, "pr_details", return_value=details),
+            mock.patch.object(agent_core, "default_branch", return_value="main"),
+        ):
+            return agent_core.validate_integration(Path("/repo"), "12")
+
+    def test_integration_evidence_requires_exact_open_same_repository_draft_identity(self) -> None:
+        valid = self.valid_integration_details()
+        self.assertEqual(self.validate_details(valid), valid)
+        for passed_check in (
+            {"status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"state": "SUCCESS"},
+            {"conclusion": "NEUTRAL"},
+        ):
+            with self.subTest(passed_check=passed_check):
+                details = dict(valid, statusCheckRollup=[passed_check])
+                self.assertEqual(self.validate_details(details), details)
+        invalid = (
+            dict(valid, number=True),
+            dict(valid, number=13),
+            {key: value for key, value in valid.items() if key != "number"},
+            dict(valid, state="CLOSED"),
+            dict(valid, state=None),
+            {key: value for key, value in valid.items() if key != "baseRefName"},
+            dict(valid, isDraft=True),
+            dict(valid, isDraft=None),
+            dict(valid, isCrossRepository=True),
+            dict(valid, isCrossRepository=None),
+            dict(valid, headRefOid="not-a-full-sha"),
+            dict(valid, headRefOid=123),
+            {key: value for key, value in valid.items() if key != "headRefOid"},
+            dict(valid, statusCheckRollup=None),
+            dict(valid, statusCheckRollup="SUCCESS"),
+            dict(valid, statusCheckRollup=[None]),
+            dict(valid, statusCheckRollup=[{"status": "COMPLETED", "conclusion": None}]),
+            dict(
+                valid,
+                statusCheckRollup=[{"status": "COMPLETED", "conclusion": "FAILURE"}],
+            ),
+            dict(valid, statusCheckRollup=[{"state": "PENDING"}]),
+        )
+        for details in invalid:
+            with self.subTest(details=details):
+                with self.assertRaises(agent_core.AutomationError):
+                    self.validate_details(details)
+
     def test_integration_checkpoint_preserves_opencode_project_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

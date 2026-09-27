@@ -795,20 +795,50 @@ def pr_details(root: Path, pr: str) -> dict:
 
 def validate_integration(root: Path, pr: str) -> dict:
     data = pr_details(root, pr)
-    if data["baseRefName"] != default_branch(root):
+    requested = validate_pr_number(pr)
+    if _validated_pr_number(data) != requested:
+        raise AutomationError("GitHub returned a different pull request")
+    if data.get("state") != "OPEN":
+        raise AutomationError("PR is not open")
+    if data.get("baseRefName") != default_branch(root):
         raise AutomationError("PR base is not the repository default branch")
-    if data["isDraft"]:
+    if data.get("isDraft") is not False:
         raise AutomationError("Draft PR cannot be merged")
+    if data.get("isCrossRepository") is not False:
+        raise AutomationError("cross-repository PR cannot be merged")
+    head = data.get("headRefOid")
+    if not isinstance(head, str) or not re.fullmatch(r"[0-9a-fA-F]{40,64}", head):
+        raise AutomationError("PR head is not a full immutable revision")
     if data.get("mergeable") != "MERGEABLE":
         raise AutomationError(f"PR is not mergeable: {data.get('mergeable')}")
+    rollup = data.get("statusCheckRollup")
+    if not isinstance(rollup, list):
+        raise AutomationError("PR status check rollup is invalid")
     failures = []
-    for check in data.get("statusCheckRollup") or []:
+    for check in rollup:
+        if not isinstance(check, dict):
+            raise AutomationError("PR status check rollup is invalid")
         conclusion = check.get("conclusion")
         status = check.get("status")
+        state = check.get("state")
+        if any(
+            value is not None and not isinstance(value, str)
+            for value in (conclusion, status, state)
+        ):
+            raise AutomationError("PR status check rollup is invalid")
+        if not any(value for value in (conclusion, status, state)):
+            raise AutomationError("PR status check rollup is invalid")
+        if status == "COMPLETED" and not conclusion:
+            raise AutomationError("PR status check rollup is invalid")
+        label = check.get("name") or check.get("context")
+        if not isinstance(label, str) or not label:
+            label = "status check"
         if status and status != "COMPLETED":
-            failures.append(check.get("name") or check.get("context") or "pending check")
-        elif conclusion and conclusion not in SAFE_CHECK_CONCLUSIONS:
-            failures.append(check.get("name") or check.get("context") or conclusion)
+            failures.append(label)
+        if conclusion and conclusion not in SAFE_CHECK_CONCLUSIONS:
+            failures.append(label)
+        if state and state != "SUCCESS":
+            failures.append(label)
     if failures:
         raise AutomationError("required checks are not successful: " + ", ".join(failures))
     return data
