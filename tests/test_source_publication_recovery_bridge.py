@@ -384,13 +384,15 @@ class PublicationRecoveryBridgeTest(unittest.TestCase):
             "state": b"- Base revision: " + b"b" * 40 + b"\n- Status: publication-ready\n",
             "status": "publication-ready",
         }
-        receipt = bridge._publication_recovery_receipt(
-            self.target, "131", ready, "main", 29
-        )
+        with mock.patch.object(bridge, "_target_git", return_value=""):
+            receipt = bridge._publication_recovery_receipt(
+                self.target, "131", ready, "main", 29
+            )
         self.agent.default_branch.return_value = "main"
         self.agent.pr_for_branch.return_value = None
         with mock.patch.object(bridge, "_publication_snapshot", return_value=ready), \
              mock.patch.object(bridge, "_read_publication_recovery_receipt", return_value=receipt), \
+             mock.patch.object(bridge, "_target_git", return_value=""), \
              self.assertRaisesRegex(bridge.BridgeError, "receipt-bound Draft PR"):
             bridge._publication_recover(self.modules, self.target, "131")
         self.agent.pr_create.assert_not_called()
@@ -405,9 +407,10 @@ class PublicationRecoveryBridgeTest(unittest.TestCase):
             "state": b"- Base revision: " + b"b" * 40 + b"\n- Status: publication-ready\n",
             "status": "publication-ready",
         }
-        receipt = bridge._publication_recovery_receipt(
-            self.target, "131", ready, "main", 29
-        )
+        with mock.patch.object(bridge, "_target_git", return_value=""):
+            receipt = bridge._publication_recovery_receipt(
+                self.target, "131", ready, "main", 29
+            )
         replacement = {
             "number": 30, "headRefName": self.branch, "baseRefName": "main",
             "headRefOid": self.head, "isDraft": True,
@@ -417,6 +420,7 @@ class PublicationRecoveryBridgeTest(unittest.TestCase):
         self.agent.pr_for_branch.return_value = replacement
         with mock.patch.object(bridge, "_publication_snapshot", return_value=ready), \
              mock.patch.object(bridge, "_read_publication_recovery_receipt", return_value=receipt), \
+             mock.patch.object(bridge, "_target_git", return_value=""), \
              self.assertRaisesRegex(bridge.BridgeError, "differs from recovery receipt"):
             bridge._publication_recover(self.modules, self.target, "131")
         self.agent.pr_create.assert_not_called()
@@ -516,9 +520,10 @@ class PublicationRecoveryBridgeTest(unittest.TestCase):
             "state": ready["state"].replace(b"publication-ready", b"draft-pr-created"),
             "status": "draft-pr-created",
         }
-        receipt = bridge._publication_recovery_receipt(
-            self.target, "131", ready, "main", 29
-        )
+        with mock.patch.object(bridge, "_target_git", return_value=""):
+            receipt = bridge._publication_recovery_receipt(
+                self.target, "131", ready, "main", 29
+            )
         exact = {
             "number": 29, "headRefName": self.branch, "baseRefName": "main",
             "headRefOid": self.head, "isDraft": True,

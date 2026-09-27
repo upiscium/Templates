@@ -26,6 +26,7 @@ class PublicationReadyRecoveryBridgeTests(unittest.TestCase):
         self.branch = "task/13-hybrid-level1-reranking"
         self.repository = "upiscium/AgentKnowledgeVault"
         self.record = mock.Mock(path=self.target, branch=self.branch, head=self.head)
+        self.snapshot_git_calls = []
         self.lifecycle = mock.Mock()
         self.lifecycle.repo_root.return_value = self.target
         self.lifecycle.current_worktree.return_value = mock.Mock(path=self.target)
@@ -168,6 +169,7 @@ class PublicationReadyRecoveryBridgeTests(unittest.TestCase):
                 self.assertNotEqual(str(config), "/tmp/attacker-gh")
 
     def _snapshot_git(self, *args, **kwargs):
+        self.snapshot_git_calls.append(args)
         if args[:2] == ("rev-parse", "--verify"):
             return self.head
         if args[:2] == ("rev-parse", "HEAD^{tree}"):
@@ -261,6 +263,10 @@ class PublicationReadyRecoveryBridgeTests(unittest.TestCase):
     def test_akv_snapshot_keeps_historical_work_units_and_effective_reviews(self):
         snapshot = self._snapshot()
         self.assertEqual(snapshot["repository"], self.repository)
+        self.assertIn(
+            ("merge-base", "--is-ancestor", "b" * 40, "main"),
+            self.snapshot_git_calls,
+        )
         self.assertIn(b"WU-13-28", snapshot["work_units"])
         self.publication.completed_reviews.assert_called_once_with(self.target, self.task)
         self.assertIn("WU-13-52", " ".join(self.publication.completed_reviews.return_value))

@@ -659,6 +659,13 @@ class MaintenanceLifecycleTest(unittest.TestCase):
             self._write(task, ".automation/VERSION", "3\n")
             self._write(task, ".automation/bin/first-upgrade.py", "base\n")
             base = self._commit(task, "Task base")
+            self._git(task, "update-ref", "refs/remotes/origin/main", base)
+            self._git(
+                task,
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            )
             self._write(task, ".automation/bin/first-upgrade.py", "first upgrade\n")
             self._commit(task, "first maintenance upgrade")
             self._write(task, ".automation/bin/second-upgrade.py", "second upgrade\n")

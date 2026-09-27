@@ -96,6 +96,27 @@ class AgentCoreSafetyTest(unittest.TestCase):
                     agent_core.validate_integration(Path("/repo"), pr)
                 details.assert_not_called()
 
+    def test_base_revision_requires_trusted_default_branch_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".task-state/task.md"
+            state.parent.mkdir()
+            revision = "a" * 40
+            state.write_text(f"- Base revision: {revision}\n", encoding="utf-8")
+            with (
+                mock.patch.object(
+                    agent_core.lifecycle,
+                    "require_cleanup_base_revision",
+                    side_effect=agent_core.lifecycle.LifecycleError("not trusted"),
+                ) as require_base,
+                self.assertRaisesRegex(
+                    agent_core.AutomationError,
+                    "Task Base revision is not trusted default-branch history",
+                ),
+            ):
+                agent_core._base_revision(root)
+            require_base.assert_called_once_with(root, revision)
+
     def test_integration_checkpoint_preserves_opencode_project_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

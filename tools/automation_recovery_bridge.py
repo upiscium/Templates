@@ -1018,6 +1018,20 @@ def _state_bytes(target: Path, name: str, contract=None) -> bytes:
         raise BridgeError(f"cannot read required Task evidence: {path}") from exc
 
 
+def _require_base_revision_history(
+    target: Path, base_revision: str, default_branch: str
+) -> None:
+    if not _REVISION_RE.fullmatch(base_revision) or not default_branch:
+        raise BridgeError("Task Base revision or default branch is invalid")
+    _target_git(
+        "merge-base",
+        "--is-ancestor",
+        base_revision,
+        default_branch,
+        target=target,
+    )
+
+
 def _optional_state_bytes(target: Path, name: str, contract) -> bytes | None:
     path = target / ".task-state" / name
     try:
@@ -1253,6 +1267,8 @@ def _publication_recovery_receipt(
     base_match = _BASE_REVISION_BYTES_RE.search(snapshot["state"])
     if base_match is None:
         raise BridgeError("Task State has no valid Base revision")
+    base_revision = base_match.group(1).decode("ascii").lower()
+    _require_base_revision_history(target, base_revision, base)
 
     def digest(content: bytes | None) -> str | None:
         return hashlib.sha256(content).hexdigest() if content is not None else None
@@ -1266,7 +1282,7 @@ def _publication_recovery_receipt(
         "branch": snapshot["branch"],
         "head": snapshot["head"],
         "base_branch": base,
-        "base_revision": base_match.group(1).decode("ascii").lower(),
+        "base_revision": base_revision,
         "pr_number": pr_number,
         "blocked_state_sha256": digest(blocked),
         "publication_ready_state_sha256": digest(ready),
@@ -1324,8 +1340,13 @@ def _validate_publication_recovery_receipt(
     }
     mismatches = [name for name, expected_value in expected.items() if value.get(name) != expected_value]
     base_match = _BASE_REVISION_BYTES_RE.search(snapshot["state"])
-    if base_match is None or value.get("base_revision") != base_match.group(1).decode("ascii").lower():
+    if base_match is None:
         mismatches.append("base_revision")
+    else:
+        base_revision = base_match.group(1).decode("ascii").lower()
+        _require_base_revision_history(target, base_revision, base)
+        if value.get("base_revision") != base_revision:
+            mismatches.append("base_revision")
     number = value.get("pr_number")
     if not isinstance(number, int) or isinstance(number, bool) or number < 1:
         mismatches.append("pr_number")
@@ -1378,7 +1399,10 @@ def _publication_recover(modules: dict, target: Path, task: str) -> dict:
         base_match = _BASE_REVISION_BYTES_RE.search(before["state"])
         if base_match is None:
             raise BridgeError("Task State has no valid Base revision")
-        base = base_match.group(1).decode("ascii")
+        base = base_match.group(1).decode("ascii").lower()
+        if blocked_base is None:
+            raise BridgeError("default branch is unresolved during publication recovery")
+        _require_base_revision_history(target, base, blocked_base)
         paths = _target_git(
             "diff", "--name-only", f"{base}...{before['head']}", target=target
         ).splitlines()
@@ -1640,6 +1664,8 @@ def _source_publication_snapshot(
         base_revision = _BASE_REVISION_LOWER_BYTES_RE.search(state)
         if not base_branch or base_branch.group(1).decode() != base or not base_revision:
             raise BridgeError("Task base branch or revision is not canonical and stable")
+        base_revision_value = base_revision.group(1).decode("ascii")
+        _require_base_revision_history(target, base_revision_value, base)
         status = lifecycle.state_status(lifecycle.state_path(target))
         if status not in {"draft-pr-created", "integration-pending"}:
             raise BridgeError(f"publication-ready recovery requires draft-pr-created or integration-pending; found {status}")
@@ -1660,7 +1686,7 @@ def _source_publication_snapshot(
         if modules["publication_metadata"].verification_evidence(target, task, head) is None:
             raise BridgeError("missing persisted verification evidence")
         modules["publication_metadata"].completed_reviews(target, task)
-        changed = _target_git("diff", "--name-only", f"{base_revision.group(1).decode()}...{head}", target=target).splitlines()
+        changed = _target_git("diff", "--name-only", f"{base_revision_value}...{head}", target=target).splitlines()
         title, body = modules["publication_metadata"].canonical_metadata(
             target, task, head=head, changed_paths=changed
         )
@@ -1676,7 +1702,7 @@ def _source_publication_snapshot(
     return {
         "record": record, "head": head, "branch": branch, "repository": repository,
         "base": base, "state": state, "status": status, "verification": verification,
-        "base_revision": base_revision.group(1).decode(),
+        "base_revision": base_revision_value,
         "work_units": _state_bytes(target, "work-units.json", contract),
         "contract": _state_bytes(target, "contract.json", contract),
         "issue": _optional_state_bytes(target, "issue.json", contract),

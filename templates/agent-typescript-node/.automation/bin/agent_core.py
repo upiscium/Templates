@@ -380,13 +380,8 @@ def pr_prepare(root: Path, task: str) -> None:
     branch, context, head = _publication_context(root, task)
     if context["status"] not in {"publication-ready", "draft-pr-created"}:
         raise AutomationError(f"publication metadata preparation requires publication-ready or draft-pr-created; found {context['status']}")
-    state = lifecycle.state_path(root).read_text(encoding="utf-8")
-    base_revision = re.search(
-        rf"(?m)^- Base revision: ({private_state.OID_RE.pattern})$", state
-    )
-    if base_revision is None:
-        raise AutomationError("Task State has no valid Base revision")
-    paths = git("diff", "--name-only", f"{base_revision.group(1)}...{head}", cwd=root).splitlines()
+    base_revision = _base_revision(root)
+    paths = git("diff", "--name-only", f"{base_revision}...{head}", cwd=root).splitlines()
     try:
         title, body = publication.canonical_metadata(root, task, head=head, changed_paths=paths)
         publication.write_metadata(root, title, body)
@@ -421,7 +416,14 @@ def _base_revision(root: Path) -> str:
     )
     if match is None:
         raise AutomationError("Task State has no valid Base revision")
-    return match.group(1)
+    revision = match.group(1)
+    try:
+        lifecycle.require_cleanup_base_revision(root, revision)
+    except lifecycle.LifecycleError as exc:
+        raise AutomationError(
+            "Task Base revision is not trusted default-branch history"
+        ) from exc
+    return revision
 
 
 def _validate_live_pr(pr: dict, *, branch: str, base: str, head: str, title: str, body: str, draft: bool) -> None:
