@@ -2,6 +2,26 @@
 
 Nix flake templates for reproducible, Agent-ready development environments.
 
+## Develop Templates
+
+The repository root `flake.nix` is the development-environment source of truth. Its default devShell provides the repository tools required for normal Templates work, including `just`, `python3`, `git`, and `gh`.
+
+With `direnv` and `nix-direnv` installed on the host, approve the repository once:
+
+```sh
+direnv allow
+```
+
+After that, entering the checkout automatically loads the flake devShell through `.envrc`, so commands such as `just --list` are available without manually prefixing them with `nix develop`.
+
+If direnv is not available, enter the same environment explicitly:
+
+```sh
+nix develop
+```
+
+Do not install or pin a separate repository-local `just` binary. Keep required development tools in the root flake so direnv and manual `nix develop` use the same environment.
+
 ## Start a new repository
 
 There are two new-repository distribution channels. Use a GitHub Template Repository when creating the repository on GitHub, or use the Nix flake template when initializing a local directory.
