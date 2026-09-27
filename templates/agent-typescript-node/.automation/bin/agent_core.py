@@ -28,6 +28,7 @@ except ModuleNotFoundError:  # pragma: no cover
 TASK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 SAFE_CHECK_CONCLUSIONS = {"SUCCESS", "SKIPPED", "NEUTRAL"}
+MAX_PULL_REQUEST_NUMBER = (1 << 63) - 1
 
 
 class AutomationError(RuntimeError):
@@ -901,12 +902,19 @@ def integrate_merge(root: Path, pr: str) -> None:
 
 
 def validate_pr_number(pr: str) -> int:
-    if not re.fullmatch(r"[1-9][0-9]*", pr):
-        raise AutomationError(f"invalid pull request number: {pr!r}")
+    if (
+        not isinstance(pr, str)
+        or len(pr) > 19
+        or not re.fullmatch(r"[1-9][0-9]*", pr)
+    ):
+        raise AutomationError("invalid pull request number")
     try:
-        return int(pr)
+        number = int(pr)
     except ValueError as exc:
         raise AutomationError("invalid pull request number") from exc
+    if number > MAX_PULL_REQUEST_NUMBER:
+        raise AutomationError("invalid pull request number")
+    return number
 
 
 def prs_for_branch(root: Path, branch: str) -> list[dict]:
