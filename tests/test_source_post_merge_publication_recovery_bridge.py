@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -19,6 +20,69 @@ SPEC.loader.exec_module(bridge)
 
 
 class PostMergePublicationRecoveryBridgeTest(unittest.TestCase):
+    def test_source_pr_list_rejects_non_positive_or_boolean_numbers(self) -> None:
+        for number in ("true", "0", "-1"):
+            with self.subTest(number=number):
+                output = (
+                    '[[{"number":'
+                    + number
+                    + '}]]'
+                )
+                with (
+                    mock.patch.object(
+                        bridge,
+                        "_pinned_run",
+                        return_value=mock.Mock(stdout=output),
+                    ),
+                    self.assertRaisesRegex(bridge.BridgeError, "invalid PR number"),
+                ):
+                    bridge._source_pr_list(
+                        self.target, self.repository, self.branch
+                    )
+
+    def test_merged_publication_rejects_boolean_requested_pr_before_listing(self) -> None:
+        with (
+            mock.patch.object(bridge, "_source_pr_list") as listing,
+            self.assertRaisesRegex(bridge.BridgeError, "positive non-bool integer"),
+        ):
+            bridge._merged_publication_pr({}, self.target, {}, True)
+        listing.assert_not_called()
+
+    def test_source_pr_list_rejects_malformed_merge_timestamps(self) -> None:
+        valid = {
+            "number": 367,
+            "state": "closed",
+            "merged_at": "2026-09-27T00:00:00Z",
+            "draft": False,
+            "head": {
+                "ref": "task/225-vulkan-development-environment",
+                "sha": "a" * 40,
+                "repo": {"full_name": "upiscium/Terreate"},
+            },
+            "base": {
+                "ref": "main",
+                "sha": "b" * 40,
+                "repo": {"full_name": "upiscium/Terreate"},
+            },
+            "merge_commit_sha": "c" * 40,
+        }
+        invalid = (
+            {**valid, "state": "open"},
+            {**valid, "merged_at": "not-a-timestamp"},
+            {**valid, "merge_commit_sha": None},
+        )
+        for pr in invalid:
+            with self.subTest(pr=pr):
+                with (
+                    mock.patch.object(
+                        bridge,
+                        "_pinned_run",
+                        return_value=mock.Mock(stdout=json.dumps([[pr]]), returncode=0),
+                    ),
+                    self.assertRaises(bridge.BridgeError),
+                ):
+                    bridge._source_pr_list(self.target, self.repository, self.branch)
+
     def setUp(self) -> None:
         self.target = Path("/tmp/terreate-task-225")
         self.main = Path("/tmp/terreate-main")
@@ -43,6 +107,14 @@ class PostMergePublicationRecoveryBridgeTest(unittest.TestCase):
         self.core.ensure_task_branch.return_value = self.branch
         self.core.canonical_repository.return_value = self.repository
         self.core.default_branch.return_value = "main"
+
+        def validated_pr_number(pr: object) -> int:
+            number = pr.get("number") if isinstance(pr, dict) else None
+            if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+                raise ValueError("pull request identity is invalid")
+            return number
+
+        self.core._validated_pr_number.side_effect = validated_pr_number
         self.core.merge_commit_is_ancestor.return_value = True
         self.publication = mock.Mock()
         self.publication.canonical_pr_body_matches.return_value = True

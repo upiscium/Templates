@@ -16,6 +16,7 @@ BIN = ROOT / "components/agent-core/.automation/bin"
 sys.path.insert(0, str(BIN))
 import task_lifecycle as lifecycle
 import task_contract
+import git_private_state as private_state
 
 spec = importlib.util.spec_from_file_location("post_merge_agent_core", BIN / "agent_core.py")
 assert spec and spec.loader
@@ -471,7 +472,10 @@ class DefaultBranchSynchronizationTest(RepositoryFixture):
         ]
         with mock.patch.object(lifecycle, "run", side_effect=responses) as observed:
             self.assertEqual(lifecycle.default_branch(self.repo), "main")
-        self.assertEqual(observed.call_args_list[1].kwargs["remove_env"], ("GH_REPO",))
+        self.assertEqual(
+            observed.call_args_list[1].kwargs["remove_env"],
+            ("GH_REPO", "GH_HOST", "GH_ENTERPRISE_TOKEN"),
+        )
 
 
 class PostMergeFinalizationTest(RepositoryFixture):
@@ -495,12 +499,13 @@ class PostMergeFinalizationTest(RepositoryFixture):
     def merged_evidence(self, task_worktree: Path, merge_oid: str, **changes: object) -> dict:
         value = {
             "number": 93,
-            "state": "MERGED",
-            "headRefName": command("git", "branch", "--show-current", cwd=task_worktree),
-            "headRefOid": command("git", "rev-parse", "HEAD", cwd=task_worktree),
-            "baseRefName": "main",
-            "isCrossRepository": False,
-            "mergeCommit": {"oid": merge_oid},
+                "state": "MERGED",
+                "headRefName": command("git", "branch", "--show-current", cwd=task_worktree),
+                "headRefOid": command("git", "rev-parse", "HEAD", cwd=task_worktree),
+                "baseRefName": "main",
+                "baseRefOid": command("git", "rev-parse", "main", cwd=task_worktree),
+                "isCrossRepository": False,
+                "mergeCommit": {"oid": merge_oid},
         }
         value.update(changes)
         return value
@@ -517,15 +522,81 @@ class PostMergeFinalizationTest(RepositoryFixture):
         return task_worktree, task_head, self.merged_evidence(task_worktree, merge_oid)
 
     def finalize(self, evidence: dict, task: str = "TASK-1") -> None:
+        def github(*args: str, cwd: Path, check: bool = True):
+            if args[:2] == ("repo", "view"):
+                return subprocess.CompletedProcess(
+                    ["gh", *args], 0, json.dumps({"nameWithOwner": "acme/widgets"}), ""
+                )
+            if args[:1] == ("api",):
+                rest_pr = {
+                    "number": evidence["number"],
+                    "state": "closed",
+                    "merged_at": "2026-08-30T00:00:00Z",
+                    "draft": False,
+                    "head": {
+                        "ref": evidence["headRefName"],
+                        "sha": evidence["headRefOid"],
+                        "repo": {"full_name": "acme/widgets"},
+                    },
+                    "base": {
+                        "ref": evidence["baseRefName"],
+                        "sha": evidence["baseRefOid"],
+                        "repo": {"full_name": "acme/widgets"},
+                    },
+                    "merge_commit_sha": evidence["mergeCommit"]["oid"],
+                }
+                return subprocess.CompletedProcess(
+                    ["gh", *args], 0, json.dumps([[rest_pr]]), ""
+                )
+            raise AssertionError(f"unexpected GitHub request: {args!r}")
+
         with (
-            mock.patch.object(agent_core, "pr_details", side_effect=[evidence, evidence]),
             mock.patch.object(
-                agent_core,
-                "prs_for_branch",
-                return_value=[{"number": 93, "headRefName": evidence["headRefName"], "baseRefName": "main"}],
+                agent_core, "pr_details", side_effect=[evidence, evidence, evidence]
             ),
+            mock.patch.object(lifecycle, "gh", side_effect=github),
         ):
             agent_core.integrate_finalize(self.repo, task, "93")
+
+    def test_duplicate_paginated_task_prs_do_not_finalize(self) -> None:
+        task_worktree, _, evidence = self.prepare()
+        state = task_worktree / ".task-state/task.md"
+
+        def github(*args: str, cwd: Path, check: bool = True):
+            if args[:2] == ("repo", "view"):
+                return subprocess.CompletedProcess(
+                    ["gh", *args], 0, json.dumps({"nameWithOwner": "acme/widgets"}), ""
+                )
+            if args[:1] == ("api",):
+                rest_pr = {
+                    "number": evidence["number"],
+                    "state": "closed",
+                    "merged_at": "2026-08-30T00:00:00Z",
+                    "draft": False,
+                    "head": {
+                        "ref": evidence["headRefName"],
+                        "sha": evidence["headRefOid"],
+                        "repo": {"full_name": "acme/widgets"},
+                    },
+                    "base": {
+                        "ref": evidence["baseRefName"],
+                        "sha": evidence["baseRefOid"],
+                        "repo": {"full_name": "acme/widgets"},
+                    },
+                    "merge_commit_sha": evidence["mergeCommit"]["oid"],
+                }
+                return subprocess.CompletedProcess(
+                    ["gh", *args], 0, json.dumps([[rest_pr], [rest_pr]]), ""
+                )
+            raise AssertionError(f"unexpected GitHub request: {args!r}")
+
+        with (
+            mock.patch.object(agent_core, "pr_details", return_value=evidence),
+            mock.patch.object(lifecycle, "gh", side_effect=github),
+            self.assertRaisesRegex(agent_core.AutomationError, "missing or ambiguous"),
+        ):
+            agent_core.integrate_finalize(self.repo, "TASK-1", "93")
+        self.assertEqual(lifecycle.state_status(state), "integration-pending")
 
     def cleanup_run(
         self,
@@ -551,6 +622,7 @@ class PostMergeFinalizationTest(RepositoryFixture):
                     "number": evidence["number"],
                     "state": "closed" if evidence["state"] == "MERGED" else evidence["state"].lower(),
                     "merged_at": "2026-08-30T00:00:00Z" if evidence["state"] == "MERGED" else None,
+                    "draft": bool(evidence.get("draft", False)),
                     "merge_commit_sha": (evidence.get("mergeCommit") or {}).get("oid"),
                     "head": {
                         "ref": evidence["headRefName"],
@@ -561,7 +633,11 @@ class PostMergeFinalizationTest(RepositoryFixture):
                             else "acme/widgets"
                         },
                     },
-                    "base": {"ref": evidence["baseRefName"]},
+                    "base": {
+                        "ref": evidence["baseRefName"],
+                        "sha": evidence.get("baseRefOid", "c" * 40),
+                        "repo": {"full_name": "acme/widgets"},
+                    },
                 }
                 return subprocess.CompletedProcess(command_args, 0, json.dumps([[raw]]), "")
             if (
@@ -752,13 +828,18 @@ class PostMergeFinalizationTest(RepositoryFixture):
                 "number": number,
                 "state": "closed",
                 "merged_at": "2026-08-30T00:00:00Z",
+                "draft": False,
                 "merge_commit_sha": "b" * 40,
                 "head": {
                     "ref": branch,
                     "sha": "a" * 40,
                     "repo": {"full_name": "acme/widgets"},
                 },
-                "base": {"ref": "main"},
+                "base": {
+                    "ref": "main",
+                    "sha": "c" * 40,
+                    "repo": {"full_name": "acme/widgets"},
+                },
             }
 
         pages = [[raw(number) for number in range(1, 101)], [raw(101)]]
@@ -772,6 +853,104 @@ class PostMergeFinalizationTest(RepositoryFixture):
         self.assertIn("--paginate", query.call_args.args)
         self.assertIn("--slurp", query.call_args.args)
 
+    def test_cleanup_rejects_malformed_pr_base_sha(self) -> None:
+        task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
+        raw = {
+            "number": evidence["number"],
+            "state": "closed",
+            "merged_at": "2026-08-30T00:00:00Z",
+            "draft": False,
+            "merge_commit_sha": evidence["mergeCommit"]["oid"],
+            "head": {
+                "ref": evidence["headRefName"],
+                "sha": evidence["headRefOid"],
+                "repo": {"full_name": "acme/widgets"},
+            },
+            "base": {
+                "ref": evidence["baseRefName"],
+                "sha": "not-a-sha",
+                "repo": {"full_name": "acme/widgets"},
+            },
+        }
+        with self.cleanup_run(evidence, pr_pages=[[raw]]), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "GitHub pull request evidence is invalid"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertTrue(task_worktree.exists())
+
+    def test_cleanup_rejects_pr_base_sha_outside_default_branch_history(self) -> None:
+        task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
+        raw = {
+            "number": evidence["number"],
+            "state": "closed",
+            "merged_at": "2026-08-30T00:00:00Z",
+            "draft": False,
+            "merge_commit_sha": evidence["mergeCommit"]["oid"],
+            "head": {
+                "ref": evidence["headRefName"],
+                "sha": evidence["headRefOid"],
+                "repo": {"full_name": "acme/widgets"},
+            },
+            "base": {
+                "ref": evidence["baseRefName"],
+                "sha": "d" * 40,
+                "repo": {"full_name": "acme/widgets"},
+            },
+        }
+        with self.cleanup_run(evidence, pr_pages=[[raw]]), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "not trusted default-branch history"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertTrue(task_worktree.exists())
+
+    def test_legacy_merged_cleanup_receipt_is_upgraded_on_retry(self) -> None:
+        task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
+        with self.cleanup_run(evidence, fail_update_ref_once=True), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "injected ref deletion failure"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(task_worktree.exists())
+        receipt = lifecycle.cleanup_receipt_path(self.repo, "TASK-1")
+        payload = json.loads(receipt.read_text(encoding="utf-8"))
+        payload["evidence"].pop("base_revision")
+        receipt.write_text(json.dumps(payload), encoding="utf-8")
+        with self.cleanup_run(evidence):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(receipt.exists())
+
+    def test_legacy_namespace_cleanup_receipt_migrates_before_retry(self) -> None:
+        task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
+        with self.cleanup_run(evidence, fail_update_ref_once=True), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "injected ref deletion failure"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(task_worktree.exists())
+
+        canonical = lifecycle.cleanup_receipt_path(self.repo, "TASK-1")
+        payload = json.loads(canonical.read_text(encoding="utf-8"))
+        payload["evidence"].pop("base_revision")
+        legacy = private_state.common_git_dir(self.repo) / "opencode/cleanup/TASK-1.json"
+        legacy.parent.mkdir(parents=True)
+        legacy_content = json.dumps(payload).encode()
+        legacy.write_bytes(legacy_content)
+        canonical.unlink()
+        canonical_lock = private_state.common_git_dir(self.repo) / "agent-core/cleanup.lock"
+        canonical_lock.unlink()
+        (private_state.common_git_dir(self.repo) / "opencode/cleanup.lock").write_bytes(b"")
+
+        with self.cleanup_run(evidence, fail_update_ref_once=True), self.assertRaisesRegex(
+            lifecycle.LifecycleError, "injected ref deletion failure"
+        ):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(legacy.exists())
+        self.assertTrue(canonical.exists())
+        migrated = json.loads(canonical.read_text(encoding="utf-8"))
+        self.assertEqual(evidence["baseRefOid"].lower(), migrated["evidence"]["base_revision"])
+
+        with self.cleanup_run(evidence):
+            lifecycle.task_cleanup(self.repo, "TASK-1")
+        self.assertFalse(canonical.exists())
+
     def test_cleanup_rejects_ambiguity_beyond_first_pr_page(self) -> None:
         task_worktree, _, evidence = self.merged_cleanup_fixture(delete_remote=True)
 
@@ -780,13 +959,18 @@ class PostMergeFinalizationTest(RepositoryFixture):
                 "number": number,
                 "state": "closed",
                 "merged_at": "2026-08-30T00:00:00Z",
+                "draft": False,
                 "merge_commit_sha": evidence["mergeCommit"]["oid"],
                 "head": {
                     "ref": evidence["headRefName"],
                     "sha": evidence["headRefOid"],
                     "repo": {"full_name": "acme/widgets"},
                 },
-                "base": {"ref": evidence["baseRefName"]},
+                "base": {
+                    "ref": evidence["baseRefName"],
+                    "sha": "c" * 40,
+                    "repo": {"full_name": "acme/widgets"},
+                },
             }
 
         pages = [[raw(number) for number in range(1, 101)], [raw(101)]]
@@ -982,15 +1166,31 @@ class PostMergeFinalizationTest(RepositoryFixture):
             dict(evidence, state="OPEN"),
             dict(evidence, state="CLOSED"),
             dict(evidence, headRefName="task/OTHER-demo"),
+            dict(evidence, headRefOid="b" * 40),
+            dict(evidence, headRefOid="b" * 41),
+            dict(evidence, headRefOid="b" * 63),
             dict(evidence, baseRefName="release"),
             dict(evidence, number=94),
+            dict(evidence, number=True),
             dict(evidence, isCrossRepository=True),
+            dict(evidence, isCrossRepository=None),
+            dict(evidence, isCrossRepository=0),
+            {key: value for key, value in evidence.items() if key != "isCrossRepository"},
             dict(evidence, mergeCommit=None),
+            dict(evidence, mergeCommit="not-an-object"),
+            dict(evidence, mergeCommit=[]),
+            dict(evidence, mergeCommit={"oid": "a" * 41}),
+            dict(evidence, mergeCommit={"oid": "a" * 63}),
         )
         for invalid in invalid_values:
             with self.subTest(invalid=invalid):
                 with mock.patch.object(agent_core, "pr_details", return_value=invalid):
                     with self.assertRaises(agent_core.AutomationError):
+                        agent_core.merged_pr_evidence(self.repo, "TASK-1", "93")
+        for invalid in (None, []):
+            with self.subTest(invalid_details=invalid):
+                with mock.patch.object(agent_core, "pr_details", return_value=invalid):
+                    with self.assertRaisesRegex(agent_core.AutomationError, "invalid pull request details"):
                         agent_core.merged_pr_evidence(self.repo, "TASK-1", "93")
         with (
             mock.patch.object(agent_core, "pr_details", return_value=evidence),
@@ -998,6 +1198,29 @@ class PostMergeFinalizationTest(RepositoryFixture):
             self.assertRaisesRegex(agent_core.AutomationError, "missing or ambiguous"),
         ):
             agent_core.merged_pr_evidence(self.repo, "TASK-1", "93")
+
+    def test_finalization_enumerates_branch_prs_through_paginated_rest_api(self) -> None:
+        branch = "task/TASK-1-demo"
+        with (
+            mock.patch.object(
+                lifecycle, "cleanup_repository", return_value="acme/widgets"
+            ),
+            mock.patch.object(
+                lifecycle, "pull_requests_for_branch", return_value=[]
+            ) as enumerate_prs,
+        ):
+            self.assertEqual([], agent_core.prs_for_branch(self.repo, branch))
+        enumerate_prs.assert_called_once_with(self.repo, branch, "acme/widgets")
+
+    def test_pr_details_rejects_malformed_json_and_non_object_payloads(self) -> None:
+        for value in ("not-json", "[]"):
+            with self.subTest(value=value):
+                with mock.patch.object(agent_core, "gh", return_value=value):
+                    with self.assertRaisesRegex(
+                        agent_core.AutomationError,
+                        "invalid pull request details",
+                    ):
+                        agent_core.pr_details(self.repo, "93")
 
     def test_wrong_task_states_cannot_jump_to_merged(self) -> None:
         task_worktree = self.start_task()
@@ -1038,6 +1261,44 @@ class PostMergeFinalizationTest(RepositoryFixture):
             lifecycle.state_status(task_worktree / ".task-state/task.md"),
             "integration-pending",
         )
+
+    def test_head_identity_must_remain_exact_during_revalidation(self) -> None:
+        task_worktree, _, evidence = self.prepare()
+        moved = dict(evidence, headRefOid="b" * 40)
+        with (
+            mock.patch.object(agent_core, "pr_details", side_effect=[evidence, moved]),
+            mock.patch.object(
+                agent_core,
+                "prs_for_branch",
+                return_value=[{"number": 93, "headRefName": evidence["headRefName"]}],
+            ),
+            self.assertRaisesRegex(agent_core.AutomationError, "head"),
+        ):
+            agent_core.integrate_finalize(self.repo, "TASK-1", "93")
+        self.assertEqual(
+            lifecycle.state_status(task_worktree / ".task-state/task.md"),
+            "integration-pending",
+        )
+
+    def test_persisted_published_head_must_match_finalization_head(self) -> None:
+        task_worktree, _, evidence = self.prepare()
+        state = task_worktree / ".task-state/task.md"
+        state.write_text(
+            state.read_text(encoding="utf-8").replace(
+                "- Published head SHA: none", "- Published head SHA: " + "b" * 40
+            ),
+            encoding="utf-8",
+        )
+        with (
+            mock.patch.object(agent_core, "pr_details", return_value=evidence),
+            mock.patch.object(
+                agent_core,
+                "prs_for_branch",
+                return_value=[{"number": 93, "headRefName": evidence["headRefName"]}],
+            ),
+            self.assertRaisesRegex(agent_core.AutomationError, "published head"),
+        ):
+            agent_core.merged_pr_evidence(self.repo, "TASK-1", "93")
 
     def test_just_exposes_finalize_without_raw_git(self) -> None:
         recipe = (ROOT / "components/agent-core/.automation/just/integrate.just").read_text(encoding="utf-8")

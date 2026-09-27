@@ -1629,6 +1629,8 @@ mod project 'just/project/mod.just'
             external = root / "escaped-authority"
             external.mkdir()
             common_opencode = common / "opencode"
+            (common_opencode / "cleanup.lock").unlink()
+            common_opencode.rmdir()
             self.assertFalse(common_opencode.exists())
             common_opencode.symlink_to(external, target_is_directory=True)
             (external / "automation-maintenance").mkdir()

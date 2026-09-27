@@ -20,6 +20,7 @@ import sys
 import tempfile
 from collections.abc import Mapping
 from contextlib import contextmanager, redirect_stdout
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -47,6 +48,12 @@ _TRUSTED_GH: Path | None = None
 _TRUSTED_GH_CONFIG_DIR: Path | None = None
 _TRUSTED_GH_TOKEN: str | None = None
 _REVISION_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+_BASE_REVISION_BYTES_RE = re.compile(
+    rb"(?m)^- Base revision: ((?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64}))$"
+)
+_BASE_REVISION_LOWER_BYTES_RE = re.compile(
+    rb"(?m)^- Base revision: ((?:[0-9a-f]{40}|[0-9a-f]{64}))$"
+)
 _UNSAFE_LOCAL_CONFIG = re.compile(
     r"(?:include(?:if)?\..*|url\..*|http\..*|credential\..*|filter\..*|protocol\..*|"
     r"core\.(?:gitproxy|hookspath|sshcommand|worktree)|"
@@ -1012,6 +1019,20 @@ def _state_bytes(target: Path, name: str, contract=None) -> bytes:
         raise BridgeError(f"cannot read required Task evidence: {path}") from exc
 
 
+def _require_base_revision_history(
+    target: Path, base_revision: str, default_branch: str
+) -> None:
+    if not _REVISION_RE.fullmatch(base_revision) or not default_branch:
+        raise BridgeError("Task Base revision or default branch is invalid")
+    _target_git(
+        "merge-base",
+        "--is-ancestor",
+        base_revision,
+        default_branch,
+        target=target,
+    )
+
+
 def _optional_state_bytes(target: Path, name: str, contract) -> bytes | None:
     path = target / ".task-state" / name
     try:
@@ -1059,6 +1080,16 @@ def _post_merge_remote_branch_head(
     if not _REVISION_RE.fullmatch(head):
         raise BridgeError("remote Task branch HEAD is not a full immutable revision")
     return head
+
+
+def _valid_github_timestamp(value: object) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
 
 
 def _publication_snapshot(modules: dict, target: Path, task: str) -> dict:
@@ -1244,11 +1275,11 @@ def _publication_recovery_receipt(
     target: Path, task: str, snapshot: dict, base: str, pr_number: int
 ) -> bytes:
     blocked, ready, draft = _recovery_states(snapshot)
-    base_match = re.search(
-        rb"(?m)^- Base revision: ([0-9a-fA-F]{40,64})$", snapshot["state"]
-    )
+    base_match = _BASE_REVISION_BYTES_RE.search(snapshot["state"])
     if base_match is None:
         raise BridgeError("Task State has no valid Base revision")
+    base_revision = base_match.group(1).decode("ascii").lower()
+    _require_base_revision_history(target, base_revision, base)
 
     def digest(content: bytes | None) -> str | None:
         return hashlib.sha256(content).hexdigest() if content is not None else None
@@ -1262,7 +1293,7 @@ def _publication_recovery_receipt(
         "branch": snapshot["branch"],
         "head": snapshot["head"],
         "base_branch": base,
-        "base_revision": base_match.group(1).decode("ascii").lower(),
+        "base_revision": base_revision,
         "pr_number": pr_number,
         "blocked_state_sha256": digest(blocked),
         "publication_ready_state_sha256": digest(ready),
@@ -1319,11 +1350,14 @@ def _validate_publication_recovery_receipt(
         "issue_sha256": digest(snapshot["issue"]),
     }
     mismatches = [name for name, expected_value in expected.items() if value.get(name) != expected_value]
-    base_match = re.search(
-        rb"(?m)^- Base revision: ([0-9a-fA-F]{40,64})$", snapshot["state"]
-    )
-    if base_match is None or value.get("base_revision") != base_match.group(1).decode("ascii").lower():
+    base_match = _BASE_REVISION_BYTES_RE.search(snapshot["state"])
+    if base_match is None:
         mismatches.append("base_revision")
+    else:
+        base_revision = base_match.group(1).decode("ascii").lower()
+        _require_base_revision_history(target, base_revision, base)
+        if value.get("base_revision") != base_revision:
+            mismatches.append("base_revision")
     number = value.get("pr_number")
     if not isinstance(number, int) or isinstance(number, bool) or number < 1:
         mismatches.append("pr_number")
@@ -1373,12 +1407,13 @@ def _publication_recover(modules: dict, target: Path, task: str) -> dict:
         return number
 
     def prove_canonical_metadata() -> None:
-        base_match = re.search(
-            rb"(?m)^- Base revision: ([0-9a-fA-F]{40,64})$", before["state"]
-        )
+        base_match = _BASE_REVISION_BYTES_RE.search(before["state"])
         if base_match is None:
             raise BridgeError("Task State has no valid Base revision")
-        base = base_match.group(1).decode("ascii")
+        base = base_match.group(1).decode("ascii").lower()
+        if blocked_base is None:
+            raise BridgeError("default branch is unresolved during publication recovery")
+        _require_base_revision_history(target, base, blocked_base)
         paths = _target_git(
             "diff", "--name-only", f"{base}...{before['head']}", target=target
         ).splitlines()
@@ -1637,9 +1672,11 @@ def _source_publication_snapshot(
         base = core.default_branch(target)
         state = _state_bytes(target, "task.md", contract)
         base_branch = re.search(rb"(?m)^- Base branch: ([^\r\n]+)$", state)
-        base_revision = re.search(rb"(?m)^- Base revision: ([0-9a-f]{40,64})$", state)
+        base_revision = _BASE_REVISION_LOWER_BYTES_RE.search(state)
         if not base_branch or base_branch.group(1).decode() != base or not base_revision:
             raise BridgeError("Task base branch or revision is not canonical and stable")
+        base_revision_value = base_revision.group(1).decode("ascii")
+        _require_base_revision_history(target, base_revision_value, base)
         status = lifecycle.state_status(lifecycle.state_path(target))
         if status not in {"draft-pr-created", "integration-pending"}:
             raise BridgeError(f"publication-ready recovery requires draft-pr-created or integration-pending; found {status}")
@@ -1660,7 +1697,7 @@ def _source_publication_snapshot(
         if modules["publication_metadata"].verification_evidence(target, task, head) is None:
             raise BridgeError("missing persisted verification evidence")
         modules["publication_metadata"].completed_reviews(target, task)
-        changed = _target_git("diff", "--name-only", f"{base_revision.group(1).decode()}...{head}", target=target).splitlines()
+        changed = _target_git("diff", "--name-only", f"{base_revision_value}...{head}", target=target).splitlines()
         title, body = modules["publication_metadata"].canonical_metadata(
             target, task, head=head, changed_paths=changed
         )
@@ -1676,7 +1713,7 @@ def _source_publication_snapshot(
     return {
         "record": record, "head": head, "branch": branch, "repository": repository,
         "base": base, "state": state, "status": status, "verification": verification,
-        "base_revision": base_revision.group(1).decode(),
+        "base_revision": base_revision_value,
         "work_units": _state_bytes(target, "work-units.json", contract),
         "contract": _state_bytes(target, "contract.json", contract),
         "issue": _optional_state_bytes(target, "issue.json", contract),
@@ -1686,18 +1723,90 @@ def _source_publication_snapshot(
 
 
 def _source_pr_list(target: Path, repository: str, branch: str) -> list[dict]:
-    result = _pinned_run(["gh", "pr", "list", "--repo", repository, "--head", branch,
-                          "--state", "all", "--limit", "100", "--json",
-                          "number,title,body,headRefName,baseRefName,isDraft,isCrossRepository,state,headRefOid"], cwd=target)
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+        raise BridgeError("GitHub repository identity is invalid")
+    owner = repository.split("/", 1)[0]
+    result = _pinned_run(
+        [
+            "gh",
+            "api",
+            "--method",
+            "GET",
+            "--paginate",
+            "--slurp",
+            f"repos/{repository}/pulls",
+            "-f",
+            "state=all",
+            "-f",
+            f"head={owner}:{branch}",
+            "-f",
+            "per_page=100",
+        ],
+        cwd=target,
+    )
     try:
-        value = json.loads(result.stdout)
+        pages = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
-        raise BridgeError("invalid pull request list returned by GitHub") from exc
-    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
-        raise BridgeError("GitHub pull request list is not an array of objects")
-    if len(value) != 1:
+        raise BridgeError("invalid paginated pull request list returned by GitHub") from exc
+    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+        raise BridgeError("GitHub pull request pages are invalid")
+    matches = []
+    for item in (entry for page in pages for entry in page):
+        if not isinstance(item, dict):
+            raise BridgeError("GitHub pull request pages contain an invalid record")
+        number = item.get("number")
+        if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+            raise BridgeError("GitHub pull request list contains an invalid PR number")
+        if item.get("state") not in {"open", "closed"} or not isinstance(item.get("draft"), bool):
+            raise BridgeError("GitHub pull request list contains invalid state evidence")
+        merged_at = item.get("merged_at")
+        if "merged_at" not in item or (merged_at is not None and not _valid_github_timestamp(merged_at)):
+            raise BridgeError("GitHub pull request list contains invalid merge evidence")
+        if merged_at is not None and item.get("state") != "closed":
+            raise BridgeError("GitHub pull request merge state is inconsistent")
+        head = item.get("head")
+        base = item.get("base")
+        if not isinstance(head, dict) or not isinstance(base, dict):
+            raise BridgeError("GitHub pull request list contains invalid branch evidence")
+        head_repo = head.get("repo")
+        base_repo = base.get("repo")
+        if not isinstance(head_repo, dict) or not isinstance(base_repo, dict):
+            raise BridgeError("GitHub pull request list contains invalid repository evidence")
+        head_repository = head_repo.get("full_name")
+        base_repository = base_repo.get("full_name")
+        head_ref = head.get("ref")
+        head_sha = head.get("sha")
+        base_ref = base.get("ref")
+        base_sha = base.get("sha")
+        merge_sha = item.get("merge_commit_sha")
+        if (
+            not isinstance(head_repository, str)
+            or head_repository.casefold() != repository.casefold()
+            or not isinstance(base_repository, str)
+            or base_repository.casefold() != repository.casefold()
+        ):
+            raise BridgeError("GitHub pull request repository identity does not match")
+        if (
+            not isinstance(head_ref, str)
+            or not head_ref
+            or not isinstance(head_sha, str)
+            or not _REVISION_RE.fullmatch(head_sha)
+            or not isinstance(base_ref, str)
+            or not base_ref
+            or not isinstance(base_sha, str)
+            or not _REVISION_RE.fullmatch(base_sha)
+            or (
+                merge_sha is not None
+                and (not isinstance(merge_sha, str) or not _REVISION_RE.fullmatch(merge_sha))
+            )
+            or (merged_at is not None and merge_sha is None)
+        ):
+            raise BridgeError("GitHub pull request list contains invalid revision evidence")
+        if head_ref == branch:
+            matches.append({"number": number, "headRefName": head_ref})
+    if len(matches) != 1:
         raise BridgeError("exactly one Task-branch pull request is required")
-    return value
+    return matches
 
 
 def _source_pr(core, target: Path, snapshot: dict, *, ready: bool | None) -> tuple[dict, int]:
@@ -1793,13 +1902,26 @@ def _post_merge_receipt(
 def _merged_publication_pr(
     modules: dict, target: Path, snapshot: dict, requested: int
 ) -> tuple[dict, str]:
+    if not isinstance(requested, int) or isinstance(requested, bool) or requested < 1:
+        raise BridgeError("pull request number must be a positive non-bool integer")
     listed = _source_pr_list(target, snapshot["repository"], snapshot["branch"])
-    if listed[0].get("number") != requested:
+    listed_number = listed[0].get("number")
+    if (
+        not isinstance(listed_number, int)
+        or isinstance(listed_number, bool)
+        or listed_number != requested
+    ):
         raise BridgeError("unique Task-branch pull request does not match the requested PR")
     try:
         pr = modules["agent_core"].pr_details(target, str(requested))
     except Exception as exc:
         raise BridgeError(str(exc)) from exc
+    try:
+        detail_number = modules["agent_core"]._validated_pr_number(pr)
+    except Exception as exc:
+        raise BridgeError(str(exc)) from exc
+    if detail_number != requested:
+        raise BridgeError("merged PR details do not match the requested PR")
     expected = {
         "number": requested,
         "headRefName": snapshot["branch"],

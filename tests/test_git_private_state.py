@@ -72,6 +72,7 @@ class GitPrivateStateTest(unittest.TestCase):
                 "repository": "acme/widgets",
                 "pr": 1,
                 "published_head": head,
+                "base_revision": head,
                 "upstream": "deleted",
             },
         }
@@ -182,6 +183,42 @@ class GitPrivateStateTest(unittest.TestCase):
                 common / "agent-core" / "integration" / "pr-12.head",
             )
             self.assertFalse((common / "agent-core").exists())
+
+    def test_generated_private_state_files_match_canonical_source(self) -> None:
+        source = (ROOT / "components/agent-core/.automation/bin/git_private_state.py").read_bytes()
+        generated = sorted(
+            ROOT.glob("templates/agent-*/.automation/bin/git_private_state.py")
+        )
+        self.assertEqual(6, len(generated))
+        for path in generated:
+            with self.subTest(path=path):
+                self.assertEqual(source, path.read_bytes())
+
+    def test_legacy_schema_versions_reject_boolean_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = self.repository(root)
+            cases = (
+                ("cleanup/1.json", self.cleanup_record(repo)),
+                ("discard-pristine/1.json", self.discard_record(repo)),
+                ("publication-recovery.json", self.publication_recovery_record(repo)),
+                (
+                    "post-merge-publication-recovery.json",
+                    self.post_merge_publication_recovery_record(repo),
+                ),
+                ("source-recovery-proof.json", self.proof_record(repo)),
+                ("authority.json", self.authority_record(repo)),
+            )
+            for relative, record in cases:
+                with self.subTest(relative=relative):
+                    record["schema_version"] = True
+                    path = root / relative
+                    with self.assertRaisesRegex(
+                        private_state.GitPrivateStateError, "invalid legacy private-state record"
+                    ):
+                        private_state._validate_legacy_content(
+                            path, json.dumps(record).encode()
+                        )
 
     def test_publication_recovery_path_is_worktree_admin_private(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -568,10 +605,13 @@ class GitPrivateStateTest(unittest.TestCase):
             legacy = common / "opencode/integration/pr-12.head"
             legacy.parent.mkdir(parents=True)
             legacy.write_bytes(b"a" * 40 + b"\n")
+            legacy_lock = common / "opencode/cleanup.lock"
+            legacy_lock.write_bytes(b"")
+            legacy_lock.chmod(0o644)
 
             private_state.prepare(repo)
 
-            self.assertFalse((common / "opencode").exists())
+            self.assertTrue((common / "opencode/cleanup.lock").is_file())
             canonical = common / "agent-core/integration/pr-12.head"
             self.assertEqual(b"a" * 40 + b"\n", private_state.read_bytes(canonical))
 
@@ -645,11 +685,95 @@ class GitPrivateStateTest(unittest.TestCase):
                 )
                 self.assertEqual(content, (base / relative).read_bytes())
                 self.assertFalse((legacy / relative).exists())
-            self.assertFalse(legacy.exists())
+            self.assertTrue(legacy.exists())
             canonical_lock = common / "agent-core/cleanup.lock"
             self.assertEqual(legacy_lock_identity[0:2], self.identity(canonical_lock)[0:2])
+            self.assertEqual(legacy_lock_identity[0:2], self.identity(legacy_lock)[0:2])
             self.assertEqual(0o600, stat.S_IMODE(canonical_lock.stat().st_mode))
             private_state.prepare(authority_worktree, admin=True)
+
+    def test_prepare_blocks_distinct_legacy_lock_after_initial_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(Path(directory))
+            legacy_lock = private_state.common_git_dir(repo) / "opencode/cleanup.lock"
+            original = private_state._scan_shared_legacy
+            created = False
+
+            def create_after_scan(layout):
+                nonlocal created
+                if not created:
+                    created = True
+                    legacy_lock.parent.mkdir(parents=True)
+                    legacy_lock.write_bytes(b"")
+                    return [], None
+                return original(layout)
+
+            with mock.patch.object(
+                private_state,
+                "_scan_shared_legacy",
+                side_effect=create_after_scan,
+            ), self.assertRaisesRegex(
+                private_state.GitPrivateStateError, "different inodes"
+            ):
+                private_state.prepare(repo)
+
+    def test_prepare_rejects_legacy_lock_replacement_before_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(Path(directory))
+            common = private_state.common_git_dir(repo)
+            legacy_lock = common / "opencode/cleanup.lock"
+            original = private_state._scan_shared_legacy
+            scans = 0
+
+            def replace_before_rescan(layout):
+                nonlocal scans
+                scans += 1
+                if scans == 3:
+                    legacy_lock.unlink()
+                    legacy_lock.write_bytes(b"replacement")
+                return original(layout)
+
+            with mock.patch.object(
+                private_state, "_scan_shared_legacy", side_effect=replace_before_rescan
+            ), self.assertRaisesRegex(
+                private_state.GitPrivateStateError, "legacy cleanup lock identity changed"
+            ):
+                private_state.prepare(repo)
+            self.assertEqual([], list((common / "agent-core/integration").iterdir()))
+
+    def test_prepare_rejects_missing_legacy_alias_before_recursive_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(Path(directory))
+            common = private_state.common_git_dir(repo)
+            source = common / "opencode/integration/pr-1.head"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"a" * 40 + b"\n")
+            legacy_lock = common / "opencode/cleanup.lock"
+            original = private_state._scan_shared_legacy
+            scans = 0
+
+            def remove_alias_before_recursive_scan(layout):
+                nonlocal scans
+                scans += 1
+                if scans == 1:
+                    return [], None
+                if scans == 2:
+                    legacy_lock.unlink()
+                    return [], None
+                return original(layout)
+
+            with mock.patch.object(
+                private_state,
+                "_scan_shared_legacy",
+                side_effect=remove_alias_before_recursive_scan,
+            ), self.assertRaisesRegex(
+                private_state.GitPrivateStateError,
+                "cleanup lock identity changed|cannot inspect legacy cleanup lock",
+            ):
+                private_state.prepare(repo)
+            canonical = common / "agent-core/integration/pr-1.head"
+            self.assertFalse(canonical.exists())
+            self.assertTrue(source.is_file())
 
     def test_contended_legacy_cleanup_lock_blocks_without_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -675,8 +799,44 @@ class GitPrivateStateTest(unittest.TestCase):
             legacy_lock.write_bytes(b"")
             inode = legacy_lock.stat().st_ino
             with private_state.cleanup_lock(repo):
-                self.assertFalse((common / "opencode").exists())
+                self.assertTrue((common / "opencode").exists())
                 self.assertEqual(inode, (common / "agent-core/cleanup.lock").stat().st_ino)
+                self.assertEqual(inode, legacy_lock.stat().st_ino)
+
+    def test_cleanup_operation_reserves_legacy_alias_when_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(Path(directory))
+            common = private_state.common_git_dir(repo)
+            with private_state.cleanup_lock(repo):
+                canonical = common / "agent-core/cleanup.lock"
+                legacy = common / "opencode/cleanup.lock"
+                self.assertEqual(canonical.stat().st_ino, legacy.stat().st_ino)
+            self.assertTrue(legacy.is_file())
+
+    def test_cleanup_operation_blocks_distinct_legacy_lock_after_initial_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(Path(directory))
+            common = private_state.common_git_dir(repo)
+            legacy = common / "opencode/cleanup.lock"
+            original = private_state._scan_shared_legacy
+            created = False
+
+            def create_after_scan(layout):
+                nonlocal created
+                if not created:
+                    created = True
+                    legacy.parent.mkdir(parents=True)
+                    legacy.write_bytes(b"")
+                    return [], None
+                return original(layout)
+
+            with mock.patch.object(
+                private_state, "_scan_shared_legacy", side_effect=create_after_scan
+            ), self.assertRaisesRegex(
+                private_state.GitPrivateStateError, "different inodes"
+            ):
+                with private_state.cleanup_lock(repo):
+                    self.fail("distinct late legacy lock was not blocked")
 
     def test_cleanup_handoff_rejects_legacy_path_inode_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -737,6 +897,44 @@ class GitPrivateStateTest(unittest.TestCase):
             self.assertTrue(replaced)
             self.assertEqual(b"unknown", canonical_lock.read_bytes())
 
+    def test_cleanup_handoff_rechecks_existing_canonical_after_fsync(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(Path(directory))
+            common = private_state.common_git_dir(repo)
+            legacy_lock = common / "opencode/cleanup.lock"
+            canonical_lock = common / "agent-core/cleanup.lock"
+            legacy_lock.parent.mkdir(parents=True)
+            legacy_lock.write_bytes(b"")
+            legacy_lock.chmod(0o600)
+            canonical_lock.parent.mkdir(parents=True)
+            canonical_lock.parent.chmod(0o700)
+            os.link(legacy_lock, canonical_lock)
+            real_stat = os.stat
+            canonical_stats = 0
+            replaced = False
+
+            def replace_after_canonical_fsync(path, *args, **kwargs):
+                nonlocal canonical_stats, replaced
+                if path == canonical_lock.name and kwargs.get("dir_fd") is not None:
+                    canonical_stats += 1
+                    if canonical_stats == 2:
+                        canonical_lock.unlink()
+                        canonical_lock.write_bytes(b"replacement")
+                        canonical_lock.chmod(0o600)
+                        replaced = True
+                return real_stat(path, *args, **kwargs)
+
+            with mock.patch.object(os, "stat", side_effect=replace_after_canonical_fsync):
+                with self.assertRaisesRegex(
+                    private_state.GitPrivateStateError,
+                    "canonical cleanup lock identity changed during handoff",
+                ):
+                    with private_state.cleanup_lock(repo):
+                        self.fail("replaced canonical cleanup lock was accepted")
+            self.assertGreaterEqual(canonical_stats, 2)
+            self.assertTrue(replaced)
+            self.assertEqual(b"replacement", canonical_lock.read_bytes())
+
     def test_distinct_dual_cleanup_locks_block_before_migration(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = self.repository(Path(directory))
@@ -771,7 +969,7 @@ class GitPrivateStateTest(unittest.TestCase):
             first.write_bytes(json.dumps({
                 "schema_version": 1, "task": "1", "status": "merged",
                 "worktree": self.valid_worktree(repo, "1-test"), "branch": "task/1-test",
-                "local_head": "a" * 40, "evidence": {"repository": "acme/widgets", "pr": 1, "published_head": "a" * 40, "upstream": "deleted"},
+                "local_head": "a" * 40, "evidence": {"repository": "acme/widgets", "pr": 1, "published_head": "a" * 40, "base_revision": "a" * 40, "upstream": "deleted"},
             }).encode())
             conflict.write_bytes(b"a" * 40 + b"\n")
             destination.write_bytes(b"b" * 40 + b"\n")
@@ -894,7 +1092,7 @@ class GitPrivateStateTest(unittest.TestCase):
             content = json.dumps({
                 "schema_version": 1, "task": "7", "status": "merged",
                 "worktree": self.valid_worktree(repo, "7-test"), "branch": "task/7-test",
-                "local_head": "a" * 40, "evidence": {"repository": "acme/widgets", "pr": 7, "published_head": "a" * 40, "upstream": "deleted"},
+                "local_head": "a" * 40, "evidence": {"repository": "acme/widgets", "pr": 7, "published_head": "a" * 40, "base_revision": "a" * 40, "upstream": "deleted"},
             }).encode()
             legacy.write_bytes(content)
             current.write_bytes(content)
@@ -923,7 +1121,7 @@ class GitPrivateStateTest(unittest.TestCase):
                 private_state.prepare(repo)
 
                 self.assertFalse(temporary.exists())
-                self.assertFalse((common / "opencode").exists())
+                self.assertTrue((common / "opencode/cleanup.lock").is_file())
                 self.assertEqual(content, (common / "agent-core/cleanup/1.json").read_bytes())
 
     def test_durable_destination_with_leftover_temp_is_recovered(self) -> None:
@@ -963,7 +1161,7 @@ class GitPrivateStateTest(unittest.TestCase):
 
             self.assertEqual(first, canonical.read_bytes())
             self.assertEqual(second, (canonical.parent / "2.json").read_bytes())
-            self.assertFalse((common / "opencode").exists())
+            self.assertTrue((common / "opencode/cleanup.lock").is_file())
 
     def test_malformed_or_unsafe_canonical_temp_fails_closed(self) -> None:
         for name, mode in ((".migrate.bad", 0o600), (".record.1.0123456789abcdef", 0o666)):
@@ -1142,7 +1340,7 @@ class GitPrivateStateTest(unittest.TestCase):
             )
             (canonical / "source-recovery-proof.json").chmod(0o600)
             private_state.prepare(linked, admin=True)
-            self.assertFalse((common / "opencode").exists())
+            self.assertTrue((common / "opencode/cleanup.lock").is_file())
             self.assertTrue((canonical / "authority.json").is_file())
 
     def test_unrelated_absolute_authority_worktree_is_not_claimed(self) -> None:
@@ -1239,6 +1437,94 @@ class GitPrivateStateTest(unittest.TestCase):
             self.assertFalse(legacy.exists())
             self.assertFalse(canonical.exists())
 
+    def test_retry_redurably_validates_existing_destination_before_source_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(Path(directory))
+            common = private_state.common_git_dir(repo)
+            source = common / "opencode/cleanup/1.json"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(json.dumps(self.cleanup_record(repo)).encode())
+            cleanup_directory = common / "agent-core/cleanup"
+            failed = False
+            real_fsync = private_state.os.fsync
+
+            def fail_after_publish(fd):
+                nonlocal failed
+                if not failed and cleanup_directory.exists():
+                    metadata = os.fstat(fd)
+                    directory_metadata = cleanup_directory.stat()
+                    if (metadata.st_dev, metadata.st_ino) == (
+                        directory_metadata.st_dev, directory_metadata.st_ino
+                    ):
+                        failed = True
+                        raise OSError("injected canonical directory fsync failure")
+                return real_fsync(fd)
+
+            with (
+                mock.patch.object(private_state.os, "fsync", side_effect=fail_after_publish),
+                self.assertRaisesRegex(
+                    private_state.GitPrivateStateError, "cannot publish private-state record"
+                ),
+            ):
+                private_state.prepare(repo)
+
+            canonical = cleanup_directory / "1.json"
+            self.assertTrue(canonical.is_file())
+            self.assertTrue(source.is_file())
+            fsynced_cleanup_directory = False
+
+            def record_fsync(fd):
+                nonlocal fsynced_cleanup_directory
+                if cleanup_directory.exists():
+                    metadata = os.fstat(fd)
+                    directory_metadata = cleanup_directory.stat()
+                    fsynced_cleanup_directory |= (
+                        (metadata.st_dev, metadata.st_ino)
+                        == (directory_metadata.st_dev, directory_metadata.st_ino)
+                    )
+                return real_fsync(fd)
+
+            with mock.patch.object(private_state.os, "fsync", side_effect=record_fsync):
+                private_state.prepare(repo)
+            self.assertTrue(fsynced_cleanup_directory)
+            self.assertFalse(source.exists())
+
+    def test_canonical_replacement_before_legacy_unlink_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(Path(directory))
+            common = private_state.common_git_dir(repo)
+            source = common / "opencode/cleanup/1.json"
+            target = common / "agent-core/cleanup/1.json"
+            source.parent.mkdir(parents=True)
+            target.parent.mkdir(parents=True)
+            self.secure_canonical(target.parent)
+            content = json.dumps(self.cleanup_record(repo)).encode()
+            source.write_bytes(content)
+            target.write_bytes(content)
+            target.chmod(0o600)
+            real_stat = os.stat
+            replaced = False
+
+            def replace_before_legacy_unlink(path, *args, **kwargs):
+                nonlocal replaced
+                if not replaced and path == target.name and kwargs.get("dir_fd") is not None:
+                    target.rename(target.with_name("original.json"))
+                    target.write_bytes(b"replacement")
+                    target.chmod(0o600)
+                    replaced = True
+                return real_stat(path, *args, **kwargs)
+
+            with mock.patch.object(os, "stat", side_effect=replace_before_legacy_unlink):
+                with self.assertRaisesRegex(
+                    private_state.GitPrivateStateError,
+                    "canonical private-state record identity changed",
+                ):
+                    private_state.prepare(repo)
+            self.assertTrue(replaced)
+            self.assertTrue(source.is_file())
+            self.assertEqual(content, source.read_bytes())
+            self.assertEqual(b"replacement", target.read_bytes())
+
     def test_unsafe_matching_target_race_does_not_consume_legacy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = self.repository(Path(directory))
@@ -1334,6 +1620,74 @@ class GitPrivateStateTest(unittest.TestCase):
             self.assertEqual(content, migrated.read_bytes())
             self.assertNotEqual(before, self.identity(migrated))
             self.assertTrue((private_state.admin_git_dir(linked) / "agent-core/automation-maintenance").is_dir())
+
+    def test_common_prepare_rejects_linked_authority_without_admin_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(Path(directory))
+            linked = repo / ".worktrees" / "1-test"
+            command("git", "worktree", "add", "-b", "task/1-test", str(linked), cwd=repo)
+            common = private_state.common_git_dir(linked)
+            authority = common / "opencode/automation-maintenance/authority.json"
+            authority.parent.mkdir(parents=True)
+            content = json.dumps({
+                "schema_version": 1, "task_id": "1", "branch": "task/1-test",
+                "worktree": str(linked), "authority_nonce": "a" * 64,
+                "receipt_sha256": "a" * 64,
+            }).encode()
+            authority.write_bytes(content)
+
+            with self.assertRaisesRegex(
+                private_state.GitPrivateStateError, "requires admin=True"
+            ):
+                private_state.prepare(linked, admin=False)
+            self.assertEqual(content, authority.read_bytes())
+            self.assertFalse(
+                (
+                    private_state.admin_git_dir(linked)
+                    / "agent-core/automation-maintenance/authority.json"
+                ).exists()
+            )
+
+    def test_common_prepare_rejects_admin_legacy_state_without_admin_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(Path(directory))
+            linked = repo / ".worktrees" / "1-test"
+            command("git", "worktree", "add", "-b", "task/1-test", str(linked), cwd=repo)
+            admin = private_state.admin_git_dir(linked)
+            authority = admin / "opencode/automation-maintenance/authority.json"
+            authority.parent.mkdir(parents=True)
+            content = json.dumps({
+                "schema_version": 1, "task_id": "1", "branch": "task/1-test",
+                "worktree": str(linked), "authority_nonce": "a" * 64,
+                "receipt_sha256": "a" * 64,
+            }).encode()
+            authority.write_bytes(content)
+
+            with self.assertRaisesRegex(
+                private_state.GitPrivateStateError, "requires admin=True"
+            ):
+                private_state.prepare(linked, admin=False)
+            self.assertEqual(content, authority.read_bytes())
+            self.assertFalse(
+                (admin / "agent-core/automation-maintenance/authority.json").exists()
+            )
+
+    def test_linked_admin_legacy_namespace_requires_safe_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = self.repository(Path(directory))
+            linked = repo / ".worktrees" / "1-test"
+            command("git", "worktree", "add", "-b", "task/1-test", str(linked), cwd=repo)
+            legacy_root = private_state.admin_git_dir(linked) / "opencode"
+            legacy_root.mkdir()
+            legacy_root.chmod(0o770)
+
+            with self.assertRaisesRegex(
+                private_state.GitPrivateStateError, "legacy private-state directory mode"
+            ):
+                private_state.prepare(linked, admin=True)
+            self.assertFalse(
+                (private_state.admin_git_dir(linked) / "agent-core").exists()
+            )
 
     def test_common_prepare_does_not_recover_unlocked_admin_temporary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

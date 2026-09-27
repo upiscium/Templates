@@ -138,7 +138,7 @@ def _require_pristine_unresolved_state(
         not isinstance(base_branch, str)
         or not base_branch
         or not isinstance(base_revision, str)
-        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", base_revision)
+        or private_state.OID_RE.fullmatch(base_revision) is None
     ):
         raise lifecycle.LifecycleError(
             "discard-pristine refused: Task Base identity is missing or invalid"
@@ -292,9 +292,9 @@ def read_discard_receipt(root: Path, path: Path, task: str) -> dict:
         or not isinstance(value.get("base_branch"), str)
         or not value.get("base_branch")
         or not isinstance(value.get("base_revision"), str)
-        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", value["base_revision"])
+        or private_state.OID_RE.fullmatch(value["base_revision"]) is None
         or not isinstance(value.get("local_head"), str)
-        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", value["local_head"])
+        or private_state.OID_RE.fullmatch(value["local_head"]) is None
         or value["local_head"].lower() != value["base_revision"].lower()
         or not isinstance(value.get("repository"), str)
         or not REPOSITORY_RE.fullmatch(value["repository"])

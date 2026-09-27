@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -18,15 +20,128 @@ spec.loader.exec_module(lifecycle)
 
 
 class TaskLifecycleTest(unittest.TestCase):
+    def test_pull_requests_for_branch_wraps_json_integer_parse_errors(self) -> None:
+        result = subprocess.CompletedProcess(
+            [], 0, "[[{\"number\": 999999999999999999999}]]", ""
+        )
+        with (
+            mock.patch.object(lifecycle, "gh", return_value=result),
+            mock.patch.object(
+                lifecycle.json, "loads", side_effect=ValueError("integer digit limit")
+            ),
+            self.assertRaisesRegex(
+                lifecycle.LifecycleError,
+                "GitHub pull request evidence is invalid",
+            ),
+        ):
+            lifecycle.pull_requests_for_branch(
+                Path("/repo"), "task/TASK-1-demo", "acme/widgets"
+            )
+
+    def test_full_git_object_id_validator_accepts_only_sha1_or_sha256_width(self) -> None:
+        for width in (40, 64):
+            self.assertIsNotNone(lifecycle.OID_RE.fullmatch("a" * width))
+        for width in (41, 63):
+            self.assertIsNone(lifecycle.OID_RE.fullmatch("a" * width))
+
+    def test_terminal_ref_locks_reject_abbreviated_oids_before_git_access(self) -> None:
+        cases = (
+            ("a" * 41, "b" * 40),
+            ("a" * 40, "b" * 63),
+        )
+        for task_head, default_revision in cases:
+            record = lifecycle.WorktreeRecord(
+                Path("/repo"), "task/TASK-1-finalize", task_head
+            )
+            with self.subTest(task_head=len(task_head), default_revision=len(default_revision)):
+                with (
+                    mock.patch.object(lifecycle, "common_git_dir") as common,
+                    self.assertRaisesRegex(lifecycle.LifecycleError, "identity is invalid|identity is incomplete"),
+                ):
+                    with lifecycle.terminal_ref_locks(
+                        record,
+                        default_branch="main",
+                        default_revision=default_revision,
+                    ):
+                        pass
+                common.assert_not_called()
+
+    def test_cleanup_base_revision_rejects_intermediate_oid_widths_before_git(self) -> None:
+        with mock.patch.object(lifecycle, "run") as run:
+            for width in (41, 63):
+                with self.subTest(width=width):
+                    with self.assertRaisesRegex(
+                        lifecycle.LifecycleError,
+                        "Base revision is missing or invalid",
+                    ):
+                        lifecycle.require_cleanup_base_revision(Path("/repo"), "a" * width)
+            run.assert_not_called()
+
+    def test_cleanup_receipt_rejects_boolean_pr_number(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receipt.json"
+            value = {
+                "schema_version": 1,
+                "task": "TASK-1",
+                "status": "merged",
+                "worktree": "/repo/.worktrees/TASK-1-demo",
+                "branch": "task/TASK-1-demo",
+                "local_head": "a" * 40,
+                "evidence": {
+                    "repository": "acme/widgets",
+                    "pr": True,
+                    "published_head": "a" * 40,
+                    "base_revision": "b" * 40,
+                    "upstream": "deleted",
+                },
+            }
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with (
+                mock.patch.object(
+                    lifecycle.private_state, "read_bytes", return_value=json.dumps(value).encode()
+                ),
+                self.assertRaisesRegex(lifecycle.LifecycleError, "cleanup receipt is invalid"),
+            ):
+                lifecycle.read_cleanup_receipt(path, "TASK-1")
+            value["evidence"]["pr"] = 1
+            path.write_text(json.dumps(value), encoding="utf-8")
+            with mock.patch.object(
+                lifecycle.private_state, "read_bytes", return_value=json.dumps(value).encode()
+            ):
+                self.assertEqual(lifecycle.read_cleanup_receipt(path, "TASK-1"), value)
+
     def test_generic_state_set_cannot_cross_publication_boundaries(self) -> None:
         record = lifecycle.WorktreeRecord(Path("/task"), "task/101-metadata", "a" * 40)
-        for status in ("draft-pr-created", "integration-pending"):
+        for status in ("draft-pr-created", "integration-pending", "merged"):
             with (
                 mock.patch.object(lifecycle, "require_local_task", return_value=record),
                 mock.patch.object(lifecycle, "require_resolved_contract"),
-                self.assertRaisesRegex(lifecycle.LifecycleError, "guarded pull request publication"),
+                self.assertRaisesRegex(lifecycle.LifecycleError, "guarded pull request lifecycle"),
             ):
                 lifecycle.task_state_set(Path("/task"), "101", status)
+
+    def test_generic_state_set_cannot_merge_integration_pending_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".task-state/task.md"
+            state.parent.mkdir()
+            state.write_text(
+                "## Current state\n\n- Status: integration-pending\n",
+                encoding="utf-8",
+            )
+            record = lifecycle.WorktreeRecord(root, "task/101-metadata", "a" * 40)
+            with (
+                mock.patch.object(lifecycle, "require_local_task", return_value=record),
+                mock.patch.object(lifecycle, "require_resolved_contract"),
+                mock.patch.object(lifecycle, "assert_task_identity"),
+                mock.patch.object(lifecycle, "work_units_lock", return_value=nullcontext()),
+                self.assertRaisesRegex(
+                    lifecycle.LifecycleError,
+                    "guarded pull request lifecycle transitions",
+                ),
+            ):
+                lifecycle.task_state_set(root, "101", "merged")
+            self.assertEqual(lifecycle.state_status(state), "integration-pending")
 
     def test_task_branch_matching_is_not_substring_based(self) -> None:
         self.assertTrue(lifecycle.branch_matches_task("task/TASK-1-example", "TASK-1"))
@@ -344,6 +459,18 @@ class TaskLifecycleTest(unittest.TestCase):
              mock.patch.object(lifecycle, "state_status", return_value="draft-pr-created"), \
              self.assertRaisesRegex(lifecycle.LifecycleError, "requires Task status integration-pending"):
             lifecycle.mark_task_merged_from_integration(record, "225")
+
+    def test_guarded_finalize_rejects_task_head_movement_under_lock(self) -> None:
+        record = lifecycle.WorktreeRecord(Path("/task"), "task/225-recovery", "a" * 40)
+        moved = lifecycle.WorktreeRecord(record.path, record.branch, "b" * 40)
+        with (
+            mock.patch.object(lifecycle, "work_units_lock", return_value=nullcontext()),
+            mock.patch.object(lifecycle, "worktree_for_task", return_value=moved),
+            self.assertRaisesRegex(lifecycle.LifecycleError, "identity changed"),
+        ):
+            lifecycle.mark_task_merged_from_integration(
+                record, "225", expected_head=record.head
+            )
 
     def test_batch_conflict_detects_dependency_and_shared_resources(self) -> None:
         summaries = [

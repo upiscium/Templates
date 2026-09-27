@@ -28,6 +28,7 @@ except ModuleNotFoundError:  # pragma: no cover
 TASK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 SAFE_CHECK_CONCLUSIONS = {"SUCCESS", "SKIPPED", "NEUTRAL"}
+MAX_PULL_REQUEST_NUMBER = (1 << 63) - 1
 
 
 class AutomationError(RuntimeError):
@@ -284,18 +285,23 @@ def verify(root: Path, task: str) -> None:
 
 def commit_task(root: Path, task: str, message: str) -> None:
     ensure_task_branch(root, task)
-    paths = pending_paths(root)
-    if not paths:
-        raise AutomationError("no Task changes to commit")
-    reject_unsafe_paths(root, paths)
-    run(["git", "add", "--", *paths], cwd=root)
-    run(["git", "diff", "--cached", "--check"], cwd=root)
-    staged = git("diff", "--cached", "--name-only", cwd=root).splitlines()
-    reject_unsafe_paths(root, staged)
-    commit_message = message.strip() or f"task: {task}"
-    if task not in commit_message:
-        commit_message = f"{commit_message}\n\nTask: {task}"
-    run(["git", "commit", "-m", commit_message], cwd=root)
+    record = lifecycle.current_worktree(root)
+    with lifecycle.work_units_lock(record):
+        paths = pending_paths(root)
+        if not paths:
+            raise AutomationError("no Task changes to commit")
+        reject_unsafe_paths(root, paths)
+        status = lifecycle.state_status(lifecycle.state_path(root))
+        if status in {"integration-pending", "merged", "cancelled"}:
+            raise AutomationError(f"Task commits are not allowed while status is {status}")
+        run(["git", "add", "--", *paths], cwd=root)
+        run(["git", "diff", "--cached", "--check"], cwd=root)
+        staged = git("diff", "--cached", "--name-only", cwd=root).splitlines()
+        reject_unsafe_paths(root, staged)
+        commit_message = message.strip() or f"task: {task}"
+        if task not in commit_message:
+            commit_message = f"{commit_message}\n\nTask: {task}"
+        run(["git", "commit", "-m", commit_message], cwd=root)
     print(git("rev-parse", "HEAD", cwd=root))
 
 
@@ -338,6 +344,8 @@ def pr_for_branch(root: Path, branch: str, repository: str | None = None) -> dic
         value = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise AutomationError("invalid pull request data returned by GitHub") from exc
+    if not isinstance(value, dict):
+        raise AutomationError("invalid pull request data returned by GitHub")
     return value
 
 
@@ -373,11 +381,8 @@ def pr_prepare(root: Path, task: str) -> None:
     branch, context, head = _publication_context(root, task)
     if context["status"] not in {"publication-ready", "draft-pr-created"}:
         raise AutomationError(f"publication metadata preparation requires publication-ready or draft-pr-created; found {context['status']}")
-    state = lifecycle.state_path(root).read_text(encoding="utf-8")
-    base_revision = re.search(r"(?m)^- Base revision: ([0-9a-fA-F]{40,64})$", state)
-    if base_revision is None:
-        raise AutomationError("Task State has no valid Base revision")
-    paths = git("diff", "--name-only", f"{base_revision.group(1)}...{head}", cwd=root).splitlines()
+    base_revision = _base_revision(root)
+    paths = git("diff", "--name-only", f"{base_revision}...{head}", cwd=root).splitlines()
     try:
         title, body = publication.canonical_metadata(root, task, head=head, changed_paths=paths)
         publication.write_metadata(root, title, body)
@@ -407,18 +412,37 @@ def _validated_local_metadata(root: Path, task: str, head: str) -> tuple[str, Pa
 
 def _base_revision(root: Path) -> str:
     text = lifecycle.state_path(root).read_text(encoding="utf-8")
-    match = re.search(r"(?m)^- Base revision: ([0-9a-fA-F]{40,64})$", text)
+    match = re.search(
+        rf"(?m)^- Base revision: ({private_state.OID_RE.pattern})$", text
+    )
     if match is None:
         raise AutomationError("Task State has no valid Base revision")
-    return match.group(1)
+    revision = match.group(1)
+    try:
+        lifecycle.require_cleanup_base_revision(root, revision)
+    except lifecycle.LifecycleError as exc:
+        raise AutomationError(
+            "Task Base revision is not trusted default-branch history"
+        ) from exc
+    return revision
 
 
 def _validate_live_pr(pr: dict, *, branch: str, base: str, head: str, title: str, body: str, draft: bool) -> None:
+    if not isinstance(pr, dict):
+        raise AutomationError("live pull request metadata is invalid")
+    _validated_pr_number(pr)
     expected = {
         "headRefName": branch, "baseRefName": base, "headRefOid": head,
         "title": title, "isDraft": draft, "isCrossRepository": False, "state": "OPEN",
     }
     mismatches = [name for name, value in expected.items() if pr.get(name) != value]
+    if type(pr.get("isDraft")) is not bool and "isDraft" not in mismatches:
+        mismatches.append("isDraft")
+    if (
+        type(pr.get("isCrossRepository")) is not bool
+        and "isCrossRepository" not in mismatches
+    ):
+        mismatches.append("isCrossRepository")
     if not publication.canonical_pr_body_matches(body, pr.get("body")):
         mismatches.append("body")
     if mismatches:
@@ -433,6 +457,9 @@ def _validated_pr_number(pr: dict) -> int:
 
 
 def _validate_edit_target(pr: dict, *, branch: str, base: str, head: str) -> None:
+    if not isinstance(pr, dict):
+        raise AutomationError("pull request repair target identity is invalid")
+    _validated_pr_number(pr)
     expected = {
         "headRefName": branch, "baseRefName": base, "headRefOid": head,
         "isDraft": True, "isCrossRepository": False, "state": "OPEN",
@@ -440,8 +467,8 @@ def _validate_edit_target(pr: dict, *, branch: str, base: str, head: str) -> Non
     mismatches = [name for name, value in expected.items() if pr.get(name) != value]
     if (
         mismatches
-        or not isinstance(pr.get("number"), int)
-        or isinstance(pr.get("number"), bool)
+        or type(pr.get("isDraft")) is not bool
+        or type(pr.get("isCrossRepository")) is not bool
     ):
         raise AutomationError("pull request repair target identity is invalid: " + ", ".join(mismatches or ["number"]))
 
@@ -687,10 +714,9 @@ def pr_ready(root: Path, task: str, expected_pr_number: int | None = None) -> No
     pr = pr_for_branch(root, branch, repository)
     if not pr:
         raise AutomationError(f"no pull request for {branch}")
-    number = pr["number"]
+    number = _validated_pr_number(pr)
     base = default_branch(root)
     if expected_pr_number is not None:
-        number = _validated_pr_number(pr)
         if number != expected_pr_number:
             raise AutomationError("pull request identity changed before mutation")
 
@@ -770,26 +796,70 @@ def cleanup(root: Path, task: str) -> None:
 
 
 def pr_details(root: Path, pr: str) -> dict:
-    data = json.loads(gh("pr", "view", pr, "--json", "number,title,body,baseRefName,headRefName,headRefOid,isDraft,isCrossRepository,mergeCommit,mergeable,statusCheckRollup,state", cwd=root))
+    try:
+        data = json.loads(
+            gh(
+                "pr",
+                "view",
+                pr,
+                "--json",
+                "number,title,body,baseRefName,headRefName,headRefOid,isDraft,isCrossRepository,mergeCommit,mergeable,statusCheckRollup,state",
+                cwd=root,
+            )
+        )
+    except json.JSONDecodeError as exc:
+        raise AutomationError("invalid pull request details returned by GitHub") from exc
+    if not isinstance(data, dict):
+        raise AutomationError("invalid pull request details returned by GitHub")
     return data
 
 
 def validate_integration(root: Path, pr: str) -> dict:
-    data = pr_details(root, pr)
-    if data["baseRefName"] != default_branch(root):
+    requested = validate_pr_number(pr)
+    data = pr_details(root, str(requested))
+    if _validated_pr_number(data) != requested:
+        raise AutomationError("GitHub returned a different pull request")
+    if data.get("state") != "OPEN":
+        raise AutomationError("PR is not open")
+    if data.get("baseRefName") != default_branch(root):
         raise AutomationError("PR base is not the repository default branch")
-    if data["isDraft"]:
+    if data.get("isDraft") is not False:
         raise AutomationError("Draft PR cannot be merged")
+    if data.get("isCrossRepository") is not False:
+        raise AutomationError("cross-repository PR cannot be merged")
+    head = data.get("headRefOid")
+    if not isinstance(head, str) or private_state.OID_RE.fullmatch(head) is None:
+        raise AutomationError("PR head is not a full immutable revision")
     if data.get("mergeable") != "MERGEABLE":
         raise AutomationError(f"PR is not mergeable: {data.get('mergeable')}")
+    rollup = data.get("statusCheckRollup")
+    if not isinstance(rollup, list):
+        raise AutomationError("PR status check rollup is invalid")
     failures = []
-    for check in data.get("statusCheckRollup") or []:
+    for check in rollup:
+        if not isinstance(check, dict):
+            raise AutomationError("PR status check rollup is invalid")
         conclusion = check.get("conclusion")
         status = check.get("status")
+        state = check.get("state")
+        if any(
+            value is not None and not isinstance(value, str)
+            for value in (conclusion, status, state)
+        ):
+            raise AutomationError("PR status check rollup is invalid")
+        if not any(value for value in (conclusion, status, state)):
+            raise AutomationError("PR status check rollup is invalid")
+        if status == "COMPLETED" and not conclusion:
+            raise AutomationError("PR status check rollup is invalid")
+        label = check.get("name") or check.get("context")
+        if not isinstance(label, str) or not label:
+            label = "status check"
         if status and status != "COMPLETED":
-            failures.append(check.get("name") or check.get("context") or "pending check")
-        elif conclusion and conclusion not in SAFE_CHECK_CONCLUSIONS:
-            failures.append(check.get("name") or check.get("context") or conclusion)
+            failures.append(label)
+        if conclusion and conclusion not in SAFE_CHECK_CONCLUSIONS:
+            failures.append(label)
+        if state and state != "SUCCESS":
+            failures.append(label)
     if failures:
         raise AutomationError("required checks are not successful: " + ", ".join(failures))
     return data
@@ -814,6 +884,7 @@ def integrate_check(root: Path, pr: str) -> None:
 
 
 def integrate_merge(root: Path, pr: str) -> None:
+    pr = str(validate_pr_number(pr))
     checkpoint = integration_checkpoint(root, pr)
     if not checkpoint.exists() or checkpoint.is_symlink() or not checkpoint.is_file():
         raise AutomationError("run integrate::check before merge")
@@ -831,33 +902,27 @@ def integrate_merge(root: Path, pr: str) -> None:
 
 
 def validate_pr_number(pr: str) -> int:
-    if not re.fullmatch(r"[1-9][0-9]*", pr):
-        raise AutomationError(f"invalid pull request number: {pr!r}")
-    return int(pr)
+    if (
+        not isinstance(pr, str)
+        or len(pr) > 19
+        or not re.fullmatch(r"[1-9][0-9]*", pr)
+    ):
+        raise AutomationError("invalid pull request number")
+    try:
+        number = int(pr)
+    except ValueError as exc:
+        raise AutomationError("invalid pull request number") from exc
+    if number > MAX_PULL_REQUEST_NUMBER:
+        raise AutomationError("invalid pull request number")
+    return number
 
 
 def prs_for_branch(root: Path, branch: str) -> list[dict]:
     try:
-        value = json.loads(
-            gh(
-                "pr",
-                "list",
-                "--state",
-                "all",
-                "--head",
-                branch,
-                "--limit",
-                "100",
-                "--json",
-                "number,headRefName,baseRefName",
-                cwd=root,
-            )
-        )
-    except json.JSONDecodeError as exc:
-        raise AutomationError("invalid pull request list returned by GitHub") from exc
-    if not isinstance(value, list):
-        raise AutomationError("invalid pull request list returned by GitHub")
-    return [item for item in value if item.get("headRefName") == branch]
+        repository = lifecycle.cleanup_repository(root)
+        return lifecycle.pull_requests_for_branch(root, branch, repository)
+    except lifecycle.LifecycleError as exc:
+        raise AutomationError(str(exc)) from exc
 
 
 def merged_pr_evidence(root: Path, task: str, pr: str) -> tuple[lifecycle.WorktreeRecord, dict]:
@@ -878,19 +943,41 @@ def merged_pr_evidence(root: Path, task: str, pr: str) -> tuple[lifecycle.Worktr
     if branch is None:
         raise AutomationError("registered Task worktree is detached")
     data = pr_details(root, pr)
+    if not isinstance(data, dict):
+        raise AutomationError("invalid pull request details returned by GitHub")
     base = default_branch(root)
-    if data.get("number") != requested:
+    if _validated_pr_number(data) != requested:
         raise AutomationError("GitHub returned a different pull request")
     if data.get("state") != "MERGED":
         raise AutomationError("pull request is not merged")
     if data.get("headRefName") != branch:
         raise AutomationError("pull request head does not match the registered Task branch")
+    task_head = record.head
+    published_head = data.get("headRefOid")
+    if (
+        not isinstance(task_head, str)
+        or private_state.OID_RE.fullmatch(task_head) is None
+        or not isinstance(published_head, str)
+        or private_state.OID_RE.fullmatch(published_head) is None
+        or published_head.casefold() != task_head.casefold()
+    ):
+        raise AutomationError("pull request head does not match the registered Task HEAD")
+    recorded_head = lifecycle.extract_identity_value(
+        lifecycle.state_path(record.path), "Published head SHA"
+    )
+    if recorded_head and recorded_head.casefold() != "none":
+        if (
+            private_state.OID_RE.fullmatch(recorded_head) is None
+            or recorded_head.casefold() != task_head.casefold()
+        ):
+            raise AutomationError("Task State published head does not match the registered Task HEAD")
     if data.get("baseRefName") != base:
         raise AutomationError("pull request base is not the repository default branch")
-    if data.get("isCrossRepository"):
+    if data.get("isCrossRepository") is not False:
         raise AutomationError("cross-repository pull requests cannot finalize a local Task")
-    merge_oid = (data.get("mergeCommit") or {}).get("oid")
-    if not isinstance(merge_oid, str) or not re.fullmatch(r"[0-9a-fA-F]{40,64}", merge_oid):
+    merge_commit = data.get("mergeCommit")
+    merge_oid = merge_commit.get("oid") if isinstance(merge_commit, dict) else None
+    if not isinstance(merge_oid, str) or private_state.OID_RE.fullmatch(merge_oid) is None:
         raise AutomationError("merged pull request has no valid merge commit identity")
     matches = prs_for_branch(root, branch)
     if len(matches) != 1 or matches[0].get("number") != requested:
@@ -899,7 +986,12 @@ def merged_pr_evidence(root: Path, task: str, pr: str) -> tuple[lifecycle.Worktr
 
 
 def merge_commit_is_ancestor(root: Path, merge_oid: str, revision: str) -> bool:
-    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", merge_oid):
+    if (
+        not isinstance(merge_oid, str)
+        or private_state.OID_RE.fullmatch(merge_oid) is None
+        or not isinstance(revision, str)
+        or private_state.OID_RE.fullmatch(revision) is None
+    ):
         return False
     return run(
         ["git", "merge-base", "--is-ancestor", merge_oid, revision],
@@ -930,6 +1022,7 @@ def integrate_finalize(root: Path, task: str, pr: str) -> None:
             value.get("number"),
             value.get("state"),
             value.get("headRefName"),
+            value.get("headRefOid"),
             value.get("baseRefName"),
             (value.get("mergeCommit") or {}).get("oid"),
             value.get("isCrossRepository"),
@@ -938,11 +1031,29 @@ def integrate_finalize(root: Path, task: str, pr: str) -> None:
         raise AutomationError("pull request or Task identity changed during finalization")
     if not merge_commit_is_ancestor(root, merge_oid, revision):
         raise AutomationError("merge identity changed during finalization")
+
+    def validate_terminal_evidence() -> None:
+        try:
+            lifecycle.require_synchronized_default_branch_revision(
+                root, synchronized["branch"], revision
+            )
+        except lifecycle.LifecycleError as exc:
+            raise AutomationError(str(exc)) from exc
+        terminal_record, terminal = merged_pr_evidence(root, task, pr)
+        if terminal_record != record or fingerprint(terminal) != fingerprint(evidence):
+            raise AutomationError("pull request or Task identity changed before terminal transition")
+        if not merge_commit_is_ancestor(root, merge_oid, revision):
+            raise AutomationError("merge identity changed before terminal transition")
+
     try:
-        lifecycle.require_synchronized_default_branch_revision(
-            root, synchronized["branch"], revision
+        outcome = lifecycle.mark_task_merged_from_integration(
+            record,
+            task,
+            expected_head=record.head,
+            validate_before_write=validate_terminal_evidence,
+            default_branch=synchronized["branch"],
+            default_revision=revision,
         )
-        outcome = lifecycle.mark_task_merged_from_integration(record, task)
     except lifecycle.LifecycleError as exc:
         raise AutomationError(str(exc)) from exc
     print(
