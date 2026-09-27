@@ -19,6 +19,34 @@ SPEC.loader.exec_module(bridge)
 
 
 class PostMergePublicationRecoveryBridgeTest(unittest.TestCase):
+    def test_source_pr_list_rejects_non_positive_or_boolean_numbers(self) -> None:
+        for number in ("true", "0", "-1"):
+            with self.subTest(number=number):
+                output = (
+                    '[[{"number":'
+                    + number
+                    + '}]]'
+                )
+                with (
+                    mock.patch.object(
+                        bridge,
+                        "_pinned_run",
+                        return_value=mock.Mock(stdout=output),
+                    ),
+                    self.assertRaisesRegex(bridge.BridgeError, "invalid PR number"),
+                ):
+                    bridge._source_pr_list(
+                        self.target, self.repository, self.branch
+                    )
+
+    def test_merged_publication_rejects_boolean_requested_pr_before_listing(self) -> None:
+        with (
+            mock.patch.object(bridge, "_source_pr_list") as listing,
+            self.assertRaisesRegex(bridge.BridgeError, "positive non-bool integer"),
+        ):
+            bridge._merged_publication_pr({}, self.target, {}, True)
+        listing.assert_not_called()
+
     def setUp(self) -> None:
         self.target = Path("/tmp/terreate-task-225")
         self.main = Path("/tmp/terreate-main")
@@ -43,6 +71,14 @@ class PostMergePublicationRecoveryBridgeTest(unittest.TestCase):
         self.core.ensure_task_branch.return_value = self.branch
         self.core.canonical_repository.return_value = self.repository
         self.core.default_branch.return_value = "main"
+
+        def validated_pr_number(pr: object) -> int:
+            number = pr.get("number") if isinstance(pr, dict) else None
+            if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+                raise ValueError("pull request identity is invalid")
+            return number
+
+        self.core._validated_pr_number.side_effect = validated_pr_number
         self.core.merge_commit_is_ancestor.return_value = True
         self.publication = mock.Mock()
         self.publication.canonical_pr_body_matches.return_value = True

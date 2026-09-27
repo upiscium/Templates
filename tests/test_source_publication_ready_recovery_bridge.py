@@ -223,6 +223,41 @@ class PublicationReadyRecoveryBridgeTests(unittest.TestCase):
             with mock.patch.object(bridge, "_source_pr_list", return_value=[{"number": value}]), self.assertRaises(bridge.BridgeError):
                  bridge._source_pr(core, Path("/consumer"), snapshot, ready=False)
 
+    def rest_pr(self, number):
+        return {
+            "number": number,
+            "state": "open",
+            "merged_at": None,
+            "draft": True,
+            "head": {
+                "ref": self.branch,
+                "sha": self.head,
+                "repo": {"full_name": self.repository},
+            },
+            "base": {
+                "ref": "main",
+                "sha": "b" * 40,
+                "repo": {"full_name": self.repository},
+            },
+            "merge_commit_sha": None,
+        }
+
+    def test_source_pr_list_uses_paginated_rest_identity(self):
+        response = mock.Mock(
+            returncode=0,
+            stdout=json.dumps([[self.rest_pr(29)]]),
+            stderr="",
+        )
+        with mock.patch.object(bridge, "_pinned_run", return_value=response) as run:
+            listed = bridge._source_pr_list(self.target, self.repository, self.branch)
+        self.assertEqual(listed, [{"number": 29, "headRefName": self.branch}])
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:4], ["gh", "api", "--method", "GET"])
+        self.assertIn("--paginate", argv)
+        self.assertIn("--slurp", argv)
+        self.assertIn(f"repos/{self.repository}/pulls", argv)
+        self.assertIn(f"head=upiscium:{self.branch}", argv)
+
     def test_akv_snapshot_keeps_historical_work_units_and_effective_reviews(self):
         snapshot = self._snapshot()
         self.assertEqual(snapshot["repository"], self.repository)
@@ -283,7 +318,7 @@ class PublicationReadyRecoveryBridgeTests(unittest.TestCase):
 
     def test_duplicate_pr_and_invalid_number_fail_closed(self):
         with mock.patch.object(bridge, "_pinned_run", return_value=mock.Mock(
-                stdout=json.dumps([{"number": 29}, {"number": 30}]), returncode=0)), \
+                stdout=json.dumps([[self.rest_pr(29)], [self.rest_pr(30)]]), returncode=0)), \
              self.assertRaisesRegex(bridge.BridgeError, "exactly one"):
             bridge._source_pr_list(self.target, self.repository, self.branch)
         snapshot = {"repository": self.repository, "branch": self.branch, "base": "main",
@@ -453,10 +488,13 @@ class PublicationReadyRecoveryBridgeTests(unittest.TestCase):
                 bridge.parser().parse_args(["publication-ready-recover", "/tmp", task, "a" * 40])
 
     def test_source_listing_rejects_duplicate_branch_pull_requests(self):
-        result = mock.Mock(stdout="[{\"number\": 1}, {\"number\": 2}]", returncode=0)
+        result = mock.Mock(
+            stdout=json.dumps([[self.rest_pr(1)], [self.rest_pr(2)]]),
+            returncode=0,
+        )
         with mock.patch.object(bridge, "_pinned_run", return_value=result):
             with self.assertRaisesRegex(bridge.BridgeError, "exactly one"):
-                bridge._source_pr_list(Path("/consumer"), "org/repo", "task/29-repair")
+                bridge._source_pr_list(Path("/consumer"), self.repository, self.branch)
 
 
 if __name__ == "__main__":

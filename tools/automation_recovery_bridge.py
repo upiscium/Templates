@@ -1686,18 +1686,88 @@ def _source_publication_snapshot(
 
 
 def _source_pr_list(target: Path, repository: str, branch: str) -> list[dict]:
-    result = _pinned_run(["gh", "pr", "list", "--repo", repository, "--head", branch,
-                          "--state", "all", "--limit", "100", "--json",
-                          "number,title,body,headRefName,baseRefName,isDraft,isCrossRepository,state,headRefOid"], cwd=target)
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+        raise BridgeError("GitHub repository identity is invalid")
+    owner = repository.split("/", 1)[0]
+    result = _pinned_run(
+        [
+            "gh",
+            "api",
+            "--method",
+            "GET",
+            "--paginate",
+            "--slurp",
+            f"repos/{repository}/pulls",
+            "-f",
+            "state=all",
+            "-f",
+            f"head={owner}:{branch}",
+            "-f",
+            "per_page=100",
+        ],
+        cwd=target,
+    )
     try:
-        value = json.loads(result.stdout)
+        pages = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
-        raise BridgeError("invalid pull request list returned by GitHub") from exc
-    if not isinstance(value, list) or not all(isinstance(item, dict) for item in value):
-        raise BridgeError("GitHub pull request list is not an array of objects")
-    if len(value) != 1:
+        raise BridgeError("invalid paginated pull request list returned by GitHub") from exc
+    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+        raise BridgeError("GitHub pull request pages are invalid")
+    matches = []
+    for item in (entry for page in pages for entry in page):
+        if not isinstance(item, dict):
+            raise BridgeError("GitHub pull request pages contain an invalid record")
+        number = item.get("number")
+        if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+            raise BridgeError("GitHub pull request list contains an invalid PR number")
+        if item.get("state") not in {"open", "closed"} or not isinstance(item.get("draft"), bool):
+            raise BridgeError("GitHub pull request list contains invalid state evidence")
+        merged_at = item.get("merged_at")
+        if "merged_at" not in item or (merged_at is not None and not isinstance(merged_at, str)):
+            raise BridgeError("GitHub pull request list contains invalid merge evidence")
+        head = item.get("head")
+        base = item.get("base")
+        if not isinstance(head, dict) or not isinstance(base, dict):
+            raise BridgeError("GitHub pull request list contains invalid branch evidence")
+        head_repo = head.get("repo")
+        base_repo = base.get("repo")
+        if not isinstance(head_repo, dict) or not isinstance(base_repo, dict):
+            raise BridgeError("GitHub pull request list contains invalid repository evidence")
+        head_repository = head_repo.get("full_name")
+        base_repository = base_repo.get("full_name")
+        head_ref = head.get("ref")
+        head_sha = head.get("sha")
+        base_ref = base.get("ref")
+        base_sha = base.get("sha")
+        merge_sha = item.get("merge_commit_sha")
+        if (
+            not isinstance(head_repository, str)
+            or head_repository.casefold() != repository.casefold()
+            or not isinstance(base_repository, str)
+            or base_repository.casefold() != repository.casefold()
+        ):
+            raise BridgeError("GitHub pull request repository identity does not match")
+        if (
+            not isinstance(head_ref, str)
+            or not head_ref
+            or not isinstance(head_sha, str)
+            or not _REVISION_RE.fullmatch(head_sha)
+            or not isinstance(base_ref, str)
+            or not base_ref
+            or not isinstance(base_sha, str)
+            or not _REVISION_RE.fullmatch(base_sha)
+            or (
+                merge_sha is not None
+                and (not isinstance(merge_sha, str) or not _REVISION_RE.fullmatch(merge_sha))
+            )
+            or (merged_at is not None and merge_sha is None)
+        ):
+            raise BridgeError("GitHub pull request list contains invalid revision evidence")
+        if head_ref == branch:
+            matches.append({"number": number, "headRefName": head_ref})
+    if len(matches) != 1:
         raise BridgeError("exactly one Task-branch pull request is required")
-    return value
+    return matches
 
 
 def _source_pr(core, target: Path, snapshot: dict, *, ready: bool | None) -> tuple[dict, int]:
@@ -1793,13 +1863,26 @@ def _post_merge_receipt(
 def _merged_publication_pr(
     modules: dict, target: Path, snapshot: dict, requested: int
 ) -> tuple[dict, str]:
+    if not isinstance(requested, int) or isinstance(requested, bool) or requested < 1:
+        raise BridgeError("pull request number must be a positive non-bool integer")
     listed = _source_pr_list(target, snapshot["repository"], snapshot["branch"])
-    if listed[0].get("number") != requested:
+    listed_number = listed[0].get("number")
+    if (
+        not isinstance(listed_number, int)
+        or isinstance(listed_number, bool)
+        or listed_number != requested
+    ):
         raise BridgeError("unique Task-branch pull request does not match the requested PR")
     try:
         pr = modules["agent_core"].pr_details(target, str(requested))
     except Exception as exc:
         raise BridgeError(str(exc)) from exc
+    try:
+        detail_number = modules["agent_core"]._validated_pr_number(pr)
+    except Exception as exc:
+        raise BridgeError(str(exc)) from exc
+    if detail_number != requested:
+        raise BridgeError("merged PR details do not match the requested PR")
     expected = {
         "number": requested,
         "headRefName": snapshot["branch"],

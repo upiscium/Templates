@@ -102,6 +102,38 @@ class MaintenanceLifecycleTest(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def test_pr_evidence_requires_positive_non_bool_number_and_false_cross_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._record(root)
+            valid = {
+                "number": 1,
+                "headRefName": record.branch,
+                "baseRefName": "main",
+                "headRefOid": self.HEAD,
+                "isCrossRepository": False,
+                "state": "OPEN",
+            }
+            with (
+                mock.patch.object(maintenance.agent_core, "pr_for_branch", return_value=valid),
+                mock.patch.object(maintenance.agent_core, "default_branch", return_value="main"),
+            ):
+                self.assertEqual(maintenance._pr_evidence(record, "example/repo", self.HEAD), valid)
+            invalid = (
+                dict(valid, number=True),
+                dict(valid, number=0),
+                dict(valid, number=-1),
+                dict(valid, isCrossRepository=0),
+            )
+            for pr in invalid:
+                with self.subTest(pr=pr):
+                    with (
+                        mock.patch.object(maintenance.agent_core, "pr_for_branch", return_value=pr),
+                        mock.patch.object(maintenance.agent_core, "default_branch", return_value="main"),
+                        self.assertRaises(maintenance.MaintenanceError),
+                    ):
+                        maintenance._pr_evidence(record, "example/repo", self.HEAD)
+
     def test_applied_stage_uses_active_receipt_without_normal_resume_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -255,10 +255,17 @@ def _pr_evidence(
         "headRefName": record.branch,
         "baseRefName": agent_core.default_branch(record.path),
         "headRefOid": commit,
-        "isCrossRepository": False,
     }
     mismatches = [name for name, wanted in expected.items() if pr.get(name) != wanted]
-    if mismatches or not isinstance(pr.get("number"), int):
+    if pr.get("isCrossRepository") is not False:
+        mismatches.append("isCrossRepository")
+    number = pr.get("number")
+    if (
+        mismatches
+        or not isinstance(number, int)
+        or isinstance(number, bool)
+        or number < 1
+    ):
         raise MaintenanceError(
             "maintenance pull request identity is stale or inconsistent: "
             + ", ".join(mismatches or ["number"])
