@@ -522,17 +522,81 @@ class PostMergeFinalizationTest(RepositoryFixture):
         return task_worktree, task_head, self.merged_evidence(task_worktree, merge_oid)
 
     def finalize(self, evidence: dict, task: str = "TASK-1") -> None:
+        def github(*args: str, cwd: Path, check: bool = True):
+            if args[:2] == ("repo", "view"):
+                return subprocess.CompletedProcess(
+                    ["gh", *args], 0, json.dumps({"nameWithOwner": "acme/widgets"}), ""
+                )
+            if args[:1] == ("api",):
+                rest_pr = {
+                    "number": evidence["number"],
+                    "state": "closed",
+                    "merged_at": "2026-08-30T00:00:00Z",
+                    "draft": False,
+                    "head": {
+                        "ref": evidence["headRefName"],
+                        "sha": evidence["headRefOid"],
+                        "repo": {"full_name": "acme/widgets"},
+                    },
+                    "base": {
+                        "ref": evidence["baseRefName"],
+                        "sha": evidence["baseRefOid"],
+                        "repo": {"full_name": "acme/widgets"},
+                    },
+                    "merge_commit_sha": evidence["mergeCommit"]["oid"],
+                }
+                return subprocess.CompletedProcess(
+                    ["gh", *args], 0, json.dumps([[rest_pr]]), ""
+                )
+            raise AssertionError(f"unexpected GitHub request: {args!r}")
+
         with (
             mock.patch.object(
                 agent_core, "pr_details", side_effect=[evidence, evidence, evidence]
             ),
-            mock.patch.object(
-                agent_core,
-                "prs_for_branch",
-                return_value=[{"number": 93, "headRefName": evidence["headRefName"], "baseRefName": "main"}],
-            ),
+            mock.patch.object(lifecycle, "gh", side_effect=github),
         ):
             agent_core.integrate_finalize(self.repo, task, "93")
+
+    def test_duplicate_paginated_task_prs_do_not_finalize(self) -> None:
+        task_worktree, _, evidence = self.prepare()
+        state = task_worktree / ".task-state/task.md"
+
+        def github(*args: str, cwd: Path, check: bool = True):
+            if args[:2] == ("repo", "view"):
+                return subprocess.CompletedProcess(
+                    ["gh", *args], 0, json.dumps({"nameWithOwner": "acme/widgets"}), ""
+                )
+            if args[:1] == ("api",):
+                rest_pr = {
+                    "number": evidence["number"],
+                    "state": "closed",
+                    "merged_at": "2026-08-30T00:00:00Z",
+                    "draft": False,
+                    "head": {
+                        "ref": evidence["headRefName"],
+                        "sha": evidence["headRefOid"],
+                        "repo": {"full_name": "acme/widgets"},
+                    },
+                    "base": {
+                        "ref": evidence["baseRefName"],
+                        "sha": evidence["baseRefOid"],
+                        "repo": {"full_name": "acme/widgets"},
+                    },
+                    "merge_commit_sha": evidence["mergeCommit"]["oid"],
+                }
+                return subprocess.CompletedProcess(
+                    ["gh", *args], 0, json.dumps([[rest_pr], [rest_pr]]), ""
+                )
+            raise AssertionError(f"unexpected GitHub request: {args!r}")
+
+        with (
+            mock.patch.object(agent_core, "pr_details", return_value=evidence),
+            mock.patch.object(lifecycle, "gh", side_effect=github),
+            self.assertRaisesRegex(agent_core.AutomationError, "missing or ambiguous"),
+        ):
+            agent_core.integrate_finalize(self.repo, "TASK-1", "93")
+        self.assertEqual(lifecycle.state_status(state), "integration-pending")
 
     def cleanup_run(
         self,
