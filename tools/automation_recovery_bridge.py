@@ -47,6 +47,12 @@ _TRUSTED_GH: Path | None = None
 _TRUSTED_GH_CONFIG_DIR: Path | None = None
 _TRUSTED_GH_TOKEN: str | None = None
 _REVISION_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+_BASE_REVISION_BYTES_RE = re.compile(
+    rb"(?m)^- Base revision: ((?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64}))$"
+)
+_BASE_REVISION_LOWER_BYTES_RE = re.compile(
+    rb"(?m)^- Base revision: ((?:[0-9a-f]{40}|[0-9a-f]{64}))$"
+)
 _UNSAFE_LOCAL_CONFIG = re.compile(
     r"(?:include(?:if)?\..*|url\..*|http\..*|credential\..*|filter\..*|protocol\..*|"
     r"core\.(?:gitproxy|hookspath|sshcommand|worktree)|"
@@ -1244,9 +1250,7 @@ def _publication_recovery_receipt(
     target: Path, task: str, snapshot: dict, base: str, pr_number: int
 ) -> bytes:
     blocked, ready, draft = _recovery_states(snapshot)
-    base_match = re.search(
-        rb"(?m)^- Base revision: ([0-9a-fA-F]{40,64})$", snapshot["state"]
-    )
+    base_match = _BASE_REVISION_BYTES_RE.search(snapshot["state"])
     if base_match is None:
         raise BridgeError("Task State has no valid Base revision")
 
@@ -1319,9 +1323,7 @@ def _validate_publication_recovery_receipt(
         "issue_sha256": digest(snapshot["issue"]),
     }
     mismatches = [name for name, expected_value in expected.items() if value.get(name) != expected_value]
-    base_match = re.search(
-        rb"(?m)^- Base revision: ([0-9a-fA-F]{40,64})$", snapshot["state"]
-    )
+    base_match = _BASE_REVISION_BYTES_RE.search(snapshot["state"])
     if base_match is None or value.get("base_revision") != base_match.group(1).decode("ascii").lower():
         mismatches.append("base_revision")
     number = value.get("pr_number")
@@ -1373,9 +1375,7 @@ def _publication_recover(modules: dict, target: Path, task: str) -> dict:
         return number
 
     def prove_canonical_metadata() -> None:
-        base_match = re.search(
-            rb"(?m)^- Base revision: ([0-9a-fA-F]{40,64})$", before["state"]
-        )
+        base_match = _BASE_REVISION_BYTES_RE.search(before["state"])
         if base_match is None:
             raise BridgeError("Task State has no valid Base revision")
         base = base_match.group(1).decode("ascii")
@@ -1637,7 +1637,7 @@ def _source_publication_snapshot(
         base = core.default_branch(target)
         state = _state_bytes(target, "task.md", contract)
         base_branch = re.search(rb"(?m)^- Base branch: ([^\r\n]+)$", state)
-        base_revision = re.search(rb"(?m)^- Base revision: ([0-9a-f]{40,64})$", state)
+        base_revision = _BASE_REVISION_LOWER_BYTES_RE.search(state)
         if not base_branch or base_branch.group(1).decode() != base or not base_revision:
             raise BridgeError("Task base branch or revision is not canonical and stable")
         status = lifecycle.state_status(lifecycle.state_path(target))

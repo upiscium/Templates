@@ -809,7 +809,7 @@ class PostMergeFinalizationTest(RepositoryFixture):
             },
         }
         with self.cleanup_run(evidence, pr_pages=[[raw]]), self.assertRaisesRegex(
-            lifecycle.LifecycleError, "does not match the Task"
+            lifecycle.LifecycleError, "GitHub pull request evidence is invalid"
         ):
             lifecycle.task_cleanup(self.repo, "TASK-1")
         self.assertTrue(task_worktree.exists())
@@ -1103,6 +1103,8 @@ class PostMergeFinalizationTest(RepositoryFixture):
             dict(evidence, state="CLOSED"),
             dict(evidence, headRefName="task/OTHER-demo"),
             dict(evidence, headRefOid="b" * 40),
+            dict(evidence, headRefOid="b" * 41),
+            dict(evidence, headRefOid="b" * 63),
             dict(evidence, baseRefName="release"),
             dict(evidence, number=94),
             dict(evidence, number=True),
@@ -1113,6 +1115,8 @@ class PostMergeFinalizationTest(RepositoryFixture):
             dict(evidence, mergeCommit=None),
             dict(evidence, mergeCommit="not-an-object"),
             dict(evidence, mergeCommit=[]),
+            dict(evidence, mergeCommit={"oid": "a" * 41}),
+            dict(evidence, mergeCommit={"oid": "a" * 63}),
         )
         for invalid in invalid_values:
             with self.subTest(invalid=invalid):

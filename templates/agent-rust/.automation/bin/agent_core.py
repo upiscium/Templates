@@ -343,6 +343,8 @@ def pr_for_branch(root: Path, branch: str, repository: str | None = None) -> dic
         value = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise AutomationError("invalid pull request data returned by GitHub") from exc
+    if not isinstance(value, dict):
+        raise AutomationError("invalid pull request data returned by GitHub")
     return value
 
 
@@ -379,7 +381,9 @@ def pr_prepare(root: Path, task: str) -> None:
     if context["status"] not in {"publication-ready", "draft-pr-created"}:
         raise AutomationError(f"publication metadata preparation requires publication-ready or draft-pr-created; found {context['status']}")
     state = lifecycle.state_path(root).read_text(encoding="utf-8")
-    base_revision = re.search(r"(?m)^- Base revision: ([0-9a-fA-F]{40,64})$", state)
+    base_revision = re.search(
+        rf"(?m)^- Base revision: ({private_state.OID_RE.pattern})$", state
+    )
     if base_revision is None:
         raise AutomationError("Task State has no valid Base revision")
     paths = git("diff", "--name-only", f"{base_revision.group(1)}...{head}", cwd=root).splitlines()
@@ -412,7 +416,9 @@ def _validated_local_metadata(root: Path, task: str, head: str) -> tuple[str, Pa
 
 def _base_revision(root: Path) -> str:
     text = lifecycle.state_path(root).read_text(encoding="utf-8")
-    match = re.search(r"(?m)^- Base revision: ([0-9a-fA-F]{40,64})$", text)
+    match = re.search(
+        rf"(?m)^- Base revision: ({private_state.OID_RE.pattern})$", text
+    )
     if match is None:
         raise AutomationError("Task State has no valid Base revision")
     return match.group(1)
@@ -424,6 +430,13 @@ def _validate_live_pr(pr: dict, *, branch: str, base: str, head: str, title: str
         "title": title, "isDraft": draft, "isCrossRepository": False, "state": "OPEN",
     }
     mismatches = [name for name, value in expected.items() if pr.get(name) != value]
+    if type(pr.get("isDraft")) is not bool and "isDraft" not in mismatches:
+        mismatches.append("isDraft")
+    if (
+        type(pr.get("isCrossRepository")) is not bool
+        and "isCrossRepository" not in mismatches
+    ):
+        mismatches.append("isCrossRepository")
     if not publication.canonical_pr_body_matches(body, pr.get("body")):
         mismatches.append("body")
     if mismatches:
@@ -445,6 +458,8 @@ def _validate_edit_target(pr: dict, *, branch: str, base: str, head: str) -> Non
     mismatches = [name for name, value in expected.items() if pr.get(name) != value]
     if (
         mismatches
+        or type(pr.get("isDraft")) is not bool
+        or type(pr.get("isCrossRepository")) is not bool
         or not isinstance(pr.get("number"), int)
         or isinstance(pr.get("number"), bool)
     ):
@@ -794,8 +809,8 @@ def pr_details(root: Path, pr: str) -> dict:
 
 
 def validate_integration(root: Path, pr: str) -> dict:
-    data = pr_details(root, pr)
     requested = validate_pr_number(pr)
+    data = pr_details(root, str(requested))
     if _validated_pr_number(data) != requested:
         raise AutomationError("GitHub returned a different pull request")
     if data.get("state") != "OPEN":
@@ -807,7 +822,7 @@ def validate_integration(root: Path, pr: str) -> dict:
     if data.get("isCrossRepository") is not False:
         raise AutomationError("cross-repository PR cannot be merged")
     head = data.get("headRefOid")
-    if not isinstance(head, str) or not re.fullmatch(r"[0-9a-fA-F]{40,64}", head):
+    if not isinstance(head, str) or private_state.OID_RE.fullmatch(head) is None:
         raise AutomationError("PR head is not a full immutable revision")
     if data.get("mergeable") != "MERGEABLE":
         raise AutomationError(f"PR is not mergeable: {data.get('mergeable')}")
@@ -924,9 +939,9 @@ def merged_pr_evidence(root: Path, task: str, pr: str) -> tuple[lifecycle.Worktr
     published_head = data.get("headRefOid")
     if (
         not isinstance(task_head, str)
-        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", task_head)
+        or private_state.OID_RE.fullmatch(task_head) is None
         or not isinstance(published_head, str)
-        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", published_head)
+        or private_state.OID_RE.fullmatch(published_head) is None
         or published_head.casefold() != task_head.casefold()
     ):
         raise AutomationError("pull request head does not match the registered Task HEAD")
@@ -935,7 +950,7 @@ def merged_pr_evidence(root: Path, task: str, pr: str) -> tuple[lifecycle.Worktr
     )
     if recorded_head and recorded_head.casefold() != "none":
         if (
-            not re.fullmatch(r"[0-9a-fA-F]{40,64}", recorded_head)
+            private_state.OID_RE.fullmatch(recorded_head) is None
             or recorded_head.casefold() != task_head.casefold()
         ):
             raise AutomationError("Task State published head does not match the registered Task HEAD")
@@ -945,7 +960,7 @@ def merged_pr_evidence(root: Path, task: str, pr: str) -> tuple[lifecycle.Worktr
         raise AutomationError("cross-repository pull requests cannot finalize a local Task")
     merge_commit = data.get("mergeCommit")
     merge_oid = merge_commit.get("oid") if isinstance(merge_commit, dict) else None
-    if not isinstance(merge_oid, str) or not re.fullmatch(r"[0-9a-fA-F]{40,64}", merge_oid):
+    if not isinstance(merge_oid, str) or private_state.OID_RE.fullmatch(merge_oid) is None:
         raise AutomationError("merged pull request has no valid merge commit identity")
     matches = prs_for_branch(root, branch)
     if len(matches) != 1 or matches[0].get("number") != requested:
@@ -954,7 +969,12 @@ def merged_pr_evidence(root: Path, task: str, pr: str) -> tuple[lifecycle.Worktr
 
 
 def merge_commit_is_ancestor(root: Path, merge_oid: str, revision: str) -> bool:
-    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", merge_oid):
+    if (
+        not isinstance(merge_oid, str)
+        or private_state.OID_RE.fullmatch(merge_oid) is None
+        or not isinstance(revision, str)
+        or private_state.OID_RE.fullmatch(revision) is None
+    ):
         return False
     return run(
         ["git", "merge-base", "--is-ancestor", merge_oid, revision],

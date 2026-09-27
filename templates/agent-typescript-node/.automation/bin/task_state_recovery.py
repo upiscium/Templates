@@ -19,7 +19,7 @@ RECOVERY_RECEIPT = "lost-ignored-task-state.json"
 TEMPLATE_PATH = "components/agent-core/.automation/templates/task-state.md"
 STATE_FILES = ("task.md", "issue.json", "contract.json")
 ALLOWED_STATE_FILES = frozenset((*STATE_FILES, "work-units.lock"))
-OID_RE = re.compile(r"^[0-9a-f]{40,64}$")
+OID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 POSITIVE_RE = re.compile(r"^[1-9][0-9]*$")
 
 

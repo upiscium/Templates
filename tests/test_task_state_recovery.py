@@ -550,6 +550,14 @@ class TaskStateRecoveryTest(unittest.TestCase):
             ),
             ("boolean-number", lambda raw: [[{**raw, "number": True}]]),
             ("non-object-entry", lambda _raw: [[None]]),
+            (
+                "abbreviated-head-sha",
+                lambda raw: [[{**raw, "head": {**raw["head"], "sha": "a" * 41}}]],
+            ),
+            (
+                "abbreviated-base-sha",
+                lambda raw: [[{**raw, "base": {**raw["base"], "sha": "b" * 63}}]],
+            ),
             ("wrong-number", lambda raw: [[{**raw, "number": 999}]]),
             ("closed", lambda raw: [[{**raw, "state": "closed"}]]),
             ("invalid-state", lambda raw: [[{**raw, "state": "merged"}]]),

@@ -27,6 +27,14 @@ SPEC.loader.exec_module(bridge)
 
 
 class PublicationRecoveryBridgeTest(unittest.TestCase):
+    def test_base_revision_parser_accepts_only_sha1_or_sha256_width(self) -> None:
+        for width in (40, 64):
+            value = b"- Base revision: " + (b"a" * width)
+            self.assertIsNotNone(bridge._BASE_REVISION_BYTES_RE.fullmatch(value))
+        for width in (41, 63):
+            value = b"- Base revision: " + (b"a" * width)
+            self.assertIsNone(bridge._BASE_REVISION_BYTES_RE.fullmatch(value))
+
     def setUp(self) -> None:
         self.target = Path("/tmp/publication-task").resolve()
         self.main = Path("/tmp/publication-main").resolve()

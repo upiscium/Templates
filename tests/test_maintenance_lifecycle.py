@@ -805,6 +805,71 @@ class MaintenanceLifecycleTest(unittest.TestCase):
                 )
             matches.assert_called_once_with("canonical body\n", "canonical body")
 
+    def test_merged_pr_rejects_intermediate_merge_oid_width(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._record(root)
+            details = {
+                "number": 22,
+                "title": "21: canonical title",
+                "body": "canonical body",
+                "headRefName": record.branch,
+                "baseRefName": "main",
+                "headRefOid": self.HEAD,
+                "isCrossRepository": False,
+                "state": "MERGED",
+                "mergeCommit": {"oid": "b" * 41},
+            }
+            with (
+                mock.patch.object(maintenance.agent_core, "pr_details", return_value=details),
+                mock.patch.object(maintenance.lifecycle, "default_branch", return_value="main"),
+                mock.patch.object(maintenance.agent_core, "canonical_repository", return_value="example/repo"),
+                self.assertRaisesRegex(maintenance.MaintenanceError, "number/mergeCommit"),
+            ):
+                maintenance._merged_pr(
+                    root,
+                    record,
+                    "example/repo",
+                    22,
+                    self.HEAD,
+                    "21: canonical title",
+                    "canonical body",
+                )
+
+    def test_merged_pr_requires_exact_number_and_same_repository_boolean(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = self._record(root)
+            base_details = {
+                "number": 22,
+                "title": "21: canonical title",
+                "body": "canonical body",
+                "headRefName": record.branch,
+                "baseRefName": "main",
+                "headRefOid": self.HEAD,
+                "isCrossRepository": False,
+                "state": "MERGED",
+                "mergeCommit": {"oid": self.MERGE},
+            }
+            cases = ((dict(base_details, number=True), 1), (dict(base_details, isCrossRepository=0), 22))
+            for details, pr_number in cases:
+                with self.subTest(details=details):
+                    with (
+                        mock.patch.object(maintenance.agent_core, "pr_details", return_value=details),
+                        mock.patch.object(maintenance.lifecycle, "default_branch", return_value="main"),
+                        mock.patch.object(maintenance.agent_core, "canonical_repository", return_value="example/repo"),
+                        self.assertRaises(maintenance.MaintenanceError),
+                    ):
+                        maintenance._merged_pr(
+                            root,
+                            record,
+                            "example/repo",
+                            pr_number,
+                            self.HEAD,
+                            "21: canonical title",
+                            "canonical body",
+                        )
+
     def test_dedicated_terminal_transition_does_not_change_normal_transition_table(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

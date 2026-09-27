@@ -24,6 +24,7 @@ if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 import git_private_state as private_state
 
+OID_RE = private_state.OID_RE
 TASK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 WORK_UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -616,12 +617,18 @@ def terminal_ref_locks(
 ):
     """Hold exact Task/default ref locks through a terminal state write."""
     branch = record.branch
-    if branch is None or record.head is None:
+    if (
+        branch is None
+        or not isinstance(record.head, str)
+        or OID_RE.fullmatch(record.head) is None
+    ):
         raise LifecycleError("terminal Task ref identity is incomplete")
     refs = [(branch, record.head)]
     if (default_branch is None) != (default_revision is None):
         raise LifecycleError("terminal default ref identity is incomplete")
     if default_branch is not None and default_revision is not None:
+        if not isinstance(default_revision, str) or OID_RE.fullmatch(default_revision) is None:
+            raise LifecycleError("terminal default ref identity is invalid")
         refs.append((default_branch, default_revision))
     if len({name for name, _ in refs}) != len(refs):
         raise LifecycleError("terminal Task and default refs must be distinct")
@@ -1758,7 +1765,7 @@ def mark_task_merged_from_integration(
     validate_task(task)
     current = record
     if expected_head is not None:
-        if not re.fullmatch(r"[0-9a-fA-F]{40,64}", expected_head):
+        if not isinstance(expected_head, str) or OID_RE.fullmatch(expected_head) is None:
             raise LifecycleError("finalization expected Task HEAD is invalid")
         current = worktree_for_task(record.path, task)
         if (
@@ -1847,7 +1854,7 @@ def remote_branch_head(record: WorktreeRecord) -> str | None:
         len(lines) != 1
         or len(lines[0]) != 2
         or lines[0][1] != expected_ref
-        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", lines[0][0])
+        or OID_RE.fullmatch(lines[0][0]) is None
     ):
         raise LifecycleError("cleanup refused: live Task branch response is invalid or ambiguous")
     return lines[0][0].lower()
@@ -1878,7 +1885,7 @@ def unpushed_commits(record: WorktreeRecord, state: Path) -> int:
 
 
 def require_cleanup_base_revision(root: Path, base_revision: str) -> None:
-    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", base_revision):
+    if not isinstance(base_revision, str) or OID_RE.fullmatch(base_revision) is None:
         raise LifecycleError("cleanup refused: Task Base revision is missing or invalid")
     result = run(
         ["git", "merge-base", "--is-ancestor", base_revision, default_branch(root)],
@@ -2007,11 +2014,19 @@ def pull_requests_for_branch(root: Path, branch: str, repository: str) -> list[d
             or not isinstance(head_ref, str)
             or not head_ref
             or not isinstance(head_sha, str)
-            or not head_sha
+            or OID_RE.fullmatch(head_sha) is None
             or not isinstance(base_ref, str)
             or not base_ref
             or not isinstance(base_sha, str)
-            or not base_sha
+            or OID_RE.fullmatch(base_sha) is None
+            or (
+                item.get("merge_commit_sha") is not None
+                and (
+                    not isinstance(item.get("merge_commit_sha"), str)
+                    or OID_RE.fullmatch(item["merge_commit_sha"]) is None
+                )
+            )
+            or (merged_at is not None and item.get("merge_commit_sha") is None)
         ):
             raise LifecycleError("GitHub pull request evidence is invalid")
         if head_ref != branch:
@@ -2064,10 +2079,12 @@ def merged_cleanup_evidence(
         or pr.get("baseRefName") != default_branch(root)
         or pr.get("isCrossRepository") is not False
         or not isinstance(pr.get("number"), int)
+        or isinstance(pr.get("number"), bool)
+        or pr.get("number") < 1
         or not isinstance(published_head, str)
-        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", published_head)
+        or OID_RE.fullmatch(published_head) is None
         or not isinstance(base_revision, str)
-        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", base_revision)
+        or OID_RE.fullmatch(base_revision) is None
     ):
         raise LifecycleError("cleanup refused: merged pull request evidence does not match the Task")
     published_head = published_head.lower()
@@ -2082,7 +2099,7 @@ def merged_cleanup_evidence(
         raise LifecycleError("cleanup refused: local Task branch is ahead of published PR head")
     recorded = extract_identity_value(state, "Published head SHA")
     if recorded and recorded.casefold() != "none":
-        if not re.fullmatch(r"[0-9a-fA-F]{40,64}", recorded) or recorded.lower() != published_head:
+        if OID_RE.fullmatch(recorded) is None or recorded.lower() != published_head:
             raise LifecycleError("cleanup refused: Task State published head does not match GitHub")
     remote_head = remote_branch_head(record)
     if remote_head is not None and remote_head != published_head:
@@ -2160,7 +2177,7 @@ def read_cleanup_receipt(path: Path, task: str) -> dict:
         or not isinstance(value.get("worktree"), str)
         or not branch_matches_task(value.get("branch"), task)
         or not isinstance(value.get("local_head"), str)
-        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", value["local_head"])
+        or OID_RE.fullmatch(value["local_head"]) is None
         or not isinstance(value.get("evidence"), dict)
     ):
         raise LifecycleError("cleanup receipt is invalid")
@@ -2170,7 +2187,7 @@ def read_cleanup_receipt(path: Path, task: str) -> dict:
         or not isinstance(evidence.get("repository"), str)
         or evidence.get("upstream") != "cancelled-safe"
         or not isinstance(evidence.get("base_revision"), str)
-        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", evidence["base_revision"])
+        or OID_RE.fullmatch(evidence["base_revision"]) is None
     ):
         raise LifecycleError("cleanup receipt is invalid")
     if value["status"] == "merged" and (
@@ -2180,13 +2197,15 @@ def read_cleanup_receipt(path: Path, task: str) -> dict:
         )
         or not isinstance(evidence.get("repository"), str)
         or not isinstance(evidence.get("pr"), int)
+        or isinstance(evidence.get("pr"), bool)
+        or evidence.get("pr") < 1
         or not isinstance(evidence.get("published_head"), str)
-        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", evidence["published_head"])
+        or OID_RE.fullmatch(evidence["published_head"]) is None
         or (
             "base_revision" in evidence
             and (
                 not isinstance(evidence.get("base_revision"), str)
-                or not re.fullmatch(r"[0-9a-fA-F]{40,64}", evidence["base_revision"])
+                or OID_RE.fullmatch(evidence["base_revision"]) is None
             )
         )
         or evidence.get("upstream") not in {"deleted", "live"}
@@ -2241,7 +2260,7 @@ def finish_cleanup(root: Path, plan: dict, receipt: Path) -> None:
             migrated_plan = None
             if plan["status"] == "merged" and base_revision is None and len(matches) == 1:
                 base_revision = matches[0].get("baseRefOid")
-                if isinstance(base_revision, str) and re.fullmatch(r"[0-9a-fA-F]{40,64}", base_revision):
+                if isinstance(base_revision, str) and OID_RE.fullmatch(base_revision):
                     base_revision = base_revision.lower()
                     migrated_plan = plan = {
                         **plan,

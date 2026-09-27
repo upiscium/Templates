@@ -68,6 +68,8 @@ class AgentCoreSafetyTest(unittest.TestCase):
             dict(valid, isCrossRepository=None),
             dict(valid, headRefOid="not-a-full-sha"),
             dict(valid, headRefOid=123),
+            dict(valid, headRefOid="a" * 41),
+            dict(valid, headRefOid="a" * 63),
             {key: value for key, value in valid.items() if key != "headRefOid"},
             dict(valid, statusCheckRollup=None),
             dict(valid, statusCheckRollup="SUCCESS"),
@@ -83,6 +85,16 @@ class AgentCoreSafetyTest(unittest.TestCase):
             with self.subTest(details=details):
                 with self.assertRaises(agent_core.AutomationError):
                     self.validate_details(details)
+
+    def test_invalid_integration_pr_argument_is_rejected_before_github_lookup(self) -> None:
+        for pr in ("--repo=attacker/target", "0", "12trailing"):
+            with self.subTest(pr=pr):
+                with (
+                    mock.patch.object(agent_core, "pr_details") as details,
+                    self.assertRaises(agent_core.AutomationError),
+                ):
+                    agent_core.validate_integration(Path("/repo"), pr)
+                details.assert_not_called()
 
     def test_integration_checkpoint_preserves_opencode_project_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -105,6 +117,17 @@ class AgentCoreSafetyTest(unittest.TestCase):
                 (root / ".git/agent-core/integration/pr-12.head").read_bytes(),
                 b"a" * 40 + b"\n",
             )
+
+    def test_branch_pr_lookup_rejects_non_object_json(self) -> None:
+        completed = subprocess.CompletedProcess(
+            ["gh", "pr", "view"], 0, "[]", ""
+        )
+        with mock.patch.object(agent_core, "run", return_value=completed):
+            with self.assertRaisesRegex(
+                agent_core.AutomationError,
+                "invalid pull request data returned by GitHub",
+            ):
+                agent_core.pr_for_branch(Path("/repo"), "task/TASK-1-demo")
 
     def test_automation_core_change_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -297,6 +320,52 @@ class PublicationMetadataTest(unittest.TestCase):
                 title="19: title", body="canonical body\n", draft=True,
             )
         matches.assert_called_once_with("canonical body\n", "canonical body")
+
+    def test_live_validation_requires_exact_boolean_pr_flags(self) -> None:
+        pr = {
+            "number": 19,
+            "headRefName": "task/19",
+            "baseRefName": "main",
+            "headRefOid": self.HEAD,
+            "title": "19: title",
+            "body": "canonical body",
+            "isDraft": True,
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+        for field, value in (("isDraft", 1), ("isCrossRepository", 0)):
+            with self.subTest(field=field, value=value):
+                invalid = {**pr, field: value}
+                with self.assertRaisesRegex(agent_core.AutomationError, field):
+                    agent_core._validate_live_pr(
+                        invalid,
+                        branch="task/19",
+                        base="main",
+                        head=self.HEAD,
+                        title="19: title",
+                        body="canonical body",
+                        draft=True,
+                    )
+
+    def test_edit_target_requires_exact_boolean_pr_flags(self) -> None:
+        pr = {
+            "number": 19,
+            "headRefName": "task/19",
+            "baseRefName": "main",
+            "headRefOid": self.HEAD,
+            "isDraft": True,
+            "isCrossRepository": False,
+            "state": "OPEN",
+        }
+        for field, value in (("isDraft", 1), ("isCrossRepository", 0)):
+            with self.subTest(field=field, value=value):
+                invalid = {**pr, field: value}
+                with self.assertRaisesRegex(
+                    agent_core.AutomationError, "pull request repair target identity is invalid"
+                ):
+                    agent_core._validate_edit_target(
+                        invalid, branch="task/19", base="main", head=self.HEAD
+                    )
 
     def fixture(self, root: Path, *, reviews: bool = True) -> None:
         state = root / ".task-state"

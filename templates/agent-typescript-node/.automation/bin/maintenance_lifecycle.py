@@ -993,6 +993,8 @@ def _merged_pr(
     title: str,
     body: str,
 ) -> dict:
+    if not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number < 1:
+        raise MaintenanceError("maintenance pull request number is invalid")
     details = agent_core.pr_details(record.path, str(pr_number))
     expected = {
         "headRefName": record.branch,
@@ -1005,15 +1007,19 @@ def _merged_pr(
     mismatches = [
         name for name, wanted in expected.items() if details.get(name) != wanted
     ]
+    number = details.get("number")
+    if not isinstance(number, int) or isinstance(number, bool) or number != pr_number:
+        mismatches.append("number")
+    if details.get("isCrossRepository") is not False:
+        mismatches.append("isCrossRepository")
     if not publication.canonical_pr_body_matches(body, details.get("body")):
         mismatches.append("body")
     merge = details.get("mergeCommit")
     merge_oid = merge.get("oid") if isinstance(merge, dict) else None
     if (
         mismatches
-        or details.get("number") != pr_number
         or not isinstance(merge_oid, str)
-        or not re.fullmatch(r"[0-9a-fA-F]{40,64}", merge_oid)
+        or lifecycle.OID_RE.fullmatch(merge_oid) is None
     ):
         raise MaintenanceError(
             "merged maintenance pull request evidence is invalid: "

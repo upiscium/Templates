@@ -249,7 +249,7 @@ def _verification_evidence_from_value(receipt: dict | None, task: str, head: str
         raise PublicationMetadataError("project verification evidence belongs to another Task")
     if (
         not isinstance(receipt.get("head"), str)
-        or not re.fullmatch(r"[0-9a-f]{40,64}", receipt["head"])
+        or task_lifecycle.OID_RE.fullmatch(receipt["head"]) is None
         or receipt["head"] != head
     ):
         raise PublicationMetadataError("project verification evidence is stale")
