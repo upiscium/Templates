@@ -112,13 +112,36 @@ class TaskLifecycleTest(unittest.TestCase):
 
     def test_generic_state_set_cannot_cross_publication_boundaries(self) -> None:
         record = lifecycle.WorktreeRecord(Path("/task"), "task/101-metadata", "a" * 40)
-        for status in ("draft-pr-created", "integration-pending"):
+        for status in ("draft-pr-created", "integration-pending", "merged"):
             with (
                 mock.patch.object(lifecycle, "require_local_task", return_value=record),
                 mock.patch.object(lifecycle, "require_resolved_contract"),
-                self.assertRaisesRegex(lifecycle.LifecycleError, "guarded pull request publication"),
+                self.assertRaisesRegex(lifecycle.LifecycleError, "guarded pull request lifecycle"),
             ):
                 lifecycle.task_state_set(Path("/task"), "101", status)
+
+    def test_generic_state_set_cannot_merge_integration_pending_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / ".task-state/task.md"
+            state.parent.mkdir()
+            state.write_text(
+                "## Current state\n\n- Status: integration-pending\n",
+                encoding="utf-8",
+            )
+            record = lifecycle.WorktreeRecord(root, "task/101-metadata", "a" * 40)
+            with (
+                mock.patch.object(lifecycle, "require_local_task", return_value=record),
+                mock.patch.object(lifecycle, "require_resolved_contract"),
+                mock.patch.object(lifecycle, "assert_task_identity"),
+                mock.patch.object(lifecycle, "work_units_lock", return_value=nullcontext()),
+                self.assertRaisesRegex(
+                    lifecycle.LifecycleError,
+                    "guarded pull request lifecycle transitions",
+                ),
+            ):
+                lifecycle.task_state_set(root, "101", "merged")
+            self.assertEqual(lifecycle.state_status(state), "integration-pending")
 
     def test_task_branch_matching_is_not_substring_based(self) -> None:
         self.assertTrue(lifecycle.branch_matches_task("task/TASK-1-example", "TASK-1"))

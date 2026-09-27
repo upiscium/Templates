@@ -1371,9 +1371,9 @@ def task_status(root: Path, task: str) -> None:
 def task_state_set(root: Path, task: str, status: str) -> None:
     record = require_local_task(root, task)
     require_resolved_contract(record, task)
-    if status in {"draft-pr-created", "integration-pending"}:
+    if status in {"draft-pr-created", "integration-pending", "merged"}:
         raise LifecycleError(
-            f"{status} is reserved for the guarded pull request publication boundary"
+            f"{status} is reserved for guarded pull request lifecycle transitions"
         )
     with work_units_lock(record):
         assert_task_identity(record, task)
