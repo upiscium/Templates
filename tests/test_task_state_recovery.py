@@ -40,8 +40,9 @@ class TaskStateRecoveryTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.remote_default_revision: str | None = None
+        self.remote_default_branch: str | None = None
+        self.fetch_ref_override: str | None = None
         self.fetch_head_override: str | None = None
-        self.update_remote_tracking = True
         self._network_fetch = mock.patch.object(
             recovery.lifecycle,
             "network_git",
@@ -75,35 +76,37 @@ class TaskStateRecoveryTest(unittest.TestCase):
     def fake_network_fetch(
         self, *args: str, cwd: Path, **_: object
     ) -> subprocess.CompletedProcess[str]:
-        self.assertEqual(
-            args,
-            (
-                "fetch",
-                "--no-tags",
-                "origin",
-                "refs/heads/main:refs/remotes/origin/main",
-            ),
-        )
-        fetched = self.fetch_head_override or self.remote_default_revision
-        if fetched is None:
-            fetched = self.git(
+        if args == ("ls-remote", "--symref", "origin", "HEAD"):
+            revision = self.remote_default_revision
+            if revision is None:
+                revision = self.git(
+                    "git", "rev-parse", "--verify", "refs/remotes/origin/main", cwd=cwd
+                )
+            branch = self.remote_default_branch or "main"
+            return subprocess.CompletedProcess(
+                ["git", *args],
+                0,
+                f"ref: refs/heads/{branch}\tHEAD\n{revision}\tHEAD\n",
+                "",
+            )
+        self.assertEqual(args[:3], ("fetch", "--no-tags", "origin"))
+        source_ref, separator, temporary_ref = args[3].partition(":")
+        self.assertEqual(source_ref, "refs/heads/main")
+        self.assertEqual(separator, ":")
+        self.assertTrue(temporary_ref.startswith("refs/agent-core/recovery-default/"))
+        fetched_ref = self.fetch_ref_override or self.remote_default_revision
+        if fetched_ref is None:
+            fetched_ref = self.git(
                 "git", "rev-parse", "--verify", "refs/remotes/origin/main", cwd=cwd
             )
-        if self.update_remote_tracking:
-            self.git(
-                "git",
-                "update-ref",
-                "refs/remotes/origin/main",
-                self.remote_default_revision or fetched,
-                cwd=cwd,
-            )
+        self.git("git", "update-ref", temporary_ref, fetched_ref, cwd=cwd)
         fetch_head = Path(
             self.git("git", "rev-parse", "--git-path", "FETCH_HEAD", cwd=cwd)
         )
         if not fetch_head.is_absolute():
             fetch_head = cwd / fetch_head
         fetch_head.write_text(
-            f"{fetched}\t\tbranch 'main' of origin\n",
+            f"{self.fetch_head_override or fetched_ref}\t\tbranch 'main' of origin\n",
             encoding="utf-8",
         )
         return subprocess.CompletedProcess(["git", *args], 0, "", "")
@@ -325,26 +328,63 @@ class TaskStateRecoveryTest(unittest.TestCase):
                 Path(directory)
             )
             self.fetch_head_override = base
-            self.update_remote_tracking = False
             self.assertEqual(self.remote_default_revision, main)
             with self.assertRaisesRegex(
                 recovery.TaskStateRecoveryError,
-                "fetched default revision does not match origin tracking ref",
+                "fetched default FETCH_HEAD does not match its temporary ref",
             ):
-                recovery._fetched_default_revision(source, "main")
+                recovery._fetched_default_revision(source, "main", main)
+
+    def test_remote_default_change_between_advertisement_and_fetch_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _repository, source, _target, base, main, implementation = self.exact_fixture(
+                Path(directory)
+            )
+            self.fetch_ref_override = base
+            with self.assertRaisesRegex(
+                recovery.TaskStateRecoveryError,
+                "remote default moved between advertisement and fetch",
+            ):
+                recovery._require_source_and_default(source, implementation)
+
+    def test_non_fast_forward_remote_default_fails_without_replacing_tracking_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository, source, _target, base, main, _implementation = self.exact_fixture(
+                Path(directory)
+            )
+            tree = self.git("git", "rev-parse", f"{base}^{{tree}}", cwd=repository)
+            rewound = self.git(
+                "git", "commit-tree", tree, "-p", base, "-m", "rewound main", cwd=repository
+            )
+            self.remote_default_revision = rewound
+            with self.assertRaisesRegex(
+                recovery.TaskStateRecoveryError,
+                "origin default branch moved non-fast-forward",
+            ):
+                recovery._fetched_default_revision(source, "main", rewound)
+            self.assertEqual(
+                main,
+                self.git(
+                    "git", "rev-parse", "refs/remotes/origin/main", cwd=repository
+                ),
+            )
+            self.assertEqual(
+                "",
+                self.git(
+                    "git",
+                    "for-each-ref",
+                    "--format=%(refname)",
+                    "refs/agent-core/recovery-default",
+                    cwd=repository,
+                ),
+            )
 
     def test_non_main_remote_default_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             _repository, source, _target, _base, _main, implementation = self.exact_fixture(
                 Path(directory)
             )
-            self.git(
-                "git",
-                "symbolic-ref",
-                "refs/remotes/origin/HEAD",
-                "refs/remotes/origin/release",
-                cwd=source,
-            )
+            self.remote_default_branch = "release"
             with self.assertRaisesRegex(
                 recovery.TaskStateRecoveryError,
                 "default branch is not main: release",
@@ -580,6 +620,70 @@ class TaskStateRecoveryTest(unittest.TestCase):
             self.assertEqual(plan["receipt"]["default_revision"], main)
             self.assertEqual(plan["receipt"]["pr_base_oid"], base)
 
+    def test_recovery_retries_after_default_and_pr_base_advance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository, source, target, base, first_main, implementation = self.exact_fixture(
+                Path(directory)
+            )
+            target_head = self.git("git", "rev-parse", "HEAD", cwd=target)
+            listing_calls = 0
+
+            def list_prs(_target: Path, _branch: str, _repository: str) -> list[dict]:
+                nonlocal listing_calls
+                listing_calls += 1
+                if listing_calls == 1:
+                    (repository / "main-after-first-plan.txt").write_text(
+                        "advance default between planning passes\n", encoding="utf-8"
+                    )
+                    self.git("git", "add", "main-after-first-plan.txt", cwd=repository)
+                    self.git(
+                        "git", "commit", "-m", "advance main during recovery plan", cwd=repository
+                    )
+                    self.remote_default_revision = self.git(
+                        "git", "rev-parse", "HEAD", cwd=repository
+                    )
+                    return [self.normalized_pr(target_head, base)]
+                return [self.normalized_pr(target_head, self.remote_default_revision)]
+
+            with (
+                mock.patch.object(
+                    recovery.lifecycle, "pull_requests_for_branch", side_effect=list_prs
+                ),
+                mock.patch.object(recovery, "_issue_runner", return_value=self.issue_runner()),
+                mock.patch.object(
+                    recovery.lifecycle, "remote_branch_head", return_value=target_head
+                ),
+            ):
+                first = recovery.recover_missing_task_state(
+                    source, target, self.TASK, self.PR, implementation
+                )
+
+                first_recovered_default = self.remote_default_revision
+                (repository / "main-after-retry.txt").write_text(
+                    "advance default before recovery retry\n", encoding="utf-8"
+                )
+                self.git("git", "add", "main-after-retry.txt", cwd=repository)
+                self.git("git", "commit", "-m", "advance main before recovery retry", cwd=repository)
+                self.remote_default_revision = self.git(
+                    "git", "rev-parse", "HEAD", cwd=repository
+                )
+                retry = recovery.recover_missing_task_state(
+                    source, target, self.TASK, self.PR, implementation
+                )
+
+            receipt_path = recovery.private_state.lost_ignored_task_state_receipt(target)
+            stored = recovery._read_receipt(receipt_path)
+            assert stored is not None
+            final_default = self.remote_default_revision
+            self.assertNotEqual(base, first_recovered_default)
+            self.assertNotEqual(first_recovered_default, final_default)
+            self.assertEqual(first["status"], "TASK_STATE_RECOVERED")
+            self.assertEqual(retry["status"], "TASK_STATE_ALREADY_RECOVERED")
+            self.assertEqual(stored[1]["base_revision"], base)
+            self.assertEqual(stored[1]["default_revision"], final_default)
+            self.assertEqual(stored[1]["pr_base_oid"], final_default)
+            self.assertEqual(target_head, self.git("git", "rev-parse", "HEAD", cwd=target))
+
     def test_authority_or_history_without_receipt_is_rejected(self) -> None:
         cases = (
             "task.md",
@@ -736,6 +840,68 @@ class TaskStateRecoveryTest(unittest.TestCase):
             receipt = recovery.private_state.lost_ignored_task_state_receipt(target)
             self.assertTrue(receipt.is_file())
             self.assertEqual(legacy_private_state.read_bytes(), b"historical private state\n")
+
+    def test_retry_refreshes_default_and_pr_base_observations_after_main_advances(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository, source, target, base, first_main, implementation = self.exact_fixture(
+                Path(directory)
+            )
+            target_head = self.git("git", "rev-parse", "HEAD", cwd=target)
+            first_pr = self.normalized_pr(target_head, base)
+            tracked_before = self.git(
+                "git", "status", "--porcelain=v1", "--untracked-files=all", cwd=target
+            )
+            with (
+                mock.patch.object(
+                    recovery.lifecycle,
+                    "pull_requests_for_branch",
+                    return_value=[first_pr],
+                ),
+                mock.patch.object(recovery, "_issue_runner", return_value=self.issue_runner()),
+                mock.patch.object(
+                    recovery.lifecycle, "remote_branch_head", return_value=target_head
+                ),
+            ):
+                first = recovery.recover_missing_task_state(
+                    source, target, self.TASK, self.PR, implementation
+                )
+            self.assertEqual(first["status"], "TASK_STATE_RECOVERED")
+
+            (repository / "main-advanced-after-recovery.txt").write_text(
+                "default advanced after initial recovery\n", encoding="utf-8"
+            )
+            self.git("git", "add", "main-advanced-after-recovery.txt", cwd=repository)
+            self.git("git", "commit", "-m", "advance main after recovery", cwd=repository)
+            current_main = self.git("git", "rev-parse", "HEAD", cwd=repository)
+            self.remote_default_revision = current_main
+            updated_pr = self.normalized_pr(target_head, current_main)
+            with (
+                mock.patch.object(
+                    recovery.lifecycle,
+                    "pull_requests_for_branch",
+                    return_value=[updated_pr],
+                ),
+                mock.patch.object(recovery, "_issue_runner", return_value=self.issue_runner()),
+                mock.patch.object(
+                    recovery.lifecycle, "remote_branch_head", return_value=target_head
+                ),
+            ):
+                retry = recovery.recover_missing_task_state(
+                    source, target, self.TASK, self.PR, implementation
+                )
+
+            receipt_path = recovery.private_state.lost_ignored_task_state_receipt(target)
+            receipt = recovery._read_receipt(receipt_path)
+            assert receipt is not None
+            self.assertEqual(retry["status"], "TASK_STATE_ALREADY_RECOVERED")
+            self.assertEqual(receipt[1]["base_revision"], base)
+            self.assertEqual(receipt[1]["default_revision"], current_main)
+            self.assertEqual(receipt[1]["pr_base_oid"], current_main)
+            self.assertEqual(target_head, self.git("git", "rev-parse", "HEAD", cwd=target))
+            self.assertEqual(
+                tracked_before,
+                self.git("git", "status", "--porcelain=v1", "--untracked-files=all", cwd=target),
+            )
 
     def test_real_rest_pr_payload_is_normalized_for_recovery(self) -> None:
         payload = self.rest_pr(self.HEAD, self.BASE)
