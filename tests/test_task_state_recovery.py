@@ -638,7 +638,7 @@ class TaskStateRecoveryTest(unittest.TestCase):
                 )
         self.assertEqual(1, len({state for state in normalized_states}))
 
-    def test_planning_succeeds_when_registered_main_checkout_is_stale(self) -> None:
+    def test_recovery_and_resume_succeed_when_registered_main_checkout_is_stale(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repository, source, target, base, main, implementation = self.exact_fixture(
                 Path(directory)
@@ -655,13 +655,16 @@ class TaskStateRecoveryTest(unittest.TestCase):
                 mock.patch.object(
                     recovery.lifecycle, "remote_branch_head", return_value=target_head
                 ),
-                mock.patch.object(
+            ):
+                with mock.patch.object(
                     recovery.lifecycle,
                     "main_worktree",
-                    side_effect=AssertionError("recovery must not depend on a main worktree"),
-                ),
-            ):
-                plan = recovery._plan(source, target, self.TASK, self.PR, implementation)
+                    side_effect=AssertionError("planning must not inspect a main checkout"),
+                ):
+                    plan = recovery._plan(source, target, self.TASK, self.PR, implementation)
+                recovered = recovery.recover_missing_task_state(
+                    source, target, self.TASK, self.PR, implementation
+                )
             self.assertEqual(base, self.git("git", "rev-parse", "HEAD", cwd=repository))
             self.assertEqual(main, self.git("git", "rev-parse", "refs/remotes/origin/main", cwd=repository))
             self.assertEqual(plan["base"], base)
@@ -669,6 +672,10 @@ class TaskStateRecoveryTest(unittest.TestCase):
             self.assertEqual(plan["receipt"]["base_revision"], base)
             self.assertEqual(plan["receipt"]["default_revision"], main)
             self.assertEqual(plan["receipt"]["pr_base_oid"], base)
+            self.assertEqual(recovered["status"], "TASK_STATE_RECOVERED")
+            self.assertEqual(recovered["resume"]["status"], "READY")
+            self.assertEqual(recovered["resume"]["mode"], "resume")
+            self.assertEqual(recovered["resume"]["taskStatus"], "implementing")
 
     def test_recovery_retries_after_default_and_pr_base_advance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
