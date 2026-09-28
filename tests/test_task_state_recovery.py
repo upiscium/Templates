@@ -322,18 +322,14 @@ class TaskStateRecoveryTest(unittest.TestCase):
                 self.BASE,
             )
 
-    def test_fetched_default_ref_mismatch_fails_closed(self) -> None:
+    def test_shared_fetch_head_drift_does_not_override_temporary_default_ref(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             _repository, source, _target, base, main, _implementation = self.exact_fixture(
                 Path(directory)
             )
             self.fetch_head_override = base
             self.assertEqual(self.remote_default_revision, main)
-            with self.assertRaisesRegex(
-                recovery.TaskStateRecoveryError,
-                "fetched default FETCH_HEAD does not match its temporary ref",
-            ):
-                recovery._fetched_default_revision(source, "main", main)
+            self.assertEqual(recovery._fetched_default_revision(source, "main", main), main)
 
     def test_remote_default_change_between_advertisement_and_fetch_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -378,6 +374,24 @@ class TaskStateRecoveryTest(unittest.TestCase):
                     cwd=repository,
                 ),
             )
+
+    def test_symbolic_origin_default_ref_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository, source, _target, _base, main, _implementation = self.exact_fixture(
+                Path(directory)
+            )
+            self.git(
+                "git",
+                "symbolic-ref",
+                "refs/remotes/origin/main",
+                "refs/remotes/origin/other-main",
+                cwd=repository,
+            )
+            with self.assertRaisesRegex(
+                recovery.TaskStateRecoveryError,
+                "origin default ref must not be symbolic",
+            ):
+                recovery._fetched_default_revision(source, "main", main)
 
     def test_non_main_remote_default_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -474,6 +488,42 @@ class TaskStateRecoveryTest(unittest.TestCase):
                 self.HEAD,
                 self.MAIN,
                 {"baseRefOid": self.BASE, "baseRefName": "main"},
+            )
+
+    def test_replace_refs_cannot_substitute_task_parent_or_source_blobs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _repository, _source, target, base, main, _implementation = self.exact_fixture(
+                Path(directory)
+            )
+            target_head = self.git("git", "rev-parse", "HEAD", cwd=target)
+            tree = self.git("git", "rev-parse", f"{target_head}^{{tree}}", cwd=target)
+            replacement = self.git(
+                "git",
+                "commit-tree",
+                tree,
+                "-p",
+                main,
+                "-m",
+                "replacement parent must not be trusted",
+                cwd=target,
+            )
+            self.git("git", "replace", target_head, replacement, cwd=target)
+
+            self.assertEqual(
+                bridge.git_bytes(
+                    ["git", "rev-list", "--parents", "-n", "1", target_head],
+                    cwd=target,
+                ).decode().strip(),
+                f"{target_head} {base}",
+            )
+            self.assertEqual(
+                recovery._prove_base(
+                    target,
+                    target_head,
+                    main,
+                    {"baseRefOid": base, "baseRefName": "main"},
+                ),
+                base,
             )
 
     def test_ambiguous_original_base_fails_closed(self) -> None:

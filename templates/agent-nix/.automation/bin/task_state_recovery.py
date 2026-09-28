@@ -41,7 +41,7 @@ def _number(value: str, label: str) -> int:
 
 
 def _git(root: Path, *args: str, check: bool = True) -> str:
-    return lifecycle.git(*args, cwd=root, check=check)
+    return lifecycle.git("--no-replace-objects", *args, cwd=root, check=check)
 
 
 def _issue_runner(command: list[str], *, cwd: Path, **_: object):
@@ -71,7 +71,9 @@ def _git_blob(root: Path, revision: str, relative: str) -> bytes:
     _oid(revision, "Git blob revision")
     try:
         result = lifecycle.run(
-            ["git", "show", f"{revision}:{relative}"], cwd=root, check=True
+            ["git", "--no-replace-objects", "show", f"{revision}:{relative}"],
+            cwd=root,
+            check=True,
         )
         return result.stdout.encode("utf-8")
     except UnicodeError as exc:
@@ -112,6 +114,15 @@ def _fetched_default_revision(
     """Fetch and validate the advertised remote default without consulting a main worktree."""
     advertised_revision = _oid(advertised_revision, "advertised remote default revision")
     remote_ref = f"refs/remotes/origin/{branch}"
+    symbolic_ref = lifecycle.run(
+        ["git", "symbolic-ref", "--quiet", remote_ref],
+        cwd=source_root,
+        check=False,
+    )
+    if symbolic_ref.returncode == 0:
+        raise TaskStateRecoveryError("origin default ref must not be symbolic")
+    if symbolic_ref.returncode != 1:
+        raise TaskStateRecoveryError("cannot inspect origin default ref type")
     previous_ref = lifecycle.run(
         ["git", "show-ref", "--verify", "--hash", remote_ref],
         cwd=source_root,
@@ -140,6 +151,15 @@ def _fetched_default_revision(
         raise TaskStateRecoveryError("temporary recovery default ref already exists")
     if collision.returncode != 1:
         raise TaskStateRecoveryError("cannot validate temporary recovery default ref")
+    temporary_symbolic = lifecycle.run(
+        ["git", "symbolic-ref", "--quiet", temporary_ref],
+        cwd=source_root,
+        check=False,
+    )
+    if temporary_symbolic.returncode == 0:
+        raise TaskStateRecoveryError("temporary recovery default ref must not be symbolic")
+    if temporary_symbolic.returncode != 1:
+        raise TaskStateRecoveryError("cannot inspect temporary recovery default ref type")
 
     temporary_revision: str | None = None
     try:
@@ -154,20 +174,19 @@ def _fetched_default_revision(
             _git(source_root, "rev-parse", "--verify", f"{temporary_ref}^{{commit}}"),
             "fetched default revision",
         )
-        fetch_head = _oid(
-            _git(source_root, "rev-parse", "--verify", "FETCH_HEAD^{commit}"),
-            "fetched default FETCH_HEAD",
-        )
-        if fetch_head != temporary_revision:
-            raise TaskStateRecoveryError(
-                "fetched default FETCH_HEAD does not match its temporary ref"
-            )
         if temporary_revision != advertised_revision:
             raise TaskStateRecoveryError(
                 "remote default moved between advertisement and fetch"
             )
         if previous is not None and lifecycle.run(
-            ["git", "merge-base", "--is-ancestor", previous, temporary_revision],
+            [
+                "git",
+                "--no-replace-objects",
+                "merge-base",
+                "--is-ancestor",
+                previous,
+                temporary_revision,
+            ],
             cwd=source_root,
             check=False,
         ).returncode != 0:
@@ -176,7 +195,14 @@ def _fetched_default_revision(
         expected_previous = previous or "0" * len(temporary_revision)
         try:
             lifecycle.run(
-                ["git", "update-ref", remote_ref, temporary_revision, expected_previous],
+                [
+                    "git",
+                    "update-ref",
+                    "--no-deref",
+                    remote_ref,
+                    temporary_revision,
+                    expected_previous,
+                ],
                 cwd=source_root,
             )
         except lifecycle.LifecycleError as exc:
@@ -185,6 +211,15 @@ def _fetched_default_revision(
             _git(source_root, "rev-parse", "--verify", f"{remote_ref}^{{commit}}"),
             "origin default revision",
         )
+        symbolic_after = lifecycle.run(
+            ["git", "symbolic-ref", "--quiet", remote_ref],
+            cwd=source_root,
+            check=False,
+        )
+        if symbolic_after.returncode == 0:
+            raise TaskStateRecoveryError("origin default ref became symbolic during fetch")
+        if symbolic_after.returncode != 1:
+            raise TaskStateRecoveryError("cannot verify origin default ref type after fetch")
         if remote != temporary_revision:
             raise TaskStateRecoveryError("origin default ref moved during recovery planning")
         return remote
@@ -214,7 +249,7 @@ def _fetched_default_revision(
         if cleanup_ref is not None:
             try:
                 lifecycle.run(
-                    ["git", "update-ref", "-d", temporary_ref, cleanup_ref],
+                    ["git", "update-ref", "--no-deref", "-d", temporary_ref, cleanup_ref],
                     cwd=source_root,
                 )
             except lifecycle.LifecycleError as exc:
@@ -530,7 +565,7 @@ def _require_default_advance(source_root: Path, previous: str, current: str) -> 
     if previous == current:
         return
     result = lifecycle.run(
-        ["git", "merge-base", "--is-ancestor", previous, current],
+        ["git", "--no-replace-objects", "merge-base", "--is-ancestor", previous, current],
         cwd=source_root,
         check=False,
     )
