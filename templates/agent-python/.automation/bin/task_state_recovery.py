@@ -77,36 +77,79 @@ def _git_blob(root: Path, revision: str, relative: str) -> bytes:
         raise TaskStateRecoveryError(f"Git blob is not valid UTF-8: {relative}") from exc
 
 
-def _require_source_and_main(source_root: Path, target: Path, implementation_revision: str) -> dict:
+def _fetched_default_revision(source_root: Path, branch: str) -> str:
+    """Fetch and validate the current remote default without consulting a main worktree."""
+    remote_ref = f"refs/remotes/origin/{branch}"
+    previous = _git(
+        source_root,
+        "rev-parse",
+        "--verify",
+        f"{remote_ref}^{{commit}}",
+        check=False,
+    )
+    previous = _oid(previous, "previous origin default revision") if previous else None
+    try:
+        lifecycle.network_git(
+            "fetch",
+            "--no-tags",
+            "origin",
+            f"refs/heads/{branch}:{remote_ref}",
+            cwd=source_root,
+        )
+    except lifecycle.LifecycleError as exc:
+        raise TaskStateRecoveryError(
+            f"cannot fetch current origin/{branch} revision"
+        ) from exc
+    fetched = _oid(
+        _git(source_root, "rev-parse", "--verify", "FETCH_HEAD^{commit}"),
+        "fetched default revision",
+    )
+    remote = _oid(
+        _git(source_root, "rev-parse", "--verify", f"{remote_ref}^{{commit}}"),
+        "origin default revision",
+    )
+    if fetched != remote:
+        raise TaskStateRecoveryError(
+            "fetched default revision does not match origin tracking ref"
+        )
+    if previous is not None and lifecycle.run(
+        ["git", "merge-base", "--is-ancestor", previous, fetched],
+        cwd=source_root,
+        check=False,
+    ).returncode != 0:
+        raise TaskStateRecoveryError("origin default branch moved non-fast-forward")
+    if _git(source_root, "rev-parse", "--verify", f"{remote_ref}^{{commit}}") != fetched:
+        raise TaskStateRecoveryError("origin default ref moved during recovery planning")
+    return fetched
+
+
+def _require_source_and_default(source_root: Path, implementation_revision: str) -> dict:
+    """Bind recovery to the exact clean implementation and fetched remote default."""
     source_root = source_root.resolve()
     if lifecycle.repo_root(source_root) != source_root:
         raise TaskStateRecoveryError("source root is not an exact Git worktree root")
-    default = lifecycle.default_branch(target)
+    default = lifecycle.default_branch(source_root)
     if default != "main":
         raise TaskStateRecoveryError(f"default branch is not main: {default}")
-    main = lifecycle.main_worktree(target)
     source_record = lifecycle.current_worktree(source_root)
-    if source_record.path != source_root or source_root == target:
+    if source_record.path != source_root:
         raise TaskStateRecoveryError("source root is not an exact registered implementation worktree")
-    if main.path == target or main.branch != default:
-        raise TaskStateRecoveryError("registered default-branch worktree is ambiguous")
     head = _oid(_git(source_root, "rev-parse", "--verify", "HEAD^{commit}"), "source HEAD")
     if head != implementation_revision:
         raise TaskStateRecoveryError("source HEAD does not match the implementation revision")
     if _git(source_root, "status", "--porcelain=v1", "--untracked-files=all"):
         raise TaskStateRecoveryError("source worktree must be clean")
-    main_head = _oid(_git(main.path, "rev-parse", "--verify", "HEAD^{commit}"), "current main HEAD")
-    main_remote = _git(main.path, "rev-parse", "--verify", "refs/remotes/origin/main", check=False)
-    if main_remote != main_head:
-        raise TaskStateRecoveryError("registered main is not synchronized with origin/main")
-    if _git(main.path, "status", "--porcelain=v1", "--untracked-files=all"):
-        raise TaskStateRecoveryError("registered main worktree must be clean")
+    default_revision = _fetched_default_revision(source_root, default)
+    if (
+        _git(source_root, "rev-parse", "--verify", "HEAD^{commit}") != head
+        or _git(source_root, "status", "--porcelain=v1", "--untracked-files=all")
+    ):
+        raise TaskStateRecoveryError("source worktree changed while fetching current default")
     return {
         "branch": default,
-        "revision": main_head,
+        "revision": default_revision,
         "implementation_revision": implementation_revision,
         "worktree": source_root,
-        "main_worktree": main.path,
     }
 
 
@@ -196,10 +239,7 @@ def _prove_base(target: Path, target_head: str, current_main: str, pr: dict) -> 
         raise TaskStateRecoveryError("Task original base is ambiguous or does not match its parent")
     if pr.get("baseRefName") != "main":
         raise TaskStateRecoveryError("pull request base branch is not main")
-    if _oid(pr.get("baseRefOid"), "pull request base revision") != current_main:
-        raise TaskStateRecoveryError(
-            "pull request base revision does not match the synchronized default branch"
-        )
+    _oid(pr.get("baseRefOid"), "pull request base revision")
     return parent
 
 
@@ -258,12 +298,14 @@ def _plan(
     task_number = _number(task, "Task/Issue")
     implementation_revision = _oid(implementation_revision, "implementation revision")
     target = target.resolve()
+    source_root = source_root.resolve()
+    if source_root == target:
+        raise TaskStateRecoveryError("source root and target Task worktree must be distinct")
     if lifecycle.repo_root(target) != target:
         raise TaskStateRecoveryError("target is not an exact Git worktree root")
     current = lifecycle.current_worktree(target)
-    main = lifecycle.main_worktree(target)
     record = lifecycle.worktree_for_task(target, task)
-    if current.path != target or record.path != target or current.path == main.path:
+    if current.path != target or record.path != target:
         raise TaskStateRecoveryError("target is not the exact registered non-default Task worktree")
     branch = record.branch
     if not lifecycle.branch_matches_task(branch, task) or branch is None:
@@ -276,13 +318,13 @@ def _plan(
     if target_head != local_head or record.head != target_head:
         raise TaskStateRecoveryError("target HEAD, local branch, and registered worktree HEAD differ")
     tree = _oid(_git(target, "rev-parse", "--verify", "HEAD^{tree}"), "target tree")
-    source = _require_source_and_main(source_root, target, implementation_revision)
     target_repository = contract.repository_identity(target)
     source_repository = contract.repository_identity(source_root)
     if target_repository.casefold() != source_repository.casefold():
         raise TaskStateRecoveryError("target and source repository identities differ")
     if private_state.common_git_dir(target).resolve() != private_state.common_git_dir(source_root).resolve():
         raise TaskStateRecoveryError("target and source do not share one Git common directory")
+    source = _require_source_and_default(source_root, implementation_revision)
     pr = _pull_request(target, target_repository, branch, requested_pr)
     if (
         pr.get("state") != "OPEN"

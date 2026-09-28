@@ -36,7 +36,19 @@ class TaskStateRecoveryTest(unittest.TestCase):
     BRANCH = "task/163-worktree-dispatch"
     HEAD = "42d0b0216fb2b338d3973484af7198cc77e52abb"
     BASE = "f9a9ba13e2366e21703847f9edf411e1cb2052a2"
-    MAIN = "36dc3a5b0290ce1c4f6e708920a4f234eb6b92b4"
+    MAIN = "271cfe06d2410f6616e74a465c50a827fe42d319"
+
+    def setUp(self) -> None:
+        self.remote_default_revision: str | None = None
+        self.fetch_head_override: str | None = None
+        self.update_remote_tracking = True
+        self._network_fetch = mock.patch.object(
+            recovery.lifecycle,
+            "network_git",
+            side_effect=self.fake_network_fetch,
+        )
+        self._network_fetch.start()
+        self.addCleanup(self._network_fetch.stop)
 
     def test_recovery_rejects_non_integer_pr_numbers_before_io(self) -> None:
         for requested_pr in (True, 1.0, 1.9, "1", 0, -1):
@@ -60,6 +72,42 @@ class TaskStateRecoveryTest(unittest.TestCase):
             raise AssertionError(result.stderr or result.stdout)
         return result.stdout.strip()
 
+    def fake_network_fetch(
+        self, *args: str, cwd: Path, **_: object
+    ) -> subprocess.CompletedProcess[str]:
+        self.assertEqual(
+            args,
+            (
+                "fetch",
+                "--no-tags",
+                "origin",
+                "refs/heads/main:refs/remotes/origin/main",
+            ),
+        )
+        fetched = self.fetch_head_override or self.remote_default_revision
+        if fetched is None:
+            fetched = self.git(
+                "git", "rev-parse", "--verify", "refs/remotes/origin/main", cwd=cwd
+            )
+        if self.update_remote_tracking:
+            self.git(
+                "git",
+                "update-ref",
+                "refs/remotes/origin/main",
+                self.remote_default_revision or fetched,
+                cwd=cwd,
+            )
+        fetch_head = Path(
+            self.git("git", "rev-parse", "--git-path", "FETCH_HEAD", cwd=cwd)
+        )
+        if not fetch_head.is_absolute():
+            fetch_head = cwd / fetch_head
+        fetch_head.write_text(
+            f"{fetched}\t\tbranch 'main' of origin\n",
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(["git", *args], 0, "", "")
+
     def exact_fixture(self, root: Path) -> tuple[Path, Path, Path, str, str, str]:
         repository = root / "repository"
         repository.mkdir()
@@ -81,6 +129,7 @@ class TaskStateRecoveryTest(unittest.TestCase):
         self.git("git", "add", "main.txt", cwd=repository)
         self.git("git", "commit", "-m", "advance main", cwd=repository)
         main = self.git("git", "rev-parse", "HEAD", cwd=repository)
+        self.remote_default_revision = main
         self.git("git", "update-ref", "refs/remotes/origin/main", main, cwd=repository)
         self.git(
             "git",
@@ -152,7 +201,7 @@ class TaskStateRecoveryTest(unittest.TestCase):
             "headRefOid": head,
             "headRepository": "upiscium/Templates",
             "baseRefName": "main",
-            "baseRefOid": base_ref_oid or self.MAIN,
+            "baseRefOid": base_ref_oid or self.BASE,
             "baseRepository": "upiscium/Templates",
             "isCrossRepository": False,
             "mergeCommit": {"oid": None},
@@ -173,7 +222,7 @@ class TaskStateRecoveryTest(unittest.TestCase):
             },
             "base": {
                 "ref": "main",
-                "sha": base_ref_oid or self.MAIN,
+                "sha": base_ref_oid or self.BASE,
                 "repo": {"full_name": "upiscium/Templates"},
             },
             "merge_commit_sha": None,
@@ -219,7 +268,7 @@ class TaskStateRecoveryTest(unittest.TestCase):
             "pr_head_ref": self.BRANCH,
             "pr_head_oid": self.HEAD,
             "pr_base_ref": "main",
-            "pr_base_oid": self.MAIN,
+            "pr_base_oid": self.BASE,
             "issue_sha256": "b" * 64,
             "implementation_source": str(ROOT),
             "implementation_revision": self.MAIN,
@@ -249,7 +298,8 @@ class TaskStateRecoveryTest(unittest.TestCase):
             "reconstructed": receipt["reconstructed_file_sha256"],
         }
 
-    def test_exact_163_shape_proves_the_original_base(self) -> None:
+    def test_production_shape_proves_original_base_when_main_and_pr_base_differ(self) -> None:
+        self.assertNotEqual(self.BASE, self.MAIN)
         values = {
             "rev-list": f"{self.HEAD} {self.BASE}\n",
             "merge-base": f"{self.BASE}\n",
@@ -262,14 +312,77 @@ class TaskStateRecoveryTest(unittest.TestCase):
                 return values["merge-base"]
             raise AssertionError((command, args))
 
-        pr = {"baseRefOid": self.MAIN, "baseRefName": "main"}
+        pr = {"baseRefOid": self.BASE, "baseRefName": "main"}
         with mock.patch.object(recovery, "_git", side_effect=fake_git):
             self.assertEqual(
                 recovery._prove_base(Path("/tmp/163"), self.HEAD, self.MAIN, pr),
                 self.BASE,
             )
 
-    def test_pull_request_base_oid_must_match_synchronized_main(self) -> None:
+    def test_fetched_default_ref_mismatch_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _repository, source, _target, base, main, _implementation = self.exact_fixture(
+                Path(directory)
+            )
+            self.fetch_head_override = base
+            self.update_remote_tracking = False
+            self.assertEqual(self.remote_default_revision, main)
+            with self.assertRaisesRegex(
+                recovery.TaskStateRecoveryError,
+                "fetched default revision does not match origin tracking ref",
+            ):
+                recovery._fetched_default_revision(source, "main")
+
+    def test_non_main_remote_default_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _repository, source, _target, _base, _main, implementation = self.exact_fixture(
+                Path(directory)
+            )
+            self.git(
+                "git",
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/release",
+                cwd=source,
+            )
+            with self.assertRaisesRegex(
+                recovery.TaskStateRecoveryError,
+                "default branch is not main: release",
+            ):
+                recovery._require_source_and_default(source, implementation)
+
+    def test_wrong_implementation_revision_fails_before_fetch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _repository, source, _target, _base, _main, implementation = self.exact_fixture(
+                Path(directory)
+            )
+            with (
+                mock.patch.object(recovery.lifecycle, "network_git") as fetch,
+                self.assertRaisesRegex(
+                    recovery.TaskStateRecoveryError,
+                    "source HEAD does not match the implementation revision",
+                ),
+            ):
+                recovery._require_source_and_default(source, "a" * 40)
+            fetch.assert_not_called()
+
+    def test_dirty_source_fails_before_fetch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _repository, source, _target, _base, _main, implementation = self.exact_fixture(
+                Path(directory)
+            )
+            (source / "unrelated-dirty-file").write_text("dirty\n", encoding="utf-8")
+            with (
+                mock.patch.object(recovery.lifecycle, "network_git") as fetch,
+                self.assertRaisesRegex(
+                    recovery.TaskStateRecoveryError,
+                    "source worktree must be clean",
+                ),
+            ):
+                recovery._require_source_and_default(source, implementation)
+            fetch.assert_not_called()
+
+    def test_pull_request_base_oid_must_be_a_full_oid(self) -> None:
         values = {
             "rev-list": f"{self.HEAD} {self.BASE}\n",
             "merge-base": f"{self.BASE}\n",
@@ -286,7 +399,34 @@ class TaskStateRecoveryTest(unittest.TestCase):
             mock.patch.object(recovery, "_git", side_effect=fake_git),
             self.assertRaisesRegex(
                 recovery.TaskStateRecoveryError,
-                "pull request base revision does not match the synchronized default branch",
+                "pull request base revision must be a full lowercase immutable revision",
+            ),
+        ):
+            recovery._prove_base(
+                Path("/tmp/163"),
+                self.HEAD,
+                self.MAIN,
+                {"baseRefOid": "not-a-full-oid", "baseRefName": "main"},
+            )
+
+    def test_task_parent_must_match_unique_current_main_merge_base(self) -> None:
+        values = {
+            "rev-list": f"{self.HEAD} {self.BASE}\n",
+            "merge-base": f"{'c' * 40}\n",
+        }
+
+        def fake_git(_root: Path, command: str, *args: str, **_: object) -> str:
+            if command == "rev-list":
+                return values["rev-list"]
+            if command == "merge-base":
+                return values["merge-base"]
+            raise AssertionError((command, args))
+
+        with (
+            mock.patch.object(recovery, "_git", side_effect=fake_git),
+            self.assertRaisesRegex(
+                recovery.TaskStateRecoveryError,
+                "Task original base is ambiguous or does not match its parent",
             ),
         ):
             recovery._prove_base(
@@ -307,7 +447,7 @@ class TaskStateRecoveryTest(unittest.TestCase):
                     Path("/tmp/163"),
                     self.HEAD,
                     self.MAIN,
-                    {"baseRefOid": self.MAIN, "baseRefName": "main"},
+                    {"baseRefOid": self.BASE, "baseRefName": "main"},
                 )
 
     def test_state_builder_is_conservative_and_schema_bound(self) -> None:
@@ -359,7 +499,7 @@ class TaskStateRecoveryTest(unittest.TestCase):
                     lock.write_bytes(b"")
                     lock.chmod(0o600)
                 target_head = self.git("git", "rev-parse", "HEAD", cwd=target)
-                pull_request = self.normalized_pr(target_head, main)
+                pull_request = self.normalized_pr(target_head, base)
                 pull_request_before = json.loads(json.dumps(pull_request))
                 tracked_before = self.git(
                     "git", "status", "--porcelain=v1", "--untracked-files=all", cwd=target
@@ -407,6 +547,38 @@ class TaskStateRecoveryTest(unittest.TestCase):
                     )
                 )
         self.assertEqual(1, len({state for state in normalized_states}))
+
+    def test_planning_succeeds_when_registered_main_checkout_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository, source, target, base, main, implementation = self.exact_fixture(
+                Path(directory)
+            )
+            self.git("git", "reset", "--hard", base, cwd=repository)
+            self.git("git", "update-ref", "refs/remotes/origin/main", base, cwd=repository)
+            target_head = self.git("git", "rev-parse", "HEAD", cwd=target)
+            pull_request = self.normalized_pr(target_head, base)
+            with (
+                mock.patch.object(
+                    recovery.lifecycle, "pull_requests_for_branch", return_value=[pull_request]
+                ),
+                mock.patch.object(recovery, "_issue_runner", return_value=self.issue_runner()),
+                mock.patch.object(
+                    recovery.lifecycle, "remote_branch_head", return_value=target_head
+                ),
+                mock.patch.object(
+                    recovery.lifecycle,
+                    "main_worktree",
+                    side_effect=AssertionError("recovery must not depend on a main worktree"),
+                ),
+            ):
+                plan = recovery._plan(source, target, self.TASK, self.PR, implementation)
+            self.assertEqual(base, self.git("git", "rev-parse", "HEAD", cwd=repository))
+            self.assertEqual(main, self.git("git", "rev-parse", "refs/remotes/origin/main", cwd=repository))
+            self.assertEqual(plan["base"], base)
+            self.assertEqual(plan["default_revision"], main)
+            self.assertEqual(plan["receipt"]["base_revision"], base)
+            self.assertEqual(plan["receipt"]["default_revision"], main)
+            self.assertEqual(plan["receipt"]["pr_base_oid"], base)
 
     def test_authority_or_history_without_receipt_is_rejected(self) -> None:
         cases = (
@@ -521,7 +693,7 @@ class TaskStateRecoveryTest(unittest.TestCase):
             legacy_private_state = recovery.private_state.admin_git_dir(target) / "opencode/automation-maintenance/legacy.json"
             legacy_private_state.parent.mkdir(parents=True)
             legacy_private_state.write_bytes(b"historical private state\n")
-            rest_payload = self.rest_pr(target_head, main)
+            rest_payload = self.rest_pr(target_head, base)
             rest_response = subprocess.CompletedProcess(
                 ["gh", "api"], 0, json.dumps([[rest_payload]]), ""
             )
@@ -549,7 +721,8 @@ class TaskStateRecoveryTest(unittest.TestCase):
             self.assertEqual(plan["default_revision"], main)
             self.assertNotEqual(base, main)
             self.assertEqual(plan["receipt"]["base_revision"], base)
-            self.assertEqual(plan["receipt"]["pr_base_oid"], main)
+            self.assertEqual(plan["receipt"]["default_revision"], main)
+            self.assertEqual(plan["receipt"]["pr_base_oid"], base)
             self.assertEqual(first["status"], "TASK_STATE_RECOVERED")
             self.assertEqual(second["status"], "TASK_STATE_ALREADY_RECOVERED")
             self.assertEqual(before, self.git("git", "status", "--porcelain=v1", "--untracked-files=all", cwd=target))
@@ -565,7 +738,7 @@ class TaskStateRecoveryTest(unittest.TestCase):
             self.assertEqual(legacy_private_state.read_bytes(), b"historical private state\n")
 
     def test_real_rest_pr_payload_is_normalized_for_recovery(self) -> None:
-        payload = self.rest_pr(self.HEAD, self.MAIN)
+        payload = self.rest_pr(self.HEAD, self.BASE)
         response = subprocess.CompletedProcess(
             ["gh", "api"], 0, json.dumps([[payload]]), ""
         )
@@ -657,8 +830,8 @@ class TaskStateRecoveryTest(unittest.TestCase):
                 lambda raw: [[{**raw, "base": {**raw["base"], "ref": "release"}}]],
             ),
             (
-                "wrong-base-sha",
-                lambda raw: [[{**raw, "base": {**raw["base"], "sha": "f" * 40}}]],
+                "malformed-base-sha",
+                lambda raw: [[{**raw, "base": {**raw["base"], "sha": "not-a-full-oid"}}]],
             ),
             (
                 "wrong-base-repository",
@@ -683,7 +856,7 @@ class TaskStateRecoveryTest(unittest.TestCase):
                     implementation,
                 ) = self.exact_fixture(Path(directory))
                 target_head = self.git("git", "rev-parse", "HEAD", cwd=target)
-                raw = self.rest_pr(target_head, main)
+                raw = self.rest_pr(target_head, base)
                 if response_factory is None:
                     response = subprocess.CompletedProcess(
                         ["gh", "api"], 1, "", "GitHub API failure\n"
@@ -721,7 +894,7 @@ class TaskStateRecoveryTest(unittest.TestCase):
                 implementation,
             ) = self.exact_fixture(Path(directory))
             target_head = self.git("git", "rev-parse", "HEAD", cwd=target)
-            pull_request = self.normalized_pr(target_head, main)
+            pull_request = self.normalized_pr(target_head, base)
             with (
                 mock.patch.object(
                     recovery.lifecycle, "pull_requests_for_branch", return_value=[pull_request]
