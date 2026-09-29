@@ -1280,6 +1280,24 @@ class PostMergeFinalizationTest(RepositoryFixture):
             "integration-pending",
         )
 
+    def test_pr_number_identity_must_remain_exact_during_revalidation(self) -> None:
+        task_worktree, _, evidence = self.prepare()
+        state = task_worktree / ".task-state/task.md"
+        before = state.read_bytes()
+        replacement = dict(evidence, number=94)
+        with (
+            mock.patch.object(agent_core, "pr_details", side_effect=[evidence, replacement]),
+            mock.patch.object(
+                agent_core,
+                "prs_for_branch",
+                return_value=[{"number": 93, "headRefName": evidence["headRefName"]}],
+            ),
+            self.assertRaises(agent_core.AutomationError),
+        ):
+            agent_core.integrate_finalize(self.repo, "TASK-1", "93")
+        self.assertEqual(before, state.read_bytes())
+        self.assertEqual("integration-pending", lifecycle.state_status(state))
+
     def test_persisted_published_head_must_match_finalization_head(self) -> None:
         task_worktree, _, evidence = self.prepare()
         state = task_worktree / ".task-state/task.md"

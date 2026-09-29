@@ -156,6 +156,26 @@ class TaskLifecycleTest(unittest.TestCase):
             lifecycle.set_state_status(path, "planning")
             self.assertEqual(lifecycle.state_status(path), "planning")
 
+    def test_cancelled_task_is_terminal_and_cannot_be_reopened(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / ".task-state/task.md"
+            path.parent.mkdir()
+            path.write_text("## Current state\n\n- Status: initialized\n", encoding="utf-8")
+            record = lifecycle.WorktreeRecord(root, "task/163-cancellation", "a" * 40)
+            with (
+                mock.patch.object(lifecycle, "require_local_task", return_value=record),
+                mock.patch.object(lifecycle, "require_resolved_contract"),
+                mock.patch.object(lifecycle, "assert_task_identity"),
+                mock.patch.object(lifecycle, "work_units_lock", return_value=nullcontext()),
+            ):
+                lifecycle.task_state_set(root, "163", "cancelled")
+                self.assertEqual("cancelled", lifecycle.state_status(path))
+                cancelled_bytes = path.read_bytes()
+                with self.assertRaises(lifecycle.LifecycleError):
+                    lifecycle.task_state_set(root, "163", "implementing")
+            self.assertEqual(cancelled_bytes, path.read_bytes())
+
     def test_generic_state_set_cannot_recover_blocked_to_publication_ready(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

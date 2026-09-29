@@ -304,20 +304,28 @@ class TaskStateRecoveryTest(unittest.TestCase):
         }
 
     def test_production_shape_proves_original_base_when_main_and_pr_base_differ(self) -> None:
+        self.assertEqual(self.HEAD, "42d0b0216fb2b338d3973484af7198cc77e52abb")
+        self.assertEqual(self.BASE, "f9a9ba13e2366e21703847f9edf411e1cb2052a2")
+        self.assertEqual(self.MAIN, "271cfe06d2410f6616e74a465c50a827fe42d319")
         self.assertNotEqual(self.BASE, self.MAIN)
         values = {
             "rev-list": f"{self.HEAD} {self.BASE}\n",
             "merge-base": f"{self.BASE}\n",
         }
 
-        def fake_git(_root: Path, command: str, *args: str, **_: object) -> str:
+        def fake_git(root: Path, command: str, *args: str, **_: object) -> str:
+            self.assertEqual(Path("/tmp/163"), root)
             if command == "rev-list":
+                self.assertEqual(("--parents", "-n", "1", self.HEAD), args)
                 return values["rev-list"]
             if command == "merge-base":
+                self.assertEqual(("--all", self.HEAD, self.MAIN), args)
                 return values["merge-base"]
             raise AssertionError((command, args))
 
-        pr = {"baseRefOid": "c" * 40, "baseRefName": "main"}
+        observed_pr_base = self.BASE
+        self.assertNotEqual(observed_pr_base, self.MAIN)
+        pr = {"baseRefOid": observed_pr_base, "baseRefName": "main"}
         with mock.patch.object(recovery, "_git", side_effect=fake_git):
             self.assertEqual(
                 recovery._prove_base(Path("/tmp/163"), self.HEAD, self.MAIN, pr),
@@ -335,6 +343,11 @@ class TaskStateRecoveryTest(unittest.TestCase):
             latest_plan["pr"]["baseRefOid"] = latest_pr_base
             latest_plan["receipt"]["pr_base_oid"] = latest_pr_base
 
+            self.assertEqual(latest_plan["receipt"]["base_revision"], self.BASE)
+            self.assertEqual(latest_plan["receipt"]["default_revision"], self.MAIN)
+            self.assertEqual(latest_plan["receipt"]["pr_base_oid"], latest_pr_base)
+            self.assertEqual(latest_plan["pr"]["baseRefOid"], latest_pr_base)
+            self.assertNotEqual(latest_plan["receipt"]["pr_base_oid"], self.MAIN)
             recovery._same_recovery_receipt(receipt, latest_plan)
 
     def test_shared_fetch_head_drift_does_not_override_temporary_default_ref(self) -> None:
@@ -588,7 +601,7 @@ class TaskStateRecoveryTest(unittest.TestCase):
         for topology in ("absent", "empty", "lock"):
             with self.subTest(topology=topology), tempfile.TemporaryDirectory() as directory:
                 (
-                    _repository,
+                    repository,
                     source,
                     target,
                     base,
@@ -604,6 +617,15 @@ class TaskStateRecoveryTest(unittest.TestCase):
                     lock.write_bytes(b"")
                     lock.chmod(0o600)
                 target_head = self.git("git", "rev-parse", "HEAD", cwd=target)
+                branch_ref = f"refs/heads/{self.BRANCH}"
+                branch_ref_before = self.git("git", "rev-parse", branch_ref, cwd=repository)
+                branch_before = self.git("git", "symbolic-ref", "HEAD", cwd=target)
+                worktree_registry_before = self.git(
+                    "git", "worktree", "list", "--porcelain", cwd=repository
+                )
+                repository_identity_before = self.git(
+                    "git", "config", "--get", "remote.origin.url", cwd=target
+                )
                 pull_request = self.normalized_pr(target_head, base)
                 pull_request_before = json.loads(json.dumps(pull_request))
                 tracked_before = self.git(
@@ -612,14 +634,35 @@ class TaskStateRecoveryTest(unittest.TestCase):
                 with (
                     mock.patch.object(
                         recovery.lifecycle, "pull_requests_for_branch", return_value=[pull_request]
-                    ),
+                    ) as listed_prs,
                     mock.patch.object(recovery, "_issue_runner", return_value=self.issue_runner()),
-                    mock.patch.object(recovery.lifecycle, "remote_branch_head", return_value=target_head),
+                    mock.patch.object(
+                        recovery.lifecycle, "remote_branch_head", return_value=target_head
+                    ) as observed_remote_head,
                 ):
                     result = recovery.recover_missing_task_state(
                         source, target, self.TASK, self.PR, implementation
                     )
+                self.assertGreaterEqual(listed_prs.call_count, 1)
+                for call in listed_prs.call_args_list:
+                    self.assertEqual(
+                        (target, self.BRANCH, "upiscium/Templates"), call.args
+                    )
+                self.assertGreaterEqual(observed_remote_head.call_count, 1)
+                for call in observed_remote_head.call_args_list:
+                    observed_record = call.args[0]
+                    self.assertEqual(target, observed_record.path)
+                    self.assertEqual(self.BRANCH, observed_record.branch)
+                    self.assertEqual(target_head, observed_record.head)
                 self.assertEqual(result["status"], "TASK_STATE_RECOVERED")
+                self.assertEqual(self.TASK, result["task"])
+                self.assertEqual("upiscium/Templates", result["repository"])
+                self.assertEqual(self.BRANCH, result["branch"])
+                self.assertEqual(str(target.resolve()), result["worktree"])
+                self.assertEqual(target_head, result["head"])
+                self.assertEqual(self.PR, result["pullRequest"])
+                self.assertEqual(base, result["baseRevision"])
+                self.assertEqual(0, result["githubMutations"])
                 self.assertEqual(result["taskStatus"], "implementing")
                 self.assertEqual(result["resume"]["status"], "READY")
                 self.assertEqual(result["resume"]["mode"], "resume")
@@ -629,11 +672,68 @@ class TaskStateRecoveryTest(unittest.TestCase):
                     self.git("git", "status", "--porcelain=v1", "--untracked-files=all", cwd=target),
                 )
                 self.assertEqual(target_head, self.git("git", "rev-parse", "HEAD", cwd=target))
+                self.assertEqual(branch_ref, branch_before)
+                self.assertEqual(target_head, branch_ref_before)
+                self.assertEqual(
+                    branch_ref_before,
+                    self.git("git", "rev-parse", branch_ref, cwd=repository),
+                )
+                self.assertEqual(
+                    worktree_registry_before,
+                    self.git("git", "worktree", "list", "--porcelain", cwd=repository),
+                )
+                self.assertIn(
+                    f"worktree {target}\nHEAD {target_head}\nbranch {branch_ref}",
+                    worktree_registry_before,
+                )
+                self.assertEqual(
+                    "https://github.com/upiscium/Templates.git",
+                    repository_identity_before,
+                )
+                self.assertEqual(
+                    repository_identity_before,
+                    self.git("git", "config", "--get", "remote.origin.url", cwd=target),
+                )
                 self.assertEqual(pull_request_before, pull_request)
+                self.assertEqual(self.PR, pull_request["number"])
+                self.assertEqual(self.BRANCH, pull_request["headRefName"])
+                self.assertEqual(target_head, pull_request["headRefOid"])
+                self.assertEqual("upiscium/Templates", pull_request["headRepository"])
+                self.assertEqual("main", pull_request["baseRefName"])
+                self.assertEqual("upiscium/Templates", pull_request["baseRepository"])
+                self.assertFalse(pull_request["isCrossRepository"])
+                self.assertEqual(base, pull_request["baseRefOid"])
                 self.assertIn(
                     "- Status: implementing",
                     (state / "task.md").read_text(encoding="utf-8"),
                 )
+                self.assertIn(f"- Task ID: {self.TASK}", (state / "task.md").read_text(encoding="utf-8"))
+                self.assertIn(f"- Branch: {self.BRANCH}", (state / "task.md").read_text(encoding="utf-8"))
+                self.assertIn(f"- Worktree: {target}", (state / "task.md").read_text(encoding="utf-8"))
+                contract_snapshot = json.loads((state / "issue.json").read_text(encoding="utf-8"))
+                contract_reference = json.loads((state / "contract.json").read_text(encoding="utf-8"))
+                self.assertEqual(self.TASK, str(contract_snapshot["issue"]))
+                self.assertEqual("upiscium/Templates", contract_snapshot["repository"])
+                self.assertEqual(self.TASK, str(contract_reference["issue"]))
+                self.assertEqual("upiscium/Templates", contract_reference["repository"])
+                stored_receipt = recovery._read_receipt(
+                    recovery.private_state.lost_ignored_task_state_receipt(target)
+                )
+                self.assertIsNotNone(stored_receipt)
+                assert stored_receipt is not None
+                receipt = stored_receipt[1]
+                self.assertEqual("upiscium/Templates", receipt["repository"])
+                self.assertEqual(self.TASK, receipt["task_id"])
+                self.assertEqual(str(target.resolve()), receipt["worktree"])
+                self.assertEqual(self.BRANCH, receipt["branch"])
+                self.assertEqual(target_head, receipt["head"])
+                self.assertEqual(base, receipt["base_revision"])
+                self.assertEqual(main, receipt["default_revision"])
+                self.assertEqual(target_head, receipt["remote_branch_head"])
+                self.assertEqual(self.PR, receipt["pr_number"])
+                self.assertEqual(self.BRANCH, receipt["pr_head_ref"])
+                self.assertEqual(target_head, receipt["pr_head_oid"])
+                self.assertEqual(base, receipt["pr_base_oid"])
                 self.assertEqual(
                     {"contract.json", "issue.json", "task.md", "work-units.lock"},
                     {path.name for path in state.iterdir()},
@@ -881,6 +981,8 @@ class TaskStateRecoveryTest(unittest.TestCase):
             self.assertEqual(plan["receipt"]["base_revision"], base)
             self.assertEqual(plan["receipt"]["default_revision"], main)
             self.assertEqual(plan["receipt"]["pr_base_oid"], base)
+            self.assertEqual(plan["receipt"]["pr_base_oid"], plan["pr"]["baseRefOid"])
+            self.assertNotEqual(plan["receipt"]["pr_base_oid"], plan["receipt"]["default_revision"])
             self.assertEqual(recovered["status"], "TASK_STATE_RECOVERED")
             self.assertEqual(recovered["resume"]["status"], "READY")
             self.assertEqual(recovered["resume"]["mode"], "resume")
