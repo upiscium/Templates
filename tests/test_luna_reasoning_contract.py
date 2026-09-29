@@ -44,7 +44,7 @@ class LunaReasoningContractTest(unittest.TestCase):
     def test_luna_agents_use_max_reasoning(self) -> None:
         for role in sorted(LUNA_AGENTS):
             metadata = frontmatter(CORE_AGENTS / f"{role}.md")
-            self.assertIn("model: openai/gpt-5.6-luna", metadata, role)
+            self.assertIn("model: openai/gpt-6-luna", metadata, role)
             self.assertIn("reasoningEffort: max", metadata, role)
 
     def test_retained_high_tier_models_are_explicit(self) -> None:

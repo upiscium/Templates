@@ -708,16 +708,16 @@ class OpenCodeContractTest(unittest.TestCase):
     def test_model_assignment_is_exact(self) -> None:
         expected = {
             "build.md": "openai/gpt-5.6-sol",
-            "plan.md": "openai/gpt-5.6-luna",
-            "task-orchestrator.md": "openai/gpt-5.6-luna",
+            "plan.md": "openai/gpt-6-luna",
+            "task-orchestrator.md": "openai/gpt-6-luna",
             "maintenance-orchestrator.md": "openai/gpt-5.6-sol",
-            "general.md": "openai/gpt-5.6-luna",
-            "explore.md": "openai/gpt-5.6-luna",
-            "verifier.md": "openai/gpt-5.6-luna",
-            "reviewer.md": "openai/gpt-5.6-luna",
-            "investigator.md": "openai/gpt-5.6-luna",
+            "general.md": "openai/gpt-6-luna",
+            "explore.md": "openai/gpt-6-luna",
+            "verifier.md": "openai/gpt-6-luna",
+            "reviewer.md": "openai/gpt-6-luna",
+            "investigator.md": "openai/gpt-6-luna",
             "security-reviewer.md": "openai/gpt-5.6-terra",
-            "scout.md": "openai/gpt-5.6-luna",
+            "scout.md": "openai/gpt-6-luna",
             "architect.md": "openai/gpt-5.6-sol",
         }
         for filename, model in expected.items():
@@ -731,7 +731,7 @@ class OpenCodeContractTest(unittest.TestCase):
         }
         luna_agents = {
             path.name for path in AGENTS.glob("*.md")
-            if "model: openai/gpt-5.6-luna" in frontmatter(path)
+            if "model: openai/gpt-6-luna" in frontmatter(path)
         }
         terra_agents = {
             path.name for path in AGENTS.glob("*.md")
@@ -843,7 +843,7 @@ class OpenCodeContractTest(unittest.TestCase):
         permission = permission_for("plan")
 
         self.assertIn("mode: primary", front)
-        self.assertIn("model: openai/gpt-5.6-luna", front)
+        self.assertIn("model: openai/gpt-6-luna", front)
         self.assertEqual(permission.get("edit"), "deny")
         self.assertEqual(permission.get("question"), "allow")
         self.assertEqual(permission.get("skill"), "allow")
@@ -985,7 +985,7 @@ global permissive plan
 
         self.assertEqual(data["description"], "Repository-local read-only planning agent")
         self.assertEqual(data["mode"], "primary")
-        self.assertEqual(data["model"], {"providerID": "openai", "modelID": "gpt-5.6-luna"})
+        self.assertEqual(data["model"], {"providerID": "openai", "modelID": "gpt-6-luna"})
         self.assertEqual(last_action("edit"), "deny")
         self.assertEqual(last_action("question"), "allow")
         self.assertEqual(last_action("bash"), "deny")

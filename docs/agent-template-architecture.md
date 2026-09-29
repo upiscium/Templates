@@ -964,10 +964,10 @@ The intended initial model allocation is:
 | Role | Model family | Responsibility |
 | --- | --- | --- |
 | Main Orchestrator / architecture | GPT-5.6 Sol | repository-wide orchestration, integration, consequential architecture decisions |
-| Task Orchestrator / plan | GPT-5.6 Luna (max) | high-frequency Task coordination and read-only planning |
-| general / explore | GPT-5.6 Luna (max) | bounded implementation and discovery |
-| verifier / scout | GPT-5.6 Luna (max) | deterministic verification and lightweight external research |
-| reviewer / investigator | GPT-5.6 Luna (max) | correctness review and root-cause investigation |
+| Task Orchestrator / plan | GPT-6 Luna (max) | high-frequency Task coordination and read-only planning |
+| general / explore | GPT-6 Luna (max) | bounded implementation and discovery |
+| verifier / scout | GPT-6 Luna (max) | deterministic verification and lightweight external research |
+| reviewer / investigator | GPT-6 Luna (max) | correctness review and root-cause investigation |
 | security-reviewer | GPT-5.6 Terra | security-boundary and attack-path review |
 
 This split keeps Sol on repository-wide orchestration and consequential architecture, uses Luna Max for high-frequency Task coordination plus bounded planning/implementation/reconnaissance/verification/research/review/investigation, and keeps Terra on security review. Each role has one fixed model; unavailable execution returns `BLOCKED` without model substitution.
