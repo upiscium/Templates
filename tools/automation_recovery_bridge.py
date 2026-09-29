@@ -219,7 +219,7 @@ def git_bytes(args: list[str], *, cwd: Path) -> bytes:
         "GIT_OPTIONAL_LOCKS": "0",
         "GIT_TERMINAL_PROMPT": "0",
     }
-    command = [str(trusted_git()), "-c", "core.fsmonitor=false",
+    command = [str(trusted_git()), "--no-replace-objects", "-c", "core.fsmonitor=false",
                "-c", "core.hooksPath=/dev/null", "--no-pager", *args[1:]]
     result = subprocess.run(command, cwd=cwd,
                             capture_output=True, env=environment, check=False)
@@ -316,6 +316,7 @@ def _pinned_run(command, *, cwd=None, check=True, remove_env=(), env_overrides=N
     if command[0] == "git":
         argv = [
             str(executable),
+            "--no-replace-objects",
             "-c",
             "core.fsmonitor=false",
             "-c",

@@ -1807,10 +1807,13 @@ def prepare(
         _remove_known_empty_legacy_directories(layout)
 
 
-def write_bytes(path: Path, content: bytes) -> None:
+def write_bytes(path: Path, content: bytes, *, _lock_held: bool = False) -> None:
     """Atomically and durably replace one prepared canonical regular file."""
     namespace = _state_namespace(path)
     ensure_parent(path)
+    if _lock_held:
+        _write_bytes_locked(path, content)
+        return
     with _file_lock(namespace / "migration.lock", create=True, exact=True):
         _recover_canonical_temps(Topology(namespace.parent, namespace.parent))
         _write_bytes_locked(path, content)

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 from pathlib import Path
 
@@ -40,7 +41,7 @@ def _number(value: str, label: str) -> int:
 
 
 def _git(root: Path, *args: str, check: bool = True) -> str:
-    return lifecycle.git(*args, cwd=root, check=check)
+    return lifecycle.git("--no-replace-objects", *args, cwd=root, check=check)
 
 
 def _issue_runner(command: list[str], *, cwd: Path, **_: object):
@@ -70,43 +71,222 @@ def _git_blob(root: Path, revision: str, relative: str) -> bytes:
     _oid(revision, "Git blob revision")
     try:
         result = lifecycle.run(
-            ["git", "show", f"{revision}:{relative}"], cwd=root, check=True
+            ["git", "--no-replace-objects", "show", f"{revision}:{relative}"],
+            cwd=root,
+            check=True,
         )
         return result.stdout.encode("utf-8")
     except UnicodeError as exc:
         raise TaskStateRecoveryError(f"Git blob is not valid UTF-8: {relative}") from exc
 
 
-def _require_source_and_main(source_root: Path, target: Path, implementation_revision: str) -> dict:
+def _remote_default_branch_and_revision(source_root: Path) -> tuple[str, str]:
+    try:
+        result = lifecycle.network_git(
+            "ls-remote", "--symref", "origin", "HEAD", cwd=source_root
+        )
+    except lifecycle.LifecycleError as exc:
+        raise TaskStateRecoveryError("cannot resolve the remote default branch") from exc
+    symbolic = []
+    revisions = []
+    for line in result.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 2 or fields[1] != "HEAD":
+            continue
+        if fields[0].startswith("ref: "):
+            symbolic.append(fields[0][5:])
+        else:
+            revisions.append(fields[0])
+    if (
+        len(symbolic) != 1
+        or not symbolic[0].startswith("refs/heads/")
+        or len(revisions) != 1
+    ):
+        raise TaskStateRecoveryError("remote default branch advertisement is invalid")
+    branch = symbolic[0].removeprefix("refs/heads/")
+    revision = _oid(revisions[0], "advertised remote default revision")
+    return branch, revision
+
+
+def _fetched_default_revision(
+    source_root: Path, branch: str, advertised_revision: str
+) -> str:
+    """Fetch and validate the advertised remote default without consulting a main worktree."""
+    advertised_revision = _oid(advertised_revision, "advertised remote default revision")
+    remote_ref = f"refs/remotes/origin/{branch}"
+    symbolic_ref = lifecycle.run(
+        ["git", "symbolic-ref", "--quiet", remote_ref],
+        cwd=source_root,
+        check=False,
+    )
+    if symbolic_ref.returncode == 0:
+        raise TaskStateRecoveryError("origin default ref must not be symbolic")
+    if symbolic_ref.returncode != 1:
+        raise TaskStateRecoveryError("cannot inspect origin default ref type")
+    previous_ref = lifecycle.run(
+        ["git", "show-ref", "--verify", "--hash", remote_ref],
+        cwd=source_root,
+        check=False,
+    )
+    if previous_ref.returncode == 0:
+        previous = _oid(previous_ref.stdout.strip(), "previous origin default revision")
+        resolved_previous = _oid(
+            _git(source_root, "rev-parse", "--verify", f"{remote_ref}^{{commit}}"),
+            "previous origin default commit",
+        )
+        if previous != resolved_previous:
+            raise TaskStateRecoveryError("origin default ref is not a direct commit ref")
+    elif previous_ref.returncode == 1:
+        previous = None
+    else:
+        raise TaskStateRecoveryError("cannot inspect previous origin default ref")
+
+    temporary_ref = f"refs/agent-core/recovery-default/{secrets.token_hex(16)}"
+    collision = lifecycle.run(
+        ["git", "show-ref", "--verify", "--quiet", temporary_ref],
+        cwd=source_root,
+        check=False,
+    )
+    if collision.returncode == 0:
+        raise TaskStateRecoveryError("temporary recovery default ref already exists")
+    if collision.returncode != 1:
+        raise TaskStateRecoveryError("cannot validate temporary recovery default ref")
+    temporary_symbolic = lifecycle.run(
+        ["git", "symbolic-ref", "--quiet", temporary_ref],
+        cwd=source_root,
+        check=False,
+    )
+    if temporary_symbolic.returncode == 0:
+        raise TaskStateRecoveryError("temporary recovery default ref must not be symbolic")
+    if temporary_symbolic.returncode != 1:
+        raise TaskStateRecoveryError("cannot inspect temporary recovery default ref type")
+
+    temporary_revision: str | None = None
+    try:
+        lifecycle.network_git(
+            "fetch",
+            "--no-tags",
+            "origin",
+            f"refs/heads/{branch}:{temporary_ref}",
+            cwd=source_root,
+        )
+        temporary_revision = _oid(
+            _git(source_root, "rev-parse", "--verify", f"{temporary_ref}^{{commit}}"),
+            "fetched default revision",
+        )
+        if temporary_revision != advertised_revision:
+            raise TaskStateRecoveryError(
+                "remote default moved between advertisement and fetch"
+            )
+        if previous is not None and lifecycle.run(
+            [
+                "git",
+                "--no-replace-objects",
+                "merge-base",
+                "--is-ancestor",
+                previous,
+                temporary_revision,
+            ],
+            cwd=source_root,
+            check=False,
+        ).returncode != 0:
+            raise TaskStateRecoveryError("origin default branch moved non-fast-forward")
+
+        expected_previous = previous or "0" * len(temporary_revision)
+        try:
+            lifecycle.run(
+                [
+                    "git",
+                    "update-ref",
+                    "--no-deref",
+                    remote_ref,
+                    temporary_revision,
+                    expected_previous,
+                ],
+                cwd=source_root,
+            )
+        except lifecycle.LifecycleError as exc:
+            raise TaskStateRecoveryError("origin default ref moved during recovery fetch") from exc
+        remote = _oid(
+            _git(source_root, "rev-parse", "--verify", f"{remote_ref}^{{commit}}"),
+            "origin default revision",
+        )
+        symbolic_after = lifecycle.run(
+            ["git", "symbolic-ref", "--quiet", remote_ref],
+            cwd=source_root,
+            check=False,
+        )
+        if symbolic_after.returncode == 0:
+            raise TaskStateRecoveryError("origin default ref became symbolic during fetch")
+        if symbolic_after.returncode != 1:
+            raise TaskStateRecoveryError("cannot verify origin default ref type after fetch")
+        if remote != temporary_revision:
+            raise TaskStateRecoveryError("origin default ref moved during recovery planning")
+        return remote
+    except TaskStateRecoveryError:
+        raise
+    except lifecycle.LifecycleError as exc:
+        raise TaskStateRecoveryError(
+            f"cannot obtain trusted origin/{branch} revision"
+        ) from exc
+    finally:
+        cleanup_ref = temporary_revision
+        if cleanup_ref is None:
+            temporary_result = lifecycle.run(
+                ["git", "show-ref", "--verify", "--hash", temporary_ref],
+                cwd=source_root,
+                check=False,
+            )
+            if temporary_result.returncode == 0:
+                cleanup_ref = _oid(
+                    temporary_result.stdout.strip(),
+                    "temporary fetched default revision",
+                )
+            elif temporary_result.returncode != 1:
+                raise TaskStateRecoveryError(
+                    "cannot inspect temporary fetched default ref after failure"
+                )
+        if cleanup_ref is not None:
+            try:
+                lifecycle.run(
+                    ["git", "update-ref", "--no-deref", "-d", temporary_ref, cleanup_ref],
+                    cwd=source_root,
+                )
+            except lifecycle.LifecycleError as exc:
+                raise TaskStateRecoveryError(
+                    "cannot remove temporary fetched default ref"
+                ) from exc
+
+
+def _require_source_and_default(source_root: Path, implementation_revision: str) -> dict:
+    """Bind recovery to the exact clean implementation and fetched remote default."""
     source_root = source_root.resolve()
     if lifecycle.repo_root(source_root) != source_root:
         raise TaskStateRecoveryError("source root is not an exact Git worktree root")
-    default = lifecycle.default_branch(target)
-    if default != "main":
-        raise TaskStateRecoveryError(f"default branch is not main: {default}")
-    main = lifecycle.main_worktree(target)
     source_record = lifecycle.current_worktree(source_root)
-    if source_record.path != source_root or source_root == target:
+    if source_record.path != source_root:
         raise TaskStateRecoveryError("source root is not an exact registered implementation worktree")
-    if main.path == target or main.branch != default:
-        raise TaskStateRecoveryError("registered default-branch worktree is ambiguous")
     head = _oid(_git(source_root, "rev-parse", "--verify", "HEAD^{commit}"), "source HEAD")
     if head != implementation_revision:
         raise TaskStateRecoveryError("source HEAD does not match the implementation revision")
     if _git(source_root, "status", "--porcelain=v1", "--untracked-files=all"):
         raise TaskStateRecoveryError("source worktree must be clean")
-    main_head = _oid(_git(main.path, "rev-parse", "--verify", "HEAD^{commit}"), "current main HEAD")
-    main_remote = _git(main.path, "rev-parse", "--verify", "refs/remotes/origin/main", check=False)
-    if main_remote != main_head:
-        raise TaskStateRecoveryError("registered main is not synchronized with origin/main")
-    if _git(main.path, "status", "--porcelain=v1", "--untracked-files=all"):
-        raise TaskStateRecoveryError("registered main worktree must be clean")
+    default, advertised_revision = _remote_default_branch_and_revision(source_root)
+    if default != "main":
+        raise TaskStateRecoveryError(f"default branch is not main: {default}")
+    default_revision = _fetched_default_revision(
+        source_root, default, advertised_revision
+    )
+    if (
+        _git(source_root, "rev-parse", "--verify", "HEAD^{commit}") != head
+        or _git(source_root, "status", "--porcelain=v1", "--untracked-files=all")
+    ):
+        raise TaskStateRecoveryError("source worktree changed while fetching current default")
     return {
         "branch": default,
-        "revision": main_head,
+        "revision": default_revision,
         "implementation_revision": implementation_revision,
         "worktree": source_root,
-        "main_worktree": main.path,
     }
 
 
@@ -196,10 +376,7 @@ def _prove_base(target: Path, target_head: str, current_main: str, pr: dict) -> 
         raise TaskStateRecoveryError("Task original base is ambiguous or does not match its parent")
     if pr.get("baseRefName") != "main":
         raise TaskStateRecoveryError("pull request base branch is not main")
-    if _oid(pr.get("baseRefOid"), "pull request base revision") != current_main:
-        raise TaskStateRecoveryError(
-            "pull request base revision does not match the synchronized default branch"
-        )
+    _oid(pr.get("baseRefOid"), "pull request base revision")
     return parent
 
 
@@ -258,12 +435,14 @@ def _plan(
     task_number = _number(task, "Task/Issue")
     implementation_revision = _oid(implementation_revision, "implementation revision")
     target = target.resolve()
+    source_root = source_root.resolve()
+    if source_root == target:
+        raise TaskStateRecoveryError("source root and target Task worktree must be distinct")
     if lifecycle.repo_root(target) != target:
         raise TaskStateRecoveryError("target is not an exact Git worktree root")
     current = lifecycle.current_worktree(target)
-    main = lifecycle.main_worktree(target)
     record = lifecycle.worktree_for_task(target, task)
-    if current.path != target or record.path != target or current.path == main.path:
+    if current.path != target or record.path != target:
         raise TaskStateRecoveryError("target is not the exact registered non-default Task worktree")
     branch = record.branch
     if not lifecycle.branch_matches_task(branch, task) or branch is None:
@@ -276,13 +455,13 @@ def _plan(
     if target_head != local_head or record.head != target_head:
         raise TaskStateRecoveryError("target HEAD, local branch, and registered worktree HEAD differ")
     tree = _oid(_git(target, "rev-parse", "--verify", "HEAD^{tree}"), "target tree")
-    source = _require_source_and_main(source_root, target, implementation_revision)
     target_repository = contract.repository_identity(target)
     source_repository = contract.repository_identity(source_root)
     if target_repository.casefold() != source_repository.casefold():
         raise TaskStateRecoveryError("target and source repository identities differ")
     if private_state.common_git_dir(target).resolve() != private_state.common_git_dir(source_root).resolve():
         raise TaskStateRecoveryError("target and source do not share one Git common directory")
+    source = _require_source_and_default(source_root, implementation_revision)
     pr = _pull_request(target, target_repository, branch, requested_pr)
     if (
         pr.get("state") != "OPEN"
@@ -380,16 +559,75 @@ def _plan(
     }
 
 
+def _require_fast_forward_observation(
+    source_root: Path, previous: str, current: str, label: str
+) -> None:
+    previous = _oid(previous, f"previous {label}")
+    current = _oid(current, f"current {label}")
+    if previous == current:
+        return
+    result = lifecycle.run(
+        ["git", "--no-replace-objects", "merge-base", "--is-ancestor", previous, current],
+        cwd=source_root,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise TaskStateRecoveryError(
+            f"{label} is not a fast-forward of its prior observation"
+        )
+
+
+def _same_recovery_receipt(receipt: dict, plan: dict) -> None:
+    """Allow live default/PR-base observations to advance, not receipt identity."""
+    expected = plan["receipt"]
+    if not isinstance(receipt, dict) or set(receipt) != set(expected):
+        raise TaskStateRecoveryError("conflicting lost Task State recovery receipt exists")
+    volatile_observations = {"default_revision", "pr_base_oid"}
+    for name, value in expected.items():
+        if name not in volatile_observations and receipt[name] != value:
+            raise TaskStateRecoveryError(
+                f"conflicting lost Task State recovery receipt field: {name}"
+            )
+    _oid(receipt["default_revision"], "recovery receipt default revision")
+    _oid(receipt["pr_base_oid"], "recovery receipt PR base revision")
+    _oid(plan["default_revision"], "current recovery default revision")
+    _oid(plan["pr"]["baseRefOid"], "current PR base revision")
+    source_root = Path(expected["implementation_source"])
+    _require_fast_forward_observation(
+        source_root,
+        receipt["default_revision"],
+        plan["default_revision"],
+        "recovery default revision",
+    )
+
+
+def _same_pr_identity(before: dict, after: dict) -> None:
+    stable_fields = (
+        "number",
+        "state",
+        "draft",
+        "headRefName",
+        "headRefOid",
+        "headRepository",
+        "baseRefName",
+        "baseRepository",
+        "isCrossRepository",
+    )
+    if any(before.get(name) != after.get(name) for name in stable_fields):
+        raise TaskStateRecoveryError("pull request identity changed before mutation")
+    _oid(before.get("baseRefOid"), "previous PR base revision")
+    _oid(after.get("baseRefOid"), "current PR base revision")
+
+
 def _same_plan(before: dict, after: dict) -> None:
     for name in (
-        "task", "repository", "branch", "head", "tree", "base", "default_revision",
-        "remote_head", "issue_digest", "issue_bytes", "contract_bytes", "state_bytes",
-        "receipt_bytes",
+        "task", "repository", "branch", "head", "tree", "base", "remote_head",
+        "issue_digest", "issue_bytes", "contract_bytes", "state_bytes", "reconstructed",
     ):
         if before[name] != after[name]:
             raise TaskStateRecoveryError(f"recovery authority changed before mutation: {name}")
-    if before["pr"] != after["pr"]:
-        raise TaskStateRecoveryError("pull request identity changed before mutation")
+    _same_pr_identity(before["pr"], after["pr"])
+    _same_recovery_receipt(before["receipt"], after)
 
 
 def _state_topology(target: Path, receipt_exists: bool) -> tuple[Path, set[str]]:
@@ -503,24 +741,25 @@ def _ensure_state_directory(target: Path) -> Path:
     return directory
 
 
-def _publish_state(plan: dict, target: Path, receipt: dict) -> None:
-    directory = _ensure_state_directory(target)
+def _publish_state(
+    plan: dict, target: Path, receipt: dict, directory_fd: int
+) -> None:
+    directory = target / TASK_STATE_DIRECTORY
     try:
-        with lifecycle.state_directory_lock(target) as directory_fd:
-            pinned = os.fstat(directory_fd)
-            current = directory.lstat()
-            if (pinned.st_dev, pinned.st_ino) != (current.st_dev, current.st_ino):
-                raise TaskStateRecoveryError("Task State directory changed during recovery")
-            entries = _state_entries_from_fd(directory_fd)
-            _validate_existing_state(plan, directory_fd, entries, receipt)
-            # state_directory_lock creates and pins work-units.lock. Publish
-            # metadata before task.md so consumers never observe a nominal
-            # Task without its Issue snapshot and contract metadata.
-            _publish_state_file(directory_fd, "issue.json", plan["issue_bytes"])
-            _publish_state_file(directory_fd, "contract.json", plan["contract_bytes"])
-            _publish_state_file(directory_fd, "task.md", plan["state_bytes"])
-            final_entries = _state_entries_from_fd(directory_fd)
-            _validate_existing_state(plan, directory_fd, final_entries, receipt)
+        pinned = os.fstat(directory_fd)
+        current = directory.lstat()
+        if (pinned.st_dev, pinned.st_ino) != (current.st_dev, current.st_ino):
+            raise TaskStateRecoveryError("Task State directory changed during recovery")
+        entries = _state_entries_from_fd(directory_fd)
+        _validate_existing_state(plan, directory_fd, entries, receipt)
+        # The caller holds work-units.lock through publication and final resume
+        # validation. Publish metadata before task.md so consumers never observe
+        # a nominal Task without its Issue snapshot and contract metadata.
+        _publish_state_file(directory_fd, "issue.json", plan["issue_bytes"])
+        _publish_state_file(directory_fd, "contract.json", plan["contract_bytes"])
+        _publish_state_file(directory_fd, "task.md", plan["state_bytes"])
+        final_entries = _state_entries_from_fd(directory_fd)
+        _validate_existing_state(plan, directory_fd, final_entries, receipt)
     except lifecycle.LifecycleError as exc:
         raise TaskStateRecoveryError(str(exc)) from exc
 
@@ -542,51 +781,98 @@ def recover_missing_task_state(
     target = target.resolve()
     receipt_path = private_state.lost_ignored_task_state_receipt(target)
     existing_receipt = _read_receipt(receipt_path)
+    receipt_was_present = existing_receipt is not None
     _state_topology(target, existing_receipt is not None)
     plan = _plan(source_root, target, task, requested_pr, implementation_revision)
     if existing_receipt is not None:
-        receipt_bytes, receipt_value = existing_receipt
-        if receipt_bytes != plan["receipt_bytes"] or receipt_value != plan["receipt"]:
-            raise TaskStateRecoveryError("conflicting lost Task State recovery receipt exists")
+        _same_recovery_receipt(existing_receipt[1], plan)
 
     try:
         private_state._validate_canonical(private_state.topology(target))
         with private_state.mutation_lock(target, admin=True):
             private_state._validate_canonical(private_state.topology(target))
-            latest_receipt = _read_receipt(receipt_path)
-            latest_plan = _plan(source_root, target, task, requested_pr, implementation_revision)
-            _same_plan(plan, latest_plan)
-            if latest_receipt is not None:
-                if latest_receipt[0] != plan["receipt_bytes"] or latest_receipt[1] != plan["receipt"]:
-                    raise TaskStateRecoveryError("recovery receipt changed before mutation")
-            private_state.exclusive_write_bytes(
-                receipt_path, plan["receipt_bytes"], _lock_held=True
-            )
-            _publish_state(plan, target, plan["receipt"])
-    except (private_state.GitPrivateStateError, OSError) as exc:
-        raise TaskStateRecoveryError(str(exc)) from exc
+            _ensure_state_directory(target)
+            # Normal Task commits use this same lock. Keep it held from the last
+            # plan through receipt/State publication and resume validation so a
+            # concurrent commit cannot strand or invalidate recovery evidence.
+            with lifecycle.state_directory_lock(target) as directory_fd:
+                latest_receipt = _read_receipt(receipt_path)
+                latest_plan = _plan(
+                    source_root, target, task, requested_pr, implementation_revision
+                )
+                _same_plan(plan, latest_plan)
+                if existing_receipt is not None:
+                    if (
+                        latest_receipt is None
+                        or latest_receipt[0] != existing_receipt[0]
+                        or latest_receipt[1] != existing_receipt[1]
+                    ):
+                        raise TaskStateRecoveryError("recovery receipt changed before mutation")
+                    receipt_to_publish = latest_receipt[1]
+                elif latest_receipt is not None:
+                    _same_recovery_receipt(latest_receipt[1], latest_plan)
+                    receipt_was_present = True
+                    receipt_to_publish = latest_receipt[1]
+                else:
+                    receipt_to_publish = latest_plan["receipt"]
+                    private_state.exclusive_write_bytes(
+                        receipt_path, latest_plan["receipt_bytes"], _lock_held=True
+                    )
 
-    after = _plan(source_root, target, task, requested_pr, implementation_revision)
-    _same_plan(plan, after)
-    if _git(target, "status", "--porcelain=v1", "--untracked-files=all"):
-        raise TaskStateRecoveryError("recovery changed tracked or unignored target content")
-    try:
-        resume = contract.check_resume_contract(target, task, runner=_issue_runner)
-    except Exception as exc:
-        raise TaskStateRecoveryError(f"recovered Task State failed resume validation: {exc}") from exc
-    if resume.get("mode") != "resume" or resume.get("taskStatus") != "implementing":
-        raise TaskStateRecoveryError("recovered Task State is not implementing/resumable")
-    return {
-        "status": "TASK_STATE_ALREADY_RECOVERED" if existing_receipt is not None else "TASK_STATE_RECOVERED",
-        "task": task,
-        "repository": plan["repository"],
-        "branch": plan["branch"],
-        "worktree": str(target),
-        "head": plan["head"],
-        "baseRevision": plan["base"],
-        "pullRequest": requested_pr,
-        "taskStatus": "implementing",
-        "receipt": str(receipt_path),
-        "resume": resume,
-        "githubMutations": 0,
-    }
+                # A retry may observe a newer fast-forward default/PR-base snapshot.
+                # Refresh only those observation fields after stable authority identity
+                # has been re-proven under both locks.
+                if receipt_to_publish != latest_plan["receipt"]:
+                    private_state.write_bytes(
+                        receipt_path,
+                        latest_plan["receipt_bytes"],
+                        _lock_held=True,
+                    )
+                    receipt_to_publish = latest_plan["receipt"]
+                _publish_state(
+                    latest_plan, target, receipt_to_publish, directory_fd
+                )
+                after = _plan(
+                    source_root, target, task, requested_pr, implementation_revision
+                )
+                _same_plan(latest_plan, after)
+                if _git(target, "status", "--porcelain=v1", "--untracked-files=all"):
+                    raise TaskStateRecoveryError(
+                        "recovery changed tracked or unignored target content"
+                    )
+                try:
+                    resume = contract.check_resume_contract(
+                        target,
+                        task,
+                        runner=_issue_runner,
+                        directory_fd=directory_fd,
+                        expected_base_branch=latest_plan["receipt"]["base_branch"],
+                        expected_base_revision=latest_plan["receipt"]["base_revision"],
+                    )
+                except Exception as exc:
+                    raise TaskStateRecoveryError(
+                        f"recovered Task State failed resume validation: {exc}"
+                    ) from exc
+                if resume.get("mode") != "resume" or resume.get("taskStatus") != "implementing":
+                    raise TaskStateRecoveryError(
+                        "recovered Task State is not implementing/resumable"
+                    )
+                plan = latest_plan
+                return {
+                    "status": "TASK_STATE_ALREADY_RECOVERED" if receipt_was_present else "TASK_STATE_RECOVERED",
+                    "task": task,
+                    "repository": plan["repository"],
+                    "branch": plan["branch"],
+                    "worktree": str(target),
+                    "head": plan["head"],
+                    "baseRevision": plan["base"],
+                    "pullRequest": requested_pr,
+                    "taskStatus": "implementing",
+                    "receipt": str(receipt_path),
+                    "resume": resume,
+                    "githubMutations": 0,
+                }
+    except TaskStateRecoveryError:
+        raise
+    except (private_state.GitPrivateStateError, lifecycle.LifecycleError, OSError) as exc:
+        raise TaskStateRecoveryError(str(exc)) from exc
