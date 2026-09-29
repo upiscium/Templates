@@ -1040,7 +1040,7 @@ None yet.
             unit = self.unit("reviewer", "completed")
             unit["transitions"][0]["provider_failure"] = {
                 "provider": "openai",
-                "model": "gpt-5.6-luna",
+                "model": "gpt-6-luna",
                 "error": "reported after completion",
             }
             self.write_work_units(root, [("WU-19-04", unit)])

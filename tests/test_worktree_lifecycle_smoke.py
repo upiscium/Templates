@@ -162,12 +162,12 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         blocked = run(
             "python3", str(self.script), "work-unit-state-set", "TASK-1", "WU-2", "blocked",
             "Configured verifier model was unavailable",
-            "--provider", "openai", "--model", "gpt-5.6-luna", "--error", "model unavailable",
+            "--provider", "openai", "--model", "gpt-6-luna", "--error", "model unavailable",
             cwd=worktree, env=self.env,
         )
         failure = json.loads(blocked.stdout)["transitions"][0]["provider_failure"]
         self.assertEqual(
-            {"provider": "openai", "model": "gpt-5.6-luna", "error": "model unavailable"},
+            {"provider": "openai", "model": "gpt-6-luna", "error": "model unavailable"},
             failure,
         )
 
@@ -209,7 +209,7 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         contradictory = run(
             "python3", str(self.script), "work-unit-state-set", "TASK-1", "WU-4", "completed",
             "Contradictory provider failure",
-            "--provider", "openai", "--model", "gpt-5.6-luna", "--error", "model unavailable",
+            "--provider", "openai", "--model", "gpt-6-luna", "--error", "model unavailable",
             cwd=worktree, check=False, env=self.env,
         )
         self.assertNotEqual(contradictory.returncode, 0)
@@ -249,7 +249,7 @@ class WorktreeLifecycleSmokeTest(unittest.TestCase):
         )
         dispatch = json.loads(ready.stdout)
         self.assertEqual("READY", dispatch["status"])
-        self.assertEqual("openai/gpt-5.6-luna", dispatch["configured_model"])
+        self.assertEqual("openai/gpt-6-luna", dispatch["configured_model"])
         self.assertEqual(unit["semantic_sha256"], dispatch["semantic_sha256"])
 
         for role, delegated_objective, expected in (

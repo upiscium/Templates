@@ -2,7 +2,7 @@
 description: Read-only specialist for consequential cross-module architecture decisions
 mode: subagent
 hidden: true
-model: openai/gpt-5.6-sol
+model: openai/gpt-6-sol
 permission:
   edit: deny
   task: deny
