@@ -2,7 +2,7 @@
 description: Owns one Automation Maintenance Task through guarded upgrade, review, commit, push, and Draft PR publication
 mode: subagent
 hidden: true
-model: openai/gpt-5.6-sol
+model: openai/gpt-6-sol
 permission:
   question: allow
   task:

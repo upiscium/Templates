@@ -1,7 +1,7 @@
 ---
 description: Repository-wide Main Orchestrator for Task scheduling and integration
 mode: primary
-model: openai/gpt-5.6-sol
+model: openai/gpt-6-sol
 permission:
   edit: deny
   task:

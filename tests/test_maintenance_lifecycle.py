@@ -1148,7 +1148,7 @@ class MaintenanceLifecycleTest(unittest.TestCase):
             / "agents"
             / "maintenance-orchestrator.md"
         ).read_text(encoding="utf-8")
-        self.assertIn("model: openai/gpt-5.6-sol", agent)
+        self.assertIn("model: openai/gpt-6-sol", agent)
         self.assertIn('"just automation::maintenance-review-record *": deny', agent)
         self.assertIn('"just automation::maintenance-contract-refresh *": deny', agent)
         self.assertIn('"just automation::maintenance-pr-create *": allow', agent)

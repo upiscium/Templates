@@ -1,7 +1,7 @@
 ---
 description: Bounded implementation worker for one Work Unit
 mode: subagent
-model: openai/gpt-5.6-luna
+model: openai/gpt-6-luna
 reasoningEffort: max
 permission:
   task: deny
