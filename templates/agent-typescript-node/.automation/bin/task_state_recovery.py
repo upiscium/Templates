@@ -559,9 +559,11 @@ def _plan(
     }
 
 
-def _require_default_advance(source_root: Path, previous: str, current: str) -> None:
-    previous = _oid(previous, "previous recovery default revision")
-    current = _oid(current, "current recovery default revision")
+def _require_fast_forward_observation(
+    source_root: Path, previous: str, current: str, label: str
+) -> None:
+    previous = _oid(previous, f"previous {label}")
+    current = _oid(current, f"current {label}")
     if previous == current:
         return
     result = lifecycle.run(
@@ -571,7 +573,7 @@ def _require_default_advance(source_root: Path, previous: str, current: str) -> 
     )
     if result.returncode != 0:
         raise TaskStateRecoveryError(
-            "recovery default revision is not a fast-forward of its prior observation"
+            f"{label} is not a fast-forward of its prior observation"
         )
 
 
@@ -591,8 +593,11 @@ def _same_recovery_receipt(receipt: dict, plan: dict) -> None:
     _oid(plan["default_revision"], "current recovery default revision")
     _oid(plan["pr"]["baseRefOid"], "current PR base revision")
     source_root = Path(expected["implementation_source"])
-    _require_default_advance(
-        source_root, receipt["default_revision"], plan["default_revision"]
+    _require_fast_forward_observation(
+        source_root,
+        receipt["default_revision"],
+        plan["default_revision"],
+        "recovery default revision",
     )
 
 
@@ -736,24 +741,25 @@ def _ensure_state_directory(target: Path) -> Path:
     return directory
 
 
-def _publish_state(plan: dict, target: Path, receipt: dict) -> None:
-    directory = _ensure_state_directory(target)
+def _publish_state(
+    plan: dict, target: Path, receipt: dict, directory_fd: int
+) -> None:
+    directory = target / TASK_STATE_DIRECTORY
     try:
-        with lifecycle.state_directory_lock(target) as directory_fd:
-            pinned = os.fstat(directory_fd)
-            current = directory.lstat()
-            if (pinned.st_dev, pinned.st_ino) != (current.st_dev, current.st_ino):
-                raise TaskStateRecoveryError("Task State directory changed during recovery")
-            entries = _state_entries_from_fd(directory_fd)
-            _validate_existing_state(plan, directory_fd, entries, receipt)
-            # state_directory_lock creates and pins work-units.lock. Publish
-            # metadata before task.md so consumers never observe a nominal
-            # Task without its Issue snapshot and contract metadata.
-            _publish_state_file(directory_fd, "issue.json", plan["issue_bytes"])
-            _publish_state_file(directory_fd, "contract.json", plan["contract_bytes"])
-            _publish_state_file(directory_fd, "task.md", plan["state_bytes"])
-            final_entries = _state_entries_from_fd(directory_fd)
-            _validate_existing_state(plan, directory_fd, final_entries, receipt)
+        pinned = os.fstat(directory_fd)
+        current = directory.lstat()
+        if (pinned.st_dev, pinned.st_ino) != (current.st_dev, current.st_ino):
+            raise TaskStateRecoveryError("Task State directory changed during recovery")
+        entries = _state_entries_from_fd(directory_fd)
+        _validate_existing_state(plan, directory_fd, entries, receipt)
+        # The caller holds work-units.lock through publication and final resume
+        # validation. Publish metadata before task.md so consumers never observe
+        # a nominal Task without its Issue snapshot and contract metadata.
+        _publish_state_file(directory_fd, "issue.json", plan["issue_bytes"])
+        _publish_state_file(directory_fd, "contract.json", plan["contract_bytes"])
+        _publish_state_file(directory_fd, "task.md", plan["state_bytes"])
+        final_entries = _state_entries_from_fd(directory_fd)
+        _validate_existing_state(plan, directory_fd, final_entries, receipt)
     except lifecycle.LifecycleError as exc:
         raise TaskStateRecoveryError(str(exc)) from exc
 
@@ -785,63 +791,86 @@ def recover_missing_task_state(
         private_state._validate_canonical(private_state.topology(target))
         with private_state.mutation_lock(target, admin=True):
             private_state._validate_canonical(private_state.topology(target))
-            latest_receipt = _read_receipt(receipt_path)
-            latest_plan = _plan(source_root, target, task, requested_pr, implementation_revision)
-            _same_plan(plan, latest_plan)
-            if existing_receipt is not None:
-                if (
-                    latest_receipt is None
-                    or latest_receipt[0] != existing_receipt[0]
-                    or latest_receipt[1] != existing_receipt[1]
-                ):
-                    raise TaskStateRecoveryError("recovery receipt changed before mutation")
-                receipt_to_publish = latest_receipt[1]
-            elif latest_receipt is not None:
-                _same_recovery_receipt(latest_receipt[1], latest_plan)
-                receipt_was_present = True
-                receipt_to_publish = latest_receipt[1]
-            else:
-                receipt_to_publish = latest_plan["receipt"]
-                private_state.exclusive_write_bytes(
-                    receipt_path, latest_plan["receipt_bytes"], _lock_held=True
+            _ensure_state_directory(target)
+            # Normal Task commits use this same lock. Keep it held from the last
+            # plan through receipt/State publication and resume validation so a
+            # concurrent commit cannot strand or invalidate recovery evidence.
+            with lifecycle.state_directory_lock(target) as directory_fd:
+                latest_receipt = _read_receipt(receipt_path)
+                latest_plan = _plan(
+                    source_root, target, task, requested_pr, implementation_revision
                 )
+                _same_plan(plan, latest_plan)
+                if existing_receipt is not None:
+                    if (
+                        latest_receipt is None
+                        or latest_receipt[0] != existing_receipt[0]
+                        or latest_receipt[1] != existing_receipt[1]
+                    ):
+                        raise TaskStateRecoveryError("recovery receipt changed before mutation")
+                    receipt_to_publish = latest_receipt[1]
+                elif latest_receipt is not None:
+                    _same_recovery_receipt(latest_receipt[1], latest_plan)
+                    receipt_was_present = True
+                    receipt_to_publish = latest_receipt[1]
+                else:
+                    receipt_to_publish = latest_plan["receipt"]
+                    private_state.exclusive_write_bytes(
+                        receipt_path, latest_plan["receipt_bytes"], _lock_held=True
+                    )
 
-            # A retry may observe a newer fast-forward default/PR-base snapshot.
-            # Refresh only those observation fields after stable authority identity
-            # has been re-proven under the mutation lock.
-            if receipt_to_publish != latest_plan["receipt"]:
-                private_state.write_bytes(
-                    receipt_path,
-                    latest_plan["receipt_bytes"],
-                    _lock_held=True,
+                # A retry may observe a newer fast-forward default/PR-base snapshot.
+                # Refresh only those observation fields after stable authority identity
+                # has been re-proven under both locks.
+                if receipt_to_publish != latest_plan["receipt"]:
+                    private_state.write_bytes(
+                        receipt_path,
+                        latest_plan["receipt_bytes"],
+                        _lock_held=True,
+                    )
+                    receipt_to_publish = latest_plan["receipt"]
+                _publish_state(
+                    latest_plan, target, receipt_to_publish, directory_fd
                 )
-                receipt_to_publish = latest_plan["receipt"]
-            _publish_state(latest_plan, target, receipt_to_publish)
-            plan = latest_plan
-    except (private_state.GitPrivateStateError, OSError) as exc:
+                after = _plan(
+                    source_root, target, task, requested_pr, implementation_revision
+                )
+                _same_plan(latest_plan, after)
+                if _git(target, "status", "--porcelain=v1", "--untracked-files=all"):
+                    raise TaskStateRecoveryError(
+                        "recovery changed tracked or unignored target content"
+                    )
+                try:
+                    resume = contract.check_resume_contract(
+                        target,
+                        task,
+                        runner=_issue_runner,
+                        directory_fd=directory_fd,
+                    )
+                except Exception as exc:
+                    raise TaskStateRecoveryError(
+                        f"recovered Task State failed resume validation: {exc}"
+                    ) from exc
+                if resume.get("mode") != "resume" or resume.get("taskStatus") != "implementing":
+                    raise TaskStateRecoveryError(
+                        "recovered Task State is not implementing/resumable"
+                    )
+                plan = latest_plan
+                return {
+                    "status": "TASK_STATE_ALREADY_RECOVERED" if receipt_was_present else "TASK_STATE_RECOVERED",
+                    "task": task,
+                    "repository": plan["repository"],
+                    "branch": plan["branch"],
+                    "worktree": str(target),
+                    "head": plan["head"],
+                    "baseRevision": plan["base"],
+                    "pullRequest": requested_pr,
+                    "taskStatus": "implementing",
+                    "receipt": str(receipt_path),
+                    "resume": resume,
+                    "githubMutations": 0,
+                }
+    except TaskStateRecoveryError:
+        raise
+    except (private_state.GitPrivateStateError, lifecycle.LifecycleError, OSError) as exc:
         raise TaskStateRecoveryError(str(exc)) from exc
-
-    after = _plan(source_root, target, task, requested_pr, implementation_revision)
-    _same_plan(plan, after)
-    if _git(target, "status", "--porcelain=v1", "--untracked-files=all"):
-        raise TaskStateRecoveryError("recovery changed tracked or unignored target content")
-    try:
-        resume = contract.check_resume_contract(target, task, runner=_issue_runner)
-    except Exception as exc:
-        raise TaskStateRecoveryError(f"recovered Task State failed resume validation: {exc}") from exc
-    if resume.get("mode") != "resume" or resume.get("taskStatus") != "implementing":
-        raise TaskStateRecoveryError("recovered Task State is not implementing/resumable")
-    return {
-        "status": "TASK_STATE_ALREADY_RECOVERED" if receipt_was_present else "TASK_STATE_RECOVERED",
-        "task": task,
-        "repository": plan["repository"],
-        "branch": plan["branch"],
-        "worktree": str(target),
-        "head": plan["head"],
-        "baseRevision": plan["base"],
-        "pullRequest": requested_pr,
-        "taskStatus": "implementing",
-        "receipt": str(receipt_path),
-        "resume": resume,
-        "githubMutations": 0,
-    }

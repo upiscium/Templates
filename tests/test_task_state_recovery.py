@@ -9,8 +9,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from unittest import mock
 
@@ -19,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "components" / "agent-core" / ".automation" / "bin"
 sys.path.insert(0, str(BIN))
 import task_state_recovery as recovery
+import agent_core
 
 
 BRIDGE_SPEC = importlib.util.spec_from_file_location(
@@ -315,12 +317,25 @@ class TaskStateRecoveryTest(unittest.TestCase):
                 return values["merge-base"]
             raise AssertionError((command, args))
 
-        pr = {"baseRefOid": self.BASE, "baseRefName": "main"}
+        pr = {"baseRefOid": "c" * 40, "baseRefName": "main"}
         with mock.patch.object(recovery, "_git", side_effect=fake_git):
             self.assertEqual(
                 recovery._prove_base(Path("/tmp/163"), self.HEAD, self.MAIN, pr),
                 self.BASE,
             )
+
+    def test_receipt_refresh_uses_github_pr_base_oid_without_git_ancestry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _repository, _source, target, _base, _main, _implementation = self.exact_fixture(
+                Path(directory)
+            )
+            receipt = self.plan(target)["receipt"]
+            latest_plan = self.plan(target)
+            latest_pr_base = "c" * 40
+            latest_plan["pr"]["baseRefOid"] = latest_pr_base
+            latest_plan["receipt"]["pr_base_oid"] = latest_pr_base
+
+            recovery._same_recovery_receipt(receipt, latest_plan)
 
     def test_shared_fetch_head_drift_does_not_override_temporary_default_ref(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -637,6 +652,116 @@ class TaskStateRecoveryTest(unittest.TestCase):
                     )
                 )
         self.assertEqual(1, len({state for state in normalized_states}))
+
+    def test_recovery_holds_task_commit_lock_through_final_resume_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            _repository, source, target, base, _main, implementation = self.exact_fixture(
+                Path(directory)
+            )
+            target_head = self.git("git", "rev-parse", "HEAD", cwd=target)
+            pull_request = self.normalized_pr(target_head, base)
+            resume_validation_started = threading.Event()
+            allow_resume_validation = threading.Event()
+            commit_lock_attempted = threading.Event()
+            allow_commit = threading.Event()
+            commit_finished = threading.Event()
+            recovery_finished = threading.Event()
+            results: dict[str, object] = {}
+            failures: list[BaseException] = []
+            original_work_units_lock = agent_core.lifecycle.work_units_lock
+            original_resume_check = recovery.contract.check_resume_contract
+
+            def paused_resume_check(*args: object, **kwargs: object) -> dict:
+                resume_validation_started.set()
+                if not allow_resume_validation.wait(30):
+                    raise AssertionError("test did not release final resume validation")
+                return original_resume_check(*args, **kwargs)
+
+            @contextmanager
+            def observed_commit_lock(record):
+                commit_lock_attempted.set()
+                with original_work_units_lock(record) as directory_fd:
+                    if not allow_commit.wait(30):
+                        raise AssertionError("test did not release the concurrent commit")
+                    (target / "concurrent-task-commit.txt").write_text(
+                        "committed after recovery validation\n", encoding="utf-8"
+                    )
+                    yield directory_fd
+
+            def recover() -> None:
+                try:
+                    results["recovery"] = recovery.recover_missing_task_state(
+                        source, target, self.TASK, self.PR, implementation
+                    )
+                except BaseException as exc:
+                    failures.append(exc)
+                finally:
+                    recovery_finished.set()
+
+            def commit() -> None:
+                try:
+                    agent_core.commit_task(target, self.TASK, "concurrent Task commit")
+                    results["commit_head"] = self.git(
+                        "git", "rev-parse", "HEAD", cwd=target
+                    )
+                except BaseException as exc:
+                    failures.append(exc)
+                finally:
+                    commit_finished.set()
+
+            recovery_thread = threading.Thread(target=recover, daemon=True)
+            commit_thread = threading.Thread(target=commit, daemon=True)
+            with (
+                mock.patch.object(
+                    recovery.lifecycle, "pull_requests_for_branch", return_value=[pull_request]
+                ),
+                mock.patch.object(recovery, "_issue_runner", return_value=self.issue_runner()),
+                mock.patch.object(
+                    recovery.lifecycle, "remote_branch_head", return_value=target_head
+                ),
+                mock.patch.object(
+                    agent_core.lifecycle,
+                    "work_units_lock",
+                    side_effect=observed_commit_lock,
+                ),
+                mock.patch.object(
+                    recovery.contract,
+                    "check_resume_contract",
+                    side_effect=paused_resume_check,
+                ),
+                mock.patch.object(agent_core, "reject_unsafe_paths", return_value=None),
+            ):
+                try:
+                    recovery_thread.start()
+                    self.assertTrue(resume_validation_started.wait(30))
+                    commit_thread.start()
+                    self.assertTrue(
+                        commit_lock_attempted.wait(30),
+                        f"concurrent commit failed before the Task lock: {failures!r}",
+                    )
+                    self.assertFalse(commit_finished.wait(0.1))
+                    allow_resume_validation.set()
+                    self.assertTrue(recovery_finished.wait(30))
+                    self.assertFalse(commit_finished.is_set())
+                    allow_commit.set()
+                    self.assertTrue(commit_finished.wait(30))
+                finally:
+                    allow_resume_validation.set()
+                    allow_commit.set()
+                    if recovery_thread.ident is not None:
+                        recovery_thread.join(30)
+                    if commit_thread.ident is not None:
+                        commit_thread.join(30)
+
+            self.assertFalse(recovery_thread.is_alive())
+            self.assertFalse(commit_thread.is_alive())
+            self.assertEqual([], failures)
+            recovery_result = results["recovery"]
+            self.assertEqual("TASK_STATE_RECOVERED", recovery_result["status"])
+            self.assertEqual(target_head, recovery_result["head"])
+            committed_head = self.git("git", "rev-parse", "HEAD", cwd=target)
+            self.assertNotEqual(target_head, committed_head)
+            self.assertEqual(committed_head, results["commit_head"])
 
     def test_recovery_and_resume_succeed_when_registered_main_checkout_is_stale(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

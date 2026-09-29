@@ -679,13 +679,30 @@ def check_contract(root: Path, task: str | None = None, *, runner=None) -> dict:
     return result
 
 
-def check_resume_contract(root: Path, task: str | None = None, *, runner=None) -> dict:
+def check_resume_contract(
+    root: Path,
+    task: str | None = None,
+    *,
+    runner=None,
+    directory_fd: int | None = None,
+) -> dict:
     target, task = _resolve_contract_target(root, task)
-    result = validate_contract(target, task)
-    try:
-        status = lifecycle.state_status(lifecycle.state_path(target))
-    except lifecycle.LifecycleError as exc:
-        raise ContractError(str(exc)) from exc
+    result = validate_contract(target, task, directory_fd=directory_fd)
+    if directory_fd is None:
+        try:
+            status = lifecycle.state_status(lifecycle.state_path(target))
+        except lifecycle.LifecycleError as exc:
+            raise ContractError(str(exc)) from exc
+    else:
+        state_bytes = _read_state_file(directory_fd, "task.md")
+        if state_bytes is None:
+            raise ContractError("Task State is missing")
+        try:
+            status = lifecycle._state_status_from_text(
+                state_bytes.decode("utf-8"), lifecycle.state_path(target)
+            )
+        except (UnicodeError, lifecycle.LifecycleError) as exc:
+            raise ContractError(str(exc)) from exc
     if status not in RESUMABLE_STATES:
         raise ContractError(f"Task State status is not resumable: {status}")
     live_repository = repository_identity(target)
