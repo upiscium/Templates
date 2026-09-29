@@ -715,12 +715,15 @@ class TaskStateRecoveryTest(unittest.TestCase):
             resume_validation_started = threading.Event()
             allow_resume_validation = threading.Event()
             commit_lock_attempted = threading.Event()
+            commit_lock_blocked = threading.Event()
+            commit_lock_acquired = threading.Event()
             allow_commit = threading.Event()
             commit_finished = threading.Event()
             recovery_finished = threading.Event()
             results: dict[str, object] = {}
             failures: list[BaseException] = []
             original_work_units_lock = agent_core.lifecycle.work_units_lock
+            original_flock = agent_core.lifecycle.fcntl.flock
             original_resume_check = recovery.contract.check_resume_contract
 
             def paused_resume_check(*args: object, **kwargs: object) -> dict:
@@ -729,10 +732,29 @@ class TaskStateRecoveryTest(unittest.TestCase):
                     raise AssertionError("test did not release final resume validation")
                 return original_resume_check(*args, **kwargs)
 
+            def observed_flock(descriptor: int, operation: int) -> None:
+                if (
+                    threading.current_thread() is commit_thread
+                    and operation == agent_core.lifecycle.fcntl.LOCK_EX
+                ):
+                    commit_lock_attempted.set()
+                    try:
+                        original_flock(
+                            descriptor,
+                            operation | agent_core.lifecycle.fcntl.LOCK_NB,
+                        )
+                    except BlockingIOError:
+                        commit_lock_blocked.set()
+                        original_flock(descriptor, operation)
+                    commit_lock_acquired.set()
+                    return
+                original_flock(descriptor, operation)
+
             @contextmanager
             def observed_commit_lock(record):
-                commit_lock_attempted.set()
                 with original_work_units_lock(record) as directory_fd:
+                    if not commit_lock_acquired.wait(30):
+                        raise AssertionError("concurrent Task commit never acquired its lock")
                     if not allow_commit.wait(30):
                         raise AssertionError("test did not release the concurrent commit")
                     (target / "concurrent-task-commit.txt").write_text(
@@ -772,6 +794,11 @@ class TaskStateRecoveryTest(unittest.TestCase):
                     recovery.lifecycle, "remote_branch_head", return_value=target_head
                 ),
                 mock.patch.object(
+                    agent_core.lifecycle.fcntl,
+                    "flock",
+                    side_effect=observed_flock,
+                ),
+                mock.patch.object(
                     agent_core.lifecycle,
                     "work_units_lock",
                     side_effect=observed_commit_lock,
@@ -791,10 +818,15 @@ class TaskStateRecoveryTest(unittest.TestCase):
                         commit_lock_attempted.wait(30),
                         f"concurrent commit failed before the Task lock: {failures!r}",
                     )
-                    self.assertFalse(commit_finished.wait(0.1))
+                    self.assertTrue(
+                        commit_lock_blocked.wait(30),
+                        "normal Task commit did not block on recovery's Task lock",
+                    )
+                    self.assertFalse(commit_lock_acquired.is_set())
                     allow_resume_validation.set()
                     self.assertTrue(recovery_finished.wait(30))
                     self.assertFalse(commit_finished.is_set())
+                    self.assertTrue(commit_lock_acquired.wait(30))
                     allow_commit.set()
                     self.assertTrue(commit_finished.wait(30))
                 finally:
