@@ -256,6 +256,26 @@ stated behavior; “partial” means only some boundaries or fields are asserted
   #191/#197 import and retire legacy state without treating these fixtures as
   new architecture.
 
+## Historical fixture provenance map
+
+These are migration inputs from the pre-#190 suite and incident history. Tests
+are not duplicated when existing characterization is sufficient. Matrix row
+numbers refer to the coverage matrix above.
+
+| Issue | Historical failure shape | Representative characterization tests | Matrix row | Later migration owner |
+|---|---|---|---:|---|
+| #95 | A pristine Task had placeholder/unresolved contract metadata; source-side recovery had to bind an authoritative Issue without inventing requirements. | `tests/test_task_contract.py::test_dogfood_contract_hydrates_without_semantic_interpretation_and_is_idempotent`; `tests/test_init_contract.py::test_unresolved_task_contract_blocks_context_without_mutation`; `tests/test_task_contract_recovery.py::test_verified_task_contract_is_loaded_from_head_blob` | 1, 2 | #191, #192; #144 for Git-derived identity |
+| #99 | Initial-launch readiness incorrectly conflated with resume readiness, blocking progressed Tasks or mutating their saved contract on resume. | `tests/test_task_contract.py::test_resume_check_accepts_every_defined_resumable_state_without_pristine_checks`; `::test_resume_check_allows_progress_with_work_units_dirty_tree_and_head_drift`; `::test_resume_check_is_byte_for_byte_read_only` | 2 | #191, #192 |
+| #101 | Draft metadata could be placeholder/stale or contradict current verification/review evidence. | `tests/test_agent_core_automation.py::test_dogfood_fixture_prepares_complete_metadata_without_product_mutation`; `::test_pass_evidence_contradicting_not_run_is_rejected`; `::test_missing_current_state_evidence_fails_closed`; `::test_pr_ready_rejects_stale_live_body_before_write` | 3, 5 | #145, #193, #194 |
+| #103 | A merged Task could lose its upstream branch, while cleanup still had to reject unpublished local-only work and match exact merge evidence. | `tests/test_post_merge_finalization.py::test_deleted_upstream_merged_pr_head_match_allows_cleanup`; `::test_deleted_upstream_with_local_only_commit_is_rejected`; `::test_local_only_commit_is_preserved_and_rejected` | 7 | #198 |
+| #129 | An earlier blocked reviewer Work Unit could incorrectly remain authoritative after a later completed review. | `tests/test_agent_core_automation.py::test_only_highest_reviewer_sequence_is_authoritative`; `::test_blocked_reviewer_is_superseded_by_later_completed_reviewer` | 4 | #145, #196 |
+| #131 / #133 | Source recovery had to repair stale validation metadata on the exact existing Draft and preserve historical review/Work Unit evidence rather than create or adopt another PR. | `tests/test_source_publication_recovery_bridge.py::test_blocked_akv_shaped_stale_draft_recovers_same_pr_and_preserves_subject`; `::test_akv_stale_metadata_fixture_renders_current_evidence_and_preserves_history`; `::test_existing_stale_draft_routes_to_canonical_edit_without_duplicate_create` | 3, 5 | #194 |
+| #157 | Sanitized GitHub authentication and ambient Git configuration needed to remain scoped to trusted network Git operations. | `tests/test_task_contract_recovery.py::test_pinned_git_scopes_trusted_auth_to_github_cli_helper`; `tests/test_post_merge_finalization.py::test_github_https_network_git_uses_only_command_scoped_gh_helper`; `::test_github_default_branch_fallback_scrubs_repository_override` | 8 | #142, #146, #192 |
+| #160 | Intentional Task Contract refresh needed guarded eligibility, read-only inspection, live-Issue race detection, and rollback on protected-state drift. | `tests/test_task_contract_refresh.py::test_pristine_refresh_passes_and_local_contract_is_updated`; `::test_refresh_inspection_is_byte_for_byte_read_only`; `::test_live_issue_race_fails_and_restores_original_contract_bytes`; `::test_protected_snapshot_drift_rolls_back_the_contract_refresh` | 2 | #191, #192 |
+| #175 | Interrupted post-merge publication recovery had to preserve Task state/evidence, retry against the same PR, and tolerate a later default-branch advance. | `tests/test_source_post_merge_publication_recovery_bridge.py::test_terreate_shaped_merged_pr_recovers_without_github_mutation`; `::test_interrupted_retry_allows_default_branch_to_advance`; `tests/test_task_lifecycle.py::test_guarded_post_merge_recovery_is_exact_state_and_evidence_cas` | 6 | #140, #194, #195 |
+| #181 / #183 | Lost ignored Task State had to be reconstructed conservatively; live REST PR selection had to identify the exact unique same-repository Draft and preserve Git/PR identity. | `tests/test_task_state_recovery.py::test_real_registered_fixture_recovers_and_resumes_without_product_mutation`; `::test_exact_fixture_reconstructs_only_three_state_files_and_is_idempotent`; `::test_pull_request_identity_failures_reject_before_recovery`; `::test_real_rest_pr_payload_is_normalized_for_recovery` | 1, 5, 12 | #147, #191, #197 |
+| #188 | Raw shell deletion could not safely Ask on unexpanded paths; deletion was moved behind a guarded API that confines literal Task-local targets and preserves data on failed preflight/races. | `tests/test_local_delete.py::test_target_parser_rejects_root_escape_and_shell_syntax`; `::test_recursive_delete_is_descriptor_anchored_and_rejects_symlink_escape`; `::test_recursive_delete_rejects_a_same_device_top_level_mount_before_mutation`; `::test_delete_holds_canonical_lock_until_mutation_finishes` | 7 | #198 |
+
 ## Preserved historical recovery fixture
 
 The #163 / PR #176 incident remains a migration input, not a path or recipe
@@ -267,15 +287,27 @@ PR:                   176 (OPEN Draft)
 branch:               task/163-worktree-dispatch
 Task HEAD:            42d0b0216fb2b338d3973484af7198cc77e52abb
 historical Task Base: f9a9ba13e2366e21703847f9edf411e1cb2052a2
-current default:      271cfe06d2410f6616e74a465c50a827fe42d319
 observed PR base OID: f9a9ba13e2366e21703847f9edf411e1cb2052a2
 ```
 
-The historical Task Base is not the current default. The PR base OID is a
-captured PR fact, not current-default authority. Recovery preserves the exact
-registered Git identity and PR selection, leaves tracked Task content/HEAD
-unchanged, and reconstructs no verification/review PASS. The existing tests
-also exercise refresh of the PR-base observation when the default branch moves.
+The Task Base and observed PR base OID have the same value in this incident,
+but remain independently owned facts. Default revision is a separate,
+time-varying observation:
+
+| Observation | Revision | Meaning |
+|---|---|---|
+| Historical Task Base | `f9a9ba13e2366e21703847f9edf411e1cb2052a2` | Proven Task parent/base. |
+| Observed PR base OID | `f9a9ba13e2366e21703847f9edf411e1cb2052a2` | Captured from PR evidence; not current-default authority. |
+| Default during #203 reproduction | `271cfe06d2410f6616e74a465c50a827fe42d319` | Point-in-time default observation during the failing reproduction. |
+| Successful post-#206 source/default | `d515a229d39a97ff0a77a4265729d3a4a5f56a5c` | Source/default used for the successful recovery. |
+
+The durable invariant is: Task Base, PR base observation, and default revision
+are distinct facts; the default is a time-varying observation independent of
+historical Task Base. The #203 and post-#206 default OIDs are incident evidence,
+not permanent architecture constants. Recovery preserves exact registered Git
+identity and PR selection, leaves tracked Task content/HEAD unchanged, and
+reconstructs no verification/review PASS. Existing tests also exercise refresh
+of PR-base observations when the default branch moves.
 
 The #163 Task tree predates the current source-side recovery entry point and
 does not necessarily contain the current Justfile command surface. This is an
