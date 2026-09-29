@@ -707,10 +707,10 @@ class OpenCodeContractTest(unittest.TestCase):
 
     def test_model_assignment_is_exact(self) -> None:
         expected = {
-            "build.md": "openai/gpt-5.6-sol",
+            "build.md": "openai/gpt-6-sol",
             "plan.md": "openai/gpt-6-luna",
             "task-orchestrator.md": "openai/gpt-6-luna",
-            "maintenance-orchestrator.md": "openai/gpt-5.6-sol",
+            "maintenance-orchestrator.md": "openai/gpt-6-sol",
             "general.md": "openai/gpt-6-luna",
             "explore.md": "openai/gpt-6-luna",
             "verifier.md": "openai/gpt-6-luna",
@@ -718,7 +718,7 @@ class OpenCodeContractTest(unittest.TestCase):
             "investigator.md": "openai/gpt-6-luna",
             "security-reviewer.md": "openai/gpt-5.6-terra",
             "scout.md": "openai/gpt-6-luna",
-            "architect.md": "openai/gpt-5.6-sol",
+            "architect.md": "openai/gpt-6-sol",
         }
         for filename, model in expected.items():
             self.assertIn(f"model: {model}", frontmatter(AGENTS / filename), filename)
@@ -727,7 +727,7 @@ class OpenCodeContractTest(unittest.TestCase):
         sol_agents = {
             path.name
             for path in AGENTS.glob("*.md")
-            if "model: openai/gpt-5.6-sol" in frontmatter(path)
+            if "model: openai/gpt-6-sol" in frontmatter(path)
         }
         luna_agents = {
             path.name for path in AGENTS.glob("*.md")
@@ -943,7 +943,7 @@ class OpenCodeContractTest(unittest.TestCase):
                 """---
 description: deliberately permissive global plan
 mode: primary
-model: openai/gpt-5.6-sol
+model: openai/gpt-6-luna
 permission:
   edit: allow
   question: deny

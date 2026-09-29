@@ -261,7 +261,7 @@ Agent Core owns a repository-local `plan` primary agent so Agent-ready repositor
 
 ```text
 plan
-├── primary = openai/gpt-5.6-sol
+├── primary = openai/gpt-6-luna
 ├── edit = deny
 ├── question = allow
 ├── bash = deny
@@ -963,7 +963,7 @@ The intended initial model allocation is:
 
 | Role | Model family | Responsibility |
 | --- | --- | --- |
-| Main Orchestrator / architecture | GPT-5.6 Sol | repository-wide orchestration, integration, consequential architecture decisions |
+| Main Orchestrator / architecture | GPT-6 Sol | repository-wide orchestration, integration, consequential architecture decisions |
 | Task Orchestrator / plan | GPT-6 Luna (max) | high-frequency Task coordination and read-only planning |
 | general / explore | GPT-6 Luna (max) | bounded implementation and discovery |
 | verifier / scout | GPT-6 Luna (max) | deterministic verification and lightweight external research |

@@ -25,9 +25,9 @@ LUNA_AGENTS = {
     "scout",
 }
 RETAINED_MODELS = {
-    "build": "openai/gpt-5.6-sol",
-    "architect": "openai/gpt-5.6-sol",
-    "maintenance-orchestrator": "openai/gpt-5.6-sol",
+    "build": "openai/gpt-6-sol",
+    "architect": "openai/gpt-6-sol",
+    "maintenance-orchestrator": "openai/gpt-6-sol",
     "security-reviewer": "openai/gpt-5.6-terra",
 }
 
