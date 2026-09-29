@@ -846,6 +846,8 @@ def recover_missing_task_state(
                         task,
                         runner=_issue_runner,
                         directory_fd=directory_fd,
+                        expected_base_branch=latest_plan["receipt"]["base_branch"],
+                        expected_base_revision=latest_plan["receipt"]["base_revision"],
                     )
                 except Exception as exc:
                     raise TaskStateRecoveryError(

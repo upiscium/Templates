@@ -653,6 +653,58 @@ class TaskStateRecoveryTest(unittest.TestCase):
                 )
         self.assertEqual(1, len({state for state in normalized_states}))
 
+    def test_resume_rejects_base_identity_drift_from_recovery_receipt(self) -> None:
+        for label, replacement in (
+            ("Base branch", "release"),
+            ("Base revision", "c" * 40),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                _repository, source, target, base, _main, implementation = self.exact_fixture(
+                    Path(directory)
+                )
+                target_head = self.git("git", "rev-parse", "HEAD", cwd=target)
+                pull_request = self.normalized_pr(target_head, base)
+                original_publish = recovery._publish_state
+
+                def publish_with_base_drift(plan, state_target, receipt, directory_fd):
+                    original_publish(plan, state_target, receipt, directory_fd)
+                    state_path = state_target / ".task-state" / "task.md"
+                    state_text = state_path.read_text(encoding="utf-8")
+                    state_text, count = re.subn(
+                        rf"(?m)^- {re.escape(label)}: .+$",
+                        f"- {label}: {replacement}",
+                        state_text,
+                        count=1,
+                    )
+                    self.assertEqual(1, count)
+                    state_path.write_text(state_text, encoding="utf-8")
+
+                with (
+                    mock.patch.object(
+                        recovery.lifecycle,
+                        "pull_requests_for_branch",
+                        return_value=[pull_request],
+                    ),
+                    mock.patch.object(
+                        recovery, "_issue_runner", return_value=self.issue_runner()
+                    ),
+                    mock.patch.object(
+                        recovery.lifecycle,
+                        "remote_branch_head",
+                        return_value=target_head,
+                    ),
+                    mock.patch.object(
+                        recovery, "_publish_state", side_effect=publish_with_base_drift
+                    ),
+                    self.assertRaisesRegex(
+                        recovery.TaskStateRecoveryError,
+                        "Base identity does not match the proven recovery Base",
+                    ),
+                ):
+                    recovery.recover_missing_task_state(
+                        source, target, self.TASK, self.PR, implementation
+                    )
+
     def test_recovery_holds_task_commit_lock_through_final_resume_validation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             _repository, source, target, base, _main, implementation = self.exact_fixture(

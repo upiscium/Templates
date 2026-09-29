@@ -685,8 +685,25 @@ def check_resume_contract(
     *,
     runner=None,
     directory_fd: int | None = None,
+    expected_base_branch: str | None = None,
+    expected_base_revision: str | None = None,
 ) -> dict:
+    if (expected_base_branch is None) != (expected_base_revision is None):
+        raise ContractError("expected Task Base identity must include branch and revision")
+    if expected_base_branch is not None:
+        if (
+            directory_fd is None
+            or not isinstance(expected_base_branch, str)
+            or not expected_base_branch
+            or not isinstance(expected_base_revision, str)
+            or lifecycle.OID_RE.fullmatch(expected_base_revision) is None
+        ):
+            raise ContractError(
+                "expected Task Base validation requires a pinned State directory and full revision"
+            )
+
     target, task = _resolve_contract_target(root, task)
+    state_text: str | None = None
     result = validate_contract(target, task, directory_fd=directory_fd)
     if directory_fd is None:
         try:
@@ -698,11 +715,23 @@ def check_resume_contract(
         if state_bytes is None:
             raise ContractError("Task State is missing")
         try:
+            state_text = state_bytes.decode("utf-8")
             status = lifecycle._state_status_from_text(
-                state_bytes.decode("utf-8"), lifecycle.state_path(target)
+                state_text, lifecycle.state_path(target)
             )
         except (UnicodeError, lifecycle.LifecycleError) as exc:
             raise ContractError(str(exc)) from exc
+    if expected_base_branch is not None:
+        assert expected_base_revision is not None and state_text is not None
+        for label, expected in (
+            ("Base branch", expected_base_branch),
+            ("Base revision", expected_base_revision),
+        ):
+            matches = re.findall(rf"(?m)^- {re.escape(label)}: ([^\r\n]+)$", state_text)
+            if len(matches) != 1 or matches[0].strip() != expected:
+                raise ContractError(
+                    "Task State Base identity does not match the proven recovery Base"
+                )
     if status not in RESUMABLE_STATES:
         raise ContractError(f"Task State status is not resumable: {status}")
     live_repository = repository_identity(target)
