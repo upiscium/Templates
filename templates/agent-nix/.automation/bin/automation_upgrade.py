@@ -19,6 +19,7 @@ from pathlib import Path, PurePosixPath
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 import git_private_state as private_state
+from path_safety import load_policy, matches_secret_path
 
 
 class UpgradeError(RuntimeError):
@@ -1721,15 +1722,27 @@ def bootstrap_fingerprint(tree: Path, raw_path: str) -> dict[str, object]:
     return file_fingerprint(tree, raw_path)
 
 
+def configured_secret_patterns(repo: Path) -> list[str]:
+    try:
+        policy = load_policy(repo)
+    except ValueError as exc:
+        raise UpgradeError(f"invalid secret path classifier configuration: {exc}") from exc
+    paths = policy.get("paths") if isinstance(policy, dict) else None
+    patterns = paths.get("secret_patterns") if isinstance(paths, dict) else None
+    return patterns
+
+
 def reject_bootstrap_path(repo: Path, raw_path: str) -> None:
     path = validate_receipt_path(raw_path)
     relative = Path(*path.split("/"))
-    policy_path = repo / ".automation" / "policy.toml"
-    policy = tomllib.loads(policy_path.read_text(encoding="utf-8")) if policy_path.is_file() else {}
-    secret_patterns = policy.get("paths", {}).get("secret_patterns", [])
+    secret_patterns = configured_secret_patterns(repo)
     if path == ".task-state" or path.startswith(".task-state/"):
         raise UpgradeError(f"pending path is Task State: {path}")
-    if any(token.lower() in path.lower() for token in secret_patterns):
+    try:
+        matches_secret = matches_secret_path(path, secret_patterns)
+    except (TypeError, ValueError) as exc:
+        raise UpgradeError(f"invalid secret path classifier configuration: {exc}") from exc
+    if matches_secret:
         raise UpgradeError(f"pending path matches a configured secret pattern: {path}")
     if path.startswith("just/project/") or path == "just/local.just":
         raise UpgradeError(f"pending path is repository-owned: {path}")
@@ -2430,14 +2443,16 @@ def receipt_paths(repo: Path, receipt: dict) -> list[str]:
     paths = [validate_receipt_path(item) for item in raw]
     if paths != sorted(paths) or len(paths) != len(set(paths)):
         raise UpgradeError("automation receipt paths must be sorted and unique")
-    secret_file = repo / ".automation" / "policy.toml"
-    policy = tomllib.loads(secret_file.read_text(encoding="utf-8")) if secret_file.is_file() else {}
-    secrets = policy.get("paths", {}).get("secret_patterns", [])
+    secrets = configured_secret_patterns(repo)
     for path in paths:
         relative = Path(*path.split("/"))
         if path == ".task-state" or path.startswith(".task-state/") or not managed(relative):
             raise UpgradeError(f"receipt path is not Agent Core managed: {path}")
-        if any(token.lower() in path.lower() for token in secrets):
+        try:
+            matches_secret = matches_secret_path(path, secrets)
+        except (TypeError, ValueError) as exc:
+            raise UpgradeError(f"invalid secret path classifier configuration: {exc}") from exc
+        if matches_secret:
             raise UpgradeError(f"receipt path matches a configured secret pattern: {path}")
     return paths
 

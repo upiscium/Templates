@@ -172,23 +172,49 @@ class TaskContractRecoveryTest(unittest.TestCase):
     def test_verified_task_contract_is_loaded_from_head_blob(self) -> None:
         contract_bytes = bridge.CONTRACT_PATH.read_bytes()
         lifecycle_bytes = bridge.LIFECYCLE_PATH.read_bytes()
+        private_state_bytes = (
+            bridge.ROOT / "components/agent-core/.automation/bin/git_private_state.py"
+        ).read_bytes()
 
         def tree_blob(_root: Path, _revision: str, path: str):
-            return ("contract", 0o100755) if path.endswith("task_contract.py") else ("lifecycle", 0o100644)
+            if path.endswith("task_contract.py"):
+                return "contract", 0o100755
+            if path.endswith("task_lifecycle.py"):
+                return "lifecycle", 0o100644
+            if path.endswith("git_private_state.py"):
+                return "private", 0o100644
+            raise AssertionError(path)
 
         def blob(_root: Path, oid: str) -> bytes:
-            return contract_bytes if oid == "contract" else lifecycle_bytes
+            return {
+                "contract": contract_bytes,
+                "lifecycle": lifecycle_bytes,
+                "private": private_state_bytes,
+            }[oid]
 
-        with mock.patch.object(bridge, "_tree_blob", side_effect=tree_blob), \
-             mock.patch.object(bridge, "_blob", side_effect=blob):
-            with bridge._verified_task_contract(ROOT, "0" * 40) as contract:
-                self.assertNotEqual(Path(contract.__file__).resolve(), bridge.CONTRACT_PATH.resolve())
-                self.assertTrue(hasattr(contract, "recover_task_from_issue"))
+        previous_private = sys.modules.get("git_private_state")
+        sentinel = mock.Mock(name="caller-git-private-state")
+        sentinel._GIT_EXECUTABLE = "caller-value"
+        sys.modules["git_private_state"] = sentinel
+        try:
+            with mock.patch.object(bridge, "_tree_blob", side_effect=tree_blob), \
+                 mock.patch.object(bridge, "_blob", side_effect=blob):
+                with bridge._verified_task_contract(ROOT, "0" * 40) as contract:
+                    self.assertNotEqual(Path(contract.__file__).resolve(), bridge.CONTRACT_PATH.resolve())
+                    self.assertTrue(hasattr(contract, "recover_task_from_issue"))
+            self.assertIs(sys.modules.get("git_private_state"), sentinel)
+            self.assertEqual(sentinel._GIT_EXECUTABLE, "caller-value")
+        finally:
+            if previous_private is None:
+                sys.modules.pop("git_private_state", None)
+            else:
+                sys.modules["git_private_state"] = previous_private
 
     def test_verified_engine_wraps_only_load_failures(self) -> None:
         blobs = {
-            "engine": b"raise RuntimeError('top-level boom')\n",
+            "engine": b"import path_safety\nraise RuntimeError(path_safety.SOURCE)\n",
             "private": b"_GIT_EXECUTABLE = None\n",
+            "classifier": b'SOURCE = "head-blob"\n',
         }
 
         def tree_blob(_root: Path, _revision: str, relative: str):
@@ -196,22 +222,39 @@ class TaskContractRecoveryTest(unittest.TestCase):
                 return "engine", 0o100644
             if relative.endswith("git_private_state.py"):
                 return "private", 0o100644
+            if relative.endswith("path_safety.py"):
+                return "classifier", 0o100644
             raise AssertionError(relative)
 
-        with mock.patch.object(bridge, "_tree_blob", side_effect=tree_blob), \
-             mock.patch.object(bridge, "_blob", side_effect=lambda _root, oid: blobs[oid]), \
-             mock.patch.object(bridge, "_clean_root"), \
-             self.assertRaisesRegex(
-                 bridge.BridgeError,
-                 "cannot load verified recovery engine: top-level boom",
-             ):
-            with bridge._verified_engine(ROOT, "0" * 40):
-                self.fail("engine load failure must not yield")
+        old_path = list(sys.path)
+        old_bytecode = sys.dont_write_bytecode
+        previous_classifier = sys.modules.get("path_safety")
+        sentinel = mock.Mock(name="previous-path-safety")
+        sys.modules["path_safety"] = sentinel
+        try:
+            with mock.patch.object(bridge, "_tree_blob", side_effect=tree_blob), \
+                 mock.patch.object(bridge, "_blob", side_effect=lambda _root, oid: blobs[oid]), \
+                 mock.patch.object(bridge, "_clean_root"), \
+                 self.assertRaisesRegex(
+                     bridge.BridgeError,
+                     "cannot load verified recovery engine: head-blob",
+                 ):
+                with bridge._verified_engine(ROOT, "0" * 40):
+                    self.fail("engine load failure must not yield")
+            self.assertEqual(sys.path, old_path)
+            self.assertEqual(sys.dont_write_bytecode, old_bytecode)
+            self.assertIs(sys.modules.get("path_safety"), sentinel)
+        finally:
+            if previous_classifier is None:
+                sys.modules.pop("path_safety", None)
+            else:
+                sys.modules["path_safety"] = previous_classifier
 
     def test_verified_engine_preserves_caller_error_and_restores_process_state(self) -> None:
         blobs = {
-            "engine": b"import git_private_state\nVALUE = 1\n",
+            "engine": b"import git_private_state\nimport path_safety\nVALUE = path_safety.SOURCE\nCLASSIFIER_FILE = path_safety.__file__\n",
             "private": b"_GIT_EXECUTABLE = None\n",
+            "classifier": b'SOURCE = "head-blob"\n',
         }
 
         def tree_blob(_root: Path, _revision: str, relative: str):
@@ -219,13 +262,18 @@ class TaskContractRecoveryTest(unittest.TestCase):
                 return "engine", 0o100644
             if relative.endswith("git_private_state.py"):
                 return "private", 0o100644
+            if relative.endswith("path_safety.py"):
+                return "classifier", 0o100644
             raise AssertionError(relative)
 
         old_path = list(sys.path)
         old_bytecode = sys.dont_write_bytecode
         previous_private = sys.modules.get("git_private_state")
+        previous_classifier = sys.modules.get("path_safety")
         sentinel = mock.Mock(name="previous-private-state")
+        classifier_sentinel = mock.Mock(name="previous-path-safety")
         sys.modules["git_private_state"] = sentinel
+        sys.modules["path_safety"] = classifier_sentinel
         try:
             with mock.patch.object(bridge, "_tree_blob", side_effect=tree_blob), \
                  mock.patch.object(bridge, "_blob", side_effect=lambda _root, oid: blobs[oid]), \
@@ -234,18 +282,28 @@ class TaskContractRecoveryTest(unittest.TestCase):
                      bridge, "trusted_git", return_value=Path("/usr/bin/git")
                  ), \
                  self.assertRaisesRegex(RuntimeError, "target validation failed"):
-                with bridge._verified_engine(ROOT, "0" * 40) as engine:
-                    self.assertEqual(engine.VALUE, 1)
-                    raise RuntimeError("target validation failed")
+                 with bridge._verified_engine(ROOT, "0" * 40) as engine:
+                     self.assertEqual(engine.VALUE, "head-blob")
+                     self.assertIn("automation-bridge-", engine.CLASSIFIER_FILE)
+                     self.assertNotEqual(
+                         Path(engine.CLASSIFIER_FILE).resolve(),
+                         (bridge.ROOT / "components/agent-core/.automation/bin/path_safety.py").resolve(),
+                     )
+                     raise RuntimeError("target validation failed")
 
             self.assertEqual(sys.path, old_path)
             self.assertEqual(sys.dont_write_bytecode, old_bytecode)
             self.assertIs(sys.modules.get("git_private_state"), sentinel)
+            self.assertIs(sys.modules.get("path_safety"), classifier_sentinel)
         finally:
             if previous_private is None:
                 sys.modules.pop("git_private_state", None)
             else:
                 sys.modules["git_private_state"] = previous_private
+            if previous_classifier is None:
+                sys.modules.pop("path_safety", None)
+            else:
+                sys.modules["path_safety"] = previous_classifier
 
     def test_maintenance_dispatch_uses_verified_modules_and_reports_revision(self) -> None:
         maintenance = mock.Mock()
@@ -270,20 +328,39 @@ class TaskContractRecoveryTest(unittest.TestCase):
         }
         old_path = list(sys.path)
         sentinel = mock.Mock(name="stale-maintenance-module")
+        path_safety_sentinel = mock.Mock(name="stale-path-safety-module")
         previous = sys.modules.get("maintenance_lifecycle")
+        previous_path_safety = sys.modules.get("path_safety")
         sys.modules["maintenance_lifecycle"] = sentinel
+        sys.modules["path_safety"] = path_safety_sentinel
 
         def tree_blob(_root: Path, _revision: str, relative: str):
             return relative, 0o100755
 
+        private_state_path = "components/agent-core/.automation/bin/git_private_state.py"
+        blobs[private_state_path] = blobs[private_state_path].replace(
+            b"from __future__ import annotations\n",
+            b"from __future__ import annotations\nimport path_safety\n",
+            1,
+        )
+
         try:
-            with mock.patch.object(bridge, "_tree_blob", side_effect=tree_blob), \
-                 mock.patch.object(bridge, "_blob", side_effect=lambda _root, oid: blobs[oid]), \
-                 mock.patch.object(bridge, "trusted_git", return_value=Path("/usr/bin/git")), \
-                 mock.patch.object(bridge, "trusted_gh", return_value=Path("/usr/bin/gh")):
+            with (
+                mock.patch.object(bridge, "_tree_blob", side_effect=tree_blob),
+                mock.patch.object(bridge, "_blob", side_effect=lambda _root, oid: blobs[oid]),
+                mock.patch.object(bridge, "trusted_git", return_value=Path("/usr/bin/git")),
+                mock.patch.object(bridge, "trusted_gh", return_value=Path("/usr/bin/gh")),
+            ):
                 with bridge._verified_modules(ROOT, "0" * 40) as modules:
                     loaded = modules["maintenance_lifecycle"]
                     self.assertIsNot(loaded, sentinel)
+                    private_state = modules["git_private_state"]
+                    self.assertIsNot(private_state.path_safety, path_safety_sentinel)
+                    self.assertNotEqual(
+                        Path(private_state.path_safety.__file__).resolve(),
+                        (bridge.ROOT / "components/agent-core/.automation/bin/path_safety.py").resolve(),
+                    )
+                    self.assertIsNot(modules["path_safety"], path_safety_sentinel)
                     self.assertNotEqual(
                         Path(loaded.__file__).resolve(), bridge.MAINTENANCE_PATH.resolve()
                     )
@@ -294,11 +371,16 @@ class TaskContractRecoveryTest(unittest.TestCase):
                     )
             self.assertEqual(sys.path, old_path)
             self.assertIs(sys.modules["maintenance_lifecycle"], sentinel)
+            self.assertIs(sys.modules["path_safety"], path_safety_sentinel)
         finally:
             if previous is None:
                 sys.modules.pop("maintenance_lifecycle", None)
             else:
                 sys.modules["maintenance_lifecycle"] = previous
+            if previous_path_safety is None:
+                sys.modules.pop("path_safety", None)
+            else:
+                sys.modules["path_safety"] = previous_path_safety
 
     def test_pinned_git_runner_disables_repository_hooks(self) -> None:
         completed = mock.Mock(returncode=0, stdout="", stderr="")

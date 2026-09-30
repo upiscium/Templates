@@ -5,6 +5,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest import mock
 
@@ -172,7 +173,9 @@ class AgentCoreSafetyTest(unittest.TestCase):
             root = Path(directory)
             (root / ".automation").mkdir()
             (root / ".automation" / "policy.toml").write_text(
-                '[paths]\nautomation_core = ["Justfile", ".automation/**"]\nsecret_patterns = []\n',
+                '[paths]\nautomation_core = ["Justfile", ".automation/**"]\n'
+                'secret_patterns = [".env", "credentials", "secret", '
+                '"id_rsa", "id_ed25519", ".pem", ".key"]\n',
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(agent_core.AutomationError, "Automation Core"):
@@ -183,11 +186,150 @@ class AgentCoreSafetyTest(unittest.TestCase):
             root = Path(directory)
             (root / ".automation").mkdir()
             (root / ".automation" / "policy.toml").write_text(
-                '[paths]\nautomation_core = []\nsecret_patterns = []\n',
+                '[paths]\nautomation_core = []\n'
+                'secret_patterns = [".env", "credentials", "secret", '
+                '"id_rsa", "id_ed25519", ".pem", ".key"]\n',
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(agent_core.AutomationError, "task-state"):
                 agent_core.reject_unsafe_paths(root, [".task-state/task.md"])
+
+    def test_task_path_guard_classifies_secret_names_without_substring_false_positives(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            automation = root / ".automation"
+            automation.mkdir()
+            (automation / "policy.toml").write_text(
+                '[paths]\nautomation_core = []\n'
+                'secret_patterns = [".env", "credentials", "secret", '
+                '"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_xmss", '
+                '".pem", ".key"]\n',
+                encoding="utf-8",
+            )
+
+            allowed_paths = (
+                ".envrc",
+                "config/.envrc",
+                ".env.example",  # Only the exact example filename is an allowed exception.
+                "nested/.ENV.EXAMPLE",
+                ".ssh/id_rsa.pub",
+                "nested/.ssh/id_ecdsa.pub",
+                ".ssh/id_ed25519.pub",
+                ".ssh/id_dsa.pub",
+                "nested/.ssh/id_xmss.pub",
+                ".ssh/id_ecdsa_sk.pub",
+                "nested/.ssh/id_ed25519_sk.pub",
+                "secretary.txt",
+                "monkey.txt",  # Contains "key", but does not end in the .key extension.
+            )
+            for path in allowed_paths:
+                with self.subTest(path=path):
+                    agent_core.reject_unsafe_paths(root, [path])
+
+            secret_paths = (
+                ".env",
+                "config/.env",
+                ".env.local",
+                "nested/.env.local",
+                ".env.example.local",
+                ".env.example/config.txt",
+                "credentials.json",
+                "nested/credentials.json",
+                "id_rsa",
+                "nested/id_ecdsa",
+                "id_dsa",
+                "nested/id_ecdsa_sk",
+                "nested/id_ed25519",
+                "id_ed25519_sk",
+                "id_xmss",
+                "backup-id_rsa.pub",
+                ".ssh/id_rsa.pub/private-material",
+                "server.key",
+                "certificate.pem",
+                ".ENV",
+                "CONFIG/.ENV.LOCAL",
+            )
+            for path in secret_paths:
+                with self.subTest(path=path):
+                    with self.assertRaises(agent_core.AutomationError):
+                        agent_core.reject_unsafe_paths(root, [path])
+
+    def test_task_path_guard_fails_closed_for_incomplete_secret_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            automation = root / ".automation"
+            automation.mkdir()
+            policy = automation / "policy.toml"
+            with self.assertRaisesRegex(agent_core.AutomationError, "missing policy"):
+                agent_core.reject_unsafe_paths(root, [".env"])
+
+            policy.write_text(
+                '[paths]\nautomation_core = []\nsecret_patterns = ["secret"]\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                agent_core.AutomationError, "invalid secret path classifier configuration"
+            ):
+                agent_core.reject_unsafe_paths(root, [".envrc"])
+
+            policy.write_text(
+                '[paths]\nautomation_core = []\n'
+                'secret_patterns = [".env", "credentials", "secret", '
+                '"id_rsa", "id_ed25519", ".pem", ".key"]\n',
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                agent_core.AutomationError, "potential secret file"
+            ):
+                agent_core.reject_unsafe_paths(root, ["nested/id_ecdsa"])
+
+            policy.unlink()
+            (automation / "policy-data.toml").write_text(
+                '[paths]\nautomation_core = []\n'
+                'secret_patterns = [".env", "credentials", "secret", '
+                '"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_xmss", '
+                '".pem", ".key"]\n',
+                encoding="utf-8",
+            )
+            policy.symlink_to("policy-data.toml")
+            with self.assertRaisesRegex(agent_core.AutomationError, "policy is unavailable or unsafe"):
+                agent_core.reject_unsafe_paths(root, [".envrc"])
+
+    def test_task_commit_allows_envrc_when_other_guards_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy = root / ".automation" / "policy.toml"
+            policy.parent.mkdir()
+            policy.write_text(
+                '[paths]\nautomation_core = []\n'
+                'secret_patterns = [".env", "credentials", "secret", '
+                '"id_rsa", "id_ed25519", ".pem", ".key"]\n',
+                encoding="utf-8",
+            )
+
+            def fake_git(*args: str, cwd: Path | None = None) -> str:
+                if args == ("diff", "--cached", "--name-only"):
+                    return ".envrc"
+                if args == ("rev-parse", "HEAD"):
+                    return "a" * 40
+                raise AssertionError(args)
+
+            with (
+                mock.patch.object(agent_core, "ensure_task_branch"),
+                mock.patch.object(agent_core.lifecycle, "current_worktree", return_value=object()),
+                mock.patch.object(agent_core.lifecycle, "work_units_lock", return_value=nullcontext()),
+                mock.patch.object(agent_core.lifecycle, "state_path", return_value=root / ".task-state/task.md"),
+                mock.patch.object(agent_core.lifecycle, "state_status", return_value="implementing"),
+                mock.patch.object(agent_core, "pending_paths", return_value=[".envrc"]),
+                mock.patch.object(agent_core, "run") as run,
+                mock.patch.object(agent_core, "git", side_effect=fake_git),
+            ):
+                agent_core.commit_task(root, "TASK-210", "allow .envrc")
+
+            run.assert_any_call(["git", "add", "--", ".envrc"], cwd=root)
+            run.assert_any_call(
+                ["git", "commit", "-m", "allow .envrc\n\nTask: TASK-210"], cwd=root
+            )
 
     @mock.patch.object(agent_core, "default_branch", return_value="main")
     @mock.patch.object(agent_core, "current_branch", return_value="main")

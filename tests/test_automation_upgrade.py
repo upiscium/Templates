@@ -42,6 +42,10 @@ AGENT_SPEC.loader.exec_module(agent_core)
 
 class AutomationUpgradeContractTest(unittest.TestCase):
     TEMPLATE_NAMES = ("agent-base", "agent-python", "agent-rust", "agent-nix", "agent-cpp-cmake", "agent-typescript-node")
+    SECRET_POLICY = '''[paths]
+automation_core = ["opencode.json", "AGENTS.md", "Justfile", ".opencode/**", ".automation/**", ".github/workflows/**"]
+secret_patterns = [".env", "credentials", "secret", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_xmss", ".pem", ".key"]
+'''
     AGENT_KNOWLEDGE_VAULT_19 = {
         "task": "19",
         "branch": "task/19-agent-core-v3-1-1",
@@ -313,6 +317,7 @@ mod project 'just/project/mod.just'
         implementation = (
             "components/agent-core/.automation/bin/automation_upgrade.py",
             "components/agent-core/.automation/bin/git_private_state.py",
+            "components/agent-core/.automation/bin/path_safety.py",
             "tools/automation_recovery_bridge.py",
             "just/agent-core.just",
         )
@@ -442,7 +447,8 @@ mod project 'just/project/mod.just'
         self._git(["config", "user.name", "Test User"], repo)
         self._git(["config", "user.email", "test@example.invalid"], repo)
         self._write_file(repo / "README.md", "repository\n")
-        self._git(["add", "README.md"], repo)
+        self._write_file(repo / ".automation/policy.toml", self.SECRET_POLICY)
+        self._git(["add", "README.md", ".automation/policy.toml"], repo)
         self._git(["commit", "-m", "initial"], repo)
         self._git(["switch", "-c", f"task/{task}-maintenance"], repo)
         head = self._git(["rev-parse", "HEAD"], repo)
@@ -1792,7 +1798,12 @@ mod project 'just/project/mod.just'
     def test_ordinary_task_commit_still_rejects_automation_core(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = self._task_repo(Path(directory) / "repo")
-            self._write_file(repo / ".automation/policy.toml", '[paths]\nautomation_core = ["Justfile", ".automation/**"]\nsecret_patterns = []\n')
+            self._write_file(
+                repo / ".automation/policy.toml",
+                '[paths]\nautomation_core = ["Justfile", ".automation/**"]\n'
+                'secret_patterns = [".env", "credentials", "secret", '
+                '"id_rsa", "id_ed25519", ".pem", ".key"]\n',
+            )
             self._write_file(repo / "Justfile", "changed\n")
             with mock.patch.object(agent_core, "ensure_task_branch", return_value="task/TASK-78-maintenance"), \
                     mock.patch.object(agent_core, "pending_paths", return_value=["Justfile"]), \
@@ -1804,7 +1815,12 @@ mod project 'just/project/mod.just'
     def test_maintenance_environment_alone_is_not_commit_authority(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = self._task_repo(Path(directory) / "repo")
-            self._write_file(repo / ".automation/policy.toml", '[paths]\nautomation_core = []\nsecret_patterns = []\n')
+            self._write_file(
+                repo / ".automation/policy.toml",
+                '[paths]\nautomation_core = []\n'
+                'secret_patterns = [".env", "credentials", "secret", '
+                '"id_rsa", "id_ed25519", ".pem", ".key"]\n',
+            )
             with mock.patch.dict(os.environ, {"AUTOMATION_MAINTENANCE": "1"}, clear=False):
                 error = self._commit_error(repo)
             self.assertIn("no active successful automation upgrade receipt", error)
@@ -1812,9 +1828,181 @@ mod project 'just/project/mod.just'
     def test_receipt_rejects_product_adapter_repository_secret_and_task_state_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = self._task_repo(Path(directory) / "repo")
-            self._write_file(repo / ".automation/policy.toml", '[paths]\nsecret_patterns = ["secret"]\n')
+            self._write_file(
+                repo / ".automation/policy.toml",
+                '[paths]\nsecret_patterns = [".env", "credentials", "secret", '
+                '"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_xmss", '
+                '".pem", ".key"]\n',
+            )
             for path in ("product.txt", ".automation/ADAPTER", "just/project/mod.just", ".automation/secret.json", ".task-state/task.md"):
                 with self.subTest(path=path):
+                    with self.assertRaises(upgrade.UpgradeError):
+                        upgrade.receipt_paths(repo, {"changed_paths": [path]})
+
+    def test_receipt_path_guard_uses_secret_name_classification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            self._write_file(
+                repo / ".automation/policy.toml",
+                '[paths]\nsecret_patterns = [".env", "credentials", "secret", '
+                '"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_xmss", '
+                '".pem", ".key"]\n',
+            )
+
+            allowed_paths = (
+                ".automation/.envrc",
+                ".automation/config/.envrc",
+                ".automation/.env.example",  # Exact .env.example basename is permitted.
+                ".automation/nested/.ENV.EXAMPLE",
+                ".automation/.ssh/id_rsa.pub",
+                ".automation/nested/.ssh/id_ecdsa.pub",
+                ".automation/.ssh/id_ed25519.pub",
+                ".automation/.ssh/id_dsa.pub",
+                ".automation/nested/.ssh/id_xmss.pub",
+                ".automation/.ssh/id_ecdsa_sk.pub",
+                ".automation/nested/.ssh/id_ed25519_sk.pub",
+                ".automation/secretary.txt",
+                ".automation/monkey.txt",  # Contains "key", but does not end in .key.
+            )
+            for path in allowed_paths:
+                with self.subTest(path=path):
+                    self.assertEqual(
+                        [path],
+                        upgrade.receipt_paths(repo, {"changed_paths": [path]}),
+                    )
+
+            secret_paths = (
+                ".automation/.env",
+                ".automation/config/.env",
+                ".automation/.env.local",
+                ".automation/nested/.env.local",
+                ".automation/.env.example.local",
+                ".automation/.env.example/config.txt",
+                ".automation/credentials.json",
+                ".automation/nested/credentials.json",
+                ".automation/id_rsa",
+                ".automation/nested/id_ecdsa",
+                ".automation/id_dsa",
+                ".automation/nested/id_ecdsa_sk",
+                ".automation/nested/id_ed25519",
+                ".automation/id_ed25519_sk",
+                ".automation/id_xmss",
+                ".automation/backup-id_rsa.pub",
+                ".automation/.ssh/id_rsa.pub/private-material",
+                ".automation/server.key",
+                ".automation/certificate.pem",
+                ".automation/.ENV",
+                ".automation/CONFIG/.ENV.LOCAL",
+            )
+            for path in secret_paths:
+                with self.subTest(path=path):
+                    with self.assertRaises(upgrade.UpgradeError):
+                        upgrade.receipt_paths(repo, {"changed_paths": [path]})
+
+    def test_bootstrap_path_guard_uses_secret_name_classification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            self._write_file(
+                repo / ".automation/policy.toml",
+                '[paths]\nsecret_patterns = [".env", "credentials", "secret", '
+                '"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_xmss", '
+                '".pem", ".key"]\n',
+            )
+
+            allowed_paths = (
+                ".automation/.envrc",
+                ".automation/config/.envrc",
+                ".automation/.env.example",
+                ".automation/nested/.ENV.EXAMPLE",
+                ".automation/.ssh/id_rsa.pub",
+                ".automation/nested/.ssh/id_ecdsa.pub",
+                ".automation/.ssh/id_ed25519.pub",
+                ".automation/.ssh/id_dsa.pub",
+                ".automation/nested/.ssh/id_xmss.pub",
+                ".automation/.ssh/id_ecdsa_sk.pub",
+                ".automation/nested/.ssh/id_ed25519_sk.pub",
+                ".automation/secretary.txt",
+                ".automation/monkey.txt",
+            )
+            for path in allowed_paths:
+                with self.subTest(path=path):
+                    upgrade.reject_bootstrap_path(repo, path)
+
+            secret_paths = (
+                ".automation/.env",
+                ".automation/config/.env",
+                ".automation/.env.local",
+                ".automation/nested/.env.local",
+                ".automation/.env.example.local",
+                ".automation/.env.example/config.txt",
+                ".automation/credentials.json",
+                ".automation/nested/credentials.json",
+                ".automation/id_rsa",
+                ".automation/nested/id_ecdsa",
+                ".automation/id_dsa",
+                ".automation/nested/id_ecdsa_sk",
+                ".automation/nested/id_ed25519",
+                ".automation/id_ed25519_sk",
+                ".automation/id_xmss",
+                ".automation/backup-id_rsa.pub",
+                ".automation/.ssh/id_rsa.pub/private-material",
+                ".automation/server.key",
+                ".automation/certificate.pem",
+                ".automation/.ENV",
+                ".automation/CONFIG/.ENV.LOCAL",
+            )
+            for path in secret_paths:
+                with self.subTest(path=path):
+                    with self.assertRaises(upgrade.UpgradeError):
+                        upgrade.reject_bootstrap_path(repo, path)
+
+    def test_upgrade_secret_guards_fail_closed_without_complete_policy(self) -> None:
+        for contents in (
+            None,
+            '[paths]\nsecret_patterns = []\n',
+            '[paths]\nsecret_patterns = ["secret"]\n',
+        ):
+            with self.subTest(policy=contents), tempfile.TemporaryDirectory() as directory:
+                repo = Path(directory)
+                if contents is not None:
+                    self._write_file(repo / ".automation/policy.toml", contents)
+                with self.assertRaises(upgrade.UpgradeError):
+                    upgrade.reject_bootstrap_path(repo, ".automation/.envrc")
+                with self.assertRaises(upgrade.UpgradeError):
+                    upgrade.receipt_paths(
+                        repo, {"changed_paths": [".automation/.envrc"]}
+                    )
+
+    def test_upgrade_secret_guards_reject_symlinked_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            self._write_file(
+                repo / ".automation/policy-data.toml", self.SECRET_POLICY
+            )
+            (repo / ".automation/policy.toml").symlink_to("policy-data.toml")
+            with self.assertRaisesRegex(upgrade.UpgradeError, "policy is unavailable or unsafe"):
+                upgrade.reject_bootstrap_path(repo, ".automation/.envrc")
+            with self.assertRaisesRegex(upgrade.UpgradeError, "policy is unavailable or unsafe"):
+                upgrade.receipt_paths(
+                    repo, {"changed_paths": [".automation/.envrc"]}
+                )
+
+    def test_upgrade_secret_guards_keep_new_key_markers_with_legacy_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            self._write_file(
+                repo / ".automation/policy.toml",
+                '[paths]\nsecret_patterns = [".env", "credentials", "secret", '
+                '"id_rsa", "id_ed25519", ".pem", ".key"]\n',
+            )
+            for path in (
+                ".automation/id_dsa",
+                ".automation/nested/id_ecdsa",
+                ".automation/id_xmss",
+            ):
+                with self.subTest(path=path):
+                    with self.assertRaises(upgrade.UpgradeError):
+                        upgrade.reject_bootstrap_path(repo, path)
                     with self.assertRaises(upgrade.UpgradeError):
                         upgrade.receipt_paths(repo, {"changed_paths": [path]})
 
@@ -2274,6 +2462,7 @@ mod project 'just/project/mod.just'
             implementation = (
                 "components/agent-core/.automation/bin/automation_upgrade.py",
                 "components/agent-core/.automation/bin/git_private_state.py",
+                "components/agent-core/.automation/bin/path_safety.py",
                 "components/agent-core/.automation/bin/task_contract.py",
                 "components/agent-core/.automation/bin/task_lifecycle.py",
                 "tools/automation_recovery_bridge.py",
