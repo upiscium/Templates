@@ -412,8 +412,8 @@ class MaintenanceLifecycleTest(unittest.TestCase):
                     root, "21", "security-reviewer", "status: BLOCKED; no result"
                 )
 
-    def test_task_worktree_dogfood_review_gate_is_exact_and_fails_closed(self) -> None:
-        """Exercise Issue #110 from a linked worktree, not a synthetic record."""
+    def test_task_worktree_reviewer_inspects_immutable_diff_and_gate_is_exact(self) -> None:
+        """Exercise the exact Issue #214 reviewer objective on a committed Task."""
         with tempfile.TemporaryDirectory() as directory:
             temporary = Path(directory)
             repository = temporary / "repository"
@@ -532,32 +532,198 @@ class MaintenanceLifecycleTest(unittest.TestCase):
                 self.assertEqual(ready["remoteRelation"], "ancestor")
                 self.assertIsNone(ready["pr"])
                 self.assertEqual(ready["reviewEvidence"], {"reviewer": False, "security-reviewer": False})
+                self.assertEqual(ready["commit"], commit)
+                reviewer_objective = ready["reviewObjectives"]["reviewer"]
+                self.assertEqual(
+                    reviewer_objective,
+                    maintenance._review_objective(
+                        "21", "reviewer", ready["reviewSubjectSha256"]
+                    ),
+                )
 
-                evidence = "status: COMPLETED; exact Task #21 upgrade evidence"
-                for role in ("reviewer", "security-reviewer"):
-                    recorded = maintenance.maintenance_review_record(task, "21", role, evidence)
-                    self.assertEqual(recorded["status"], "RECORDED")
-                    units = maintenance.lifecycle.read_work_units(
-                        maintenance.lifecycle.WorktreeRecord(
-                            task, "task/21-agent-core-v3-1-5", commit
-                        ),
+                before_inspection = (
+                    self._git(task, "rev-parse", "--verify", "HEAD^{commit}"),
+                    self._git(
+                        task,
+                        "--no-optional-locks",
+                        "status",
+                        "--short",
+                    ),
+                    self._git(
+                        task,
+                        "--no-pager",
+                        "diff",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                    ),
+                    self._git(
+                        task,
+                        "--no-pager",
+                        "diff",
+                        "--cached",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                    ),
+                )
+                resolved_commit = self._git(
+                    task, "rev-parse", "--verify", "HEAD^{commit}"
+                )
+                self.assertEqual(resolved_commit, ready["commit"])
+                parent_commit = self._git(task, "rev-parse", "--verify", "HEAD^")
+                self.assertEqual(resolved_commit, commit)
+                self.assertEqual(parent_commit, base)
+                committed_diff = self._git(
+                    task,
+                    "--no-pager",
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "HEAD^",
+                    "HEAD",
+                )
+                shown_diff = self._git(
+                    task,
+                    "--no-pager",
+                    "show",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--format=",
+                    "HEAD",
+                )
+                self.assertEqual(shown_diff, committed_diff)
+                self.assertEqual(
+                    [
+                        line
+                        for line in committed_diff.splitlines()
+                        if line.startswith("diff --git ")
+                    ],
+                    [
+                        "diff --git a/.automation/bin/maintenance.py "
+                        "b/.automation/bin/maintenance.py"
+                    ],
+                )
+                self.assertIn("-recipe: pre-v3.1.6", committed_diff)
+                self.assertIn("+recipe: v3.1.6", committed_diff)
+                after_inspection = (
+                    self._git(task, "rev-parse", "--verify", "HEAD^{commit}"),
+                    self._git(
+                        task,
+                        "--no-optional-locks",
+                        "status",
+                        "--short",
+                    ),
+                    self._git(
+                        task,
+                        "--no-pager",
+                        "diff",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                    ),
+                    self._git(
+                        task,
+                        "--no-pager",
+                        "diff",
+                        "--cached",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                    ),
+                )
+                self.assertEqual(
+                    after_inspection,
+                    before_inspection,
+                    "read-only Git inspection changed the Task worktree",
+                )
+
+                evidence = (
+                    "status: COMPLETED; reviewed the exact committed upgrade for the returned reviewer objective. "
+                    f"Reviewer objective (unchanged): {reviewer_objective} "
+                    f"Commit: {resolved_commit}; parent: {parent_commit}. "
+                    "Inspection: allowlisted read-only git rev-parse, git show, status, and diff commands; "
+                    "Task worktree unchanged. "
+                    f"Committed diff (JSON-escaped): {json.dumps(committed_diff)}"
+                )
+                self.assertTrue(evidence.startswith("status: COMPLETED;"))
+                self.assertIn(reviewer_objective, evidence)
+                reviewer_recorded = maintenance.maintenance_review_record(
+                    task, "21", "reviewer", evidence
+                )
+                self.assertEqual(reviewer_recorded["status"], "RECORDED")
+                self.assertEqual(
+                    reviewer_recorded["reviewSubjectSha256"],
+                    ready["reviewSubjectSha256"],
+                )
+                units = maintenance.lifecycle.read_work_units(
+                    maintenance.lifecycle.WorktreeRecord(
+                        task, "task/21-agent-core-v3-1-5", commit
+                    ),
+                    "21",
+                )
+                reviewer_unit = units["units"][reviewer_recorded["workUnit"]]
+                self.assertEqual(reviewer_unit["objective"], reviewer_objective)
+                self.assertEqual(
+                    reviewer_unit["transitions"][-1]["evidence"], evidence
+                )
+                duplicate = maintenance.maintenance_review_record(
+                    task, "21", "reviewer", evidence
+                )
+                self.assertEqual(duplicate["status"], "ALREADY_RECORDED")
+                with self.assertRaisesRegex(
+                    maintenance.MaintenanceError, "different or invalid completed evidence"
+                ):
+                    maintenance.maintenance_review_record(
+                        task,
                         "21",
+                        "reviewer",
+                        "status: COMPLETED; different evidence for the same subject",
                     )
-                    self.assertEqual(
-                        units["units"][recorded["workUnit"]]["objective"],
-                        ready["reviewObjectives"][role],
+
+                reviewer_checked = maintenance.maintenance_check(task, "21")
+                self.assertEqual(
+                    reviewer_checked["reviewEvidence"],
+                    {"reviewer": True, "security-reviewer": False},
+                )
+                self.assertEqual(reviewer_checked["commit"], ready["commit"])
+                self.assertEqual(
+                    reviewer_checked["reviewSubjectSha256"],
+                    ready["reviewSubjectSha256"],
+                )
+                self.assertEqual(
+                    reviewer_checked["reviewObjectives"]["reviewer"],
+                    reviewer_objective,
+                )
+
+                security_evidence = "status: COMPLETED; exact Task #21 upgrade evidence"
+                security_recorded = maintenance.maintenance_review_record(
+                    task, "21", "security-reviewer", security_evidence
+                )
+                self.assertEqual(security_recorded["status"], "RECORDED")
+                units = maintenance.lifecycle.read_work_units(
+                    maintenance.lifecycle.WorktreeRecord(
+                        task, "task/21-agent-core-v3-1-5", commit
+                    ),
+                    "21",
+                )
+                security_unit = units["units"][security_recorded["workUnit"]]
+                self.assertEqual(
+                    security_unit["objective"],
+                    ready["reviewObjectives"]["security-reviewer"],
+                )
+                self.assertEqual(
+                    security_unit["transitions"][-1]["evidence"], security_evidence
+                )
+                security_duplicate = maintenance.maintenance_review_record(
+                    task, "21", "security-reviewer", security_evidence
+                )
+                self.assertEqual(security_duplicate["status"], "ALREADY_RECORDED")
+                with self.assertRaisesRegex(
+                    maintenance.MaintenanceError, "different or invalid completed evidence"
+                ):
+                    maintenance.maintenance_review_record(
+                        task,
+                        "21",
+                        "security-reviewer",
+                        "status: COMPLETED; different evidence for the same subject",
                     )
-                    duplicate = maintenance.maintenance_review_record(task, "21", role, evidence)
-                    self.assertEqual(duplicate["status"], "ALREADY_RECORDED")
-                    with self.assertRaisesRegex(
-                        maintenance.MaintenanceError, "different or invalid completed evidence"
-                    ):
-                        maintenance.maintenance_review_record(
-                            task,
-                            "21",
-                            role,
-                            "status: COMPLETED; different evidence for the same subject",
-                        )
 
                 checked = maintenance.maintenance_check(task, "21")
                 self.assertEqual(checked["reviewEvidence"], {"reviewer": True, "security-reviewer": True})

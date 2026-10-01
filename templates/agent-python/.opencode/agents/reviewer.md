@@ -13,6 +13,13 @@ permission:
   websearch: deny
   bash:
     "*": deny
+    "git --no-optional-locks status --short": allow
+    "git --no-pager diff --no-ext-diff --no-textconv": allow
+    "git --no-pager diff --cached --no-ext-diff --no-textconv": allow
+    "git --no-pager diff --no-ext-diff --no-textconv HEAD^ HEAD": allow
+    "git --no-pager show --no-ext-diff --no-textconv --format= HEAD": allow
+    "git rev-parse --verify HEAD^{commit}": allow
+    "git rev-parse --verify HEAD^": allow
 ---
 
 Review the assigned change for concrete correctness, regression, maintainability, and contract violations. This is a non-interactive Depth-2 leaf.
@@ -36,3 +43,5 @@ Depth-2 leaf return contract:
 - `NEEDS_DECISION`: include ambiguity, options with tradeoffs, and recommendation.
 
 Do not edit, delegate, or mutate repository state.
+
+For a committed immutable maintenance-review objective, inspect the current subject at `HEAD` and its authoritative first parent only with the explicitly allowlisted commands: resolve `HEAD^{commit}` and `HEAD^` with `git rev-parse`, then review the commit using the bounded `git show` or `git diff` command. Keep the assigned objective unchanged and return canonical completion evidence only after inspecting that exact subject.

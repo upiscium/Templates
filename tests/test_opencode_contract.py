@@ -85,6 +85,15 @@ READ_ONLY_GIT_COMMANDS = {
     "git remote -v",
     "git worktree list *",
 }
+IMMUTABLE_REVIEW_GIT_COMMANDS = {
+    "git --no-optional-locks status --short",
+    "git --no-pager diff --no-ext-diff --no-textconv",
+    "git --no-pager diff --cached --no-ext-diff --no-textconv",
+    "git --no-pager diff --no-ext-diff --no-textconv HEAD^ HEAD",
+    "git --no-pager show --no-ext-diff --no-textconv --format= HEAD",
+    "git rev-parse --verify HEAD^{commit}",
+    "git rev-parse --verify HEAD^",
+}
 PROJECT_CHECK_COMMANDS = {
     "just project::doctor",
     "just project::eval",
@@ -99,7 +108,7 @@ LEAF_ALLOWED_BASH = {
     "explore": READ_ONLY_GIT_COMMANDS,
     "verifier": {"git status", "git status *", "git diff", "git diff *"}
     | PROJECT_CHECK_COMMANDS,
-    "reviewer": set(),
+    "reviewer": IMMUTABLE_REVIEW_GIT_COMMANDS,
     "investigator": READ_ONLY_GIT_COMMANDS | PROJECT_CHECK_COMMANDS,
     "security-reviewer": READ_ONLY_GIT_COMMANDS,
     "scout": set(),
@@ -836,6 +845,35 @@ class OpenCodeContractTest(unittest.TestCase):
                     last_action(effective["security-reviewer"], command), leaf_action
                 )
 
+        def effective_bash_action(agent: str, command: str) -> str:
+            matches = [
+                item["action"]
+                for item in effective[agent]
+                if item["permission"] == "bash"
+                and fnmatchcase(command, item.get("pattern", ""))
+            ]
+            self.assertTrue(matches, f"no effective Bash rule matches {agent}: {command}")
+            return matches[-1]
+
+        for command in IMMUTABLE_REVIEW_GIT_COMMANDS:
+            with self.subTest(reviewer_command=command):
+                self.assertEqual(effective_bash_action("reviewer", command), "allow")
+        for command in (
+            "git diff --output=review.patch HEAD^ HEAD",
+            "git --no-pager diff --no-ext-diff --no-textconv --output=review.patch HEAD^ HEAD",
+            "git --no-pager show --no-ext-diff --no-textconv --output=review.patch HEAD",
+            "git add reviewer.md",
+            "git commit -m review",
+            "git push origin HEAD",
+            "git checkout -- reviewer.md",
+            "git reset --hard HEAD",
+            "sed -i s/a/b/ reviewer.md",
+            "gh pr create --title review",
+            "echo review",
+        ):
+            with self.subTest(reviewer_denied_command=command):
+                self.assertEqual(effective_bash_action("reviewer", command), "deny")
+
 
     def test_plan_agent_repository_local_read_only_contract(self) -> None:
         front = frontmatter(AGENTS / "plan.md")
@@ -1070,6 +1108,78 @@ global permissive plan
             self.assertNotIn("just agent::context", bash, leaf)
             if "just project::doctor" in LEAF_ALLOWED_BASH[leaf]:
                 self.assertEqual(bash.get("just project::doctor"), "allow", leaf)
+
+    def test_reviewer_has_bounded_immutable_read_only_git_allowlist(self) -> None:
+        reviewer = permission_for("reviewer")
+        reviewer_bash = reviewer["bash"]
+        security_reviewer_bash = permission_for("security-reviewer")["bash"]
+
+        self.assertEqual(reviewer_bash["*"], "deny")
+        self.assertEqual(
+            {
+                command
+                for command, action in reviewer_bash.items()
+                if action == "allow"
+            },
+            IMMUTABLE_REVIEW_GIT_COMMANDS,
+        )
+        self.assertEqual(
+            {
+                command
+                for command, action in security_reviewer_bash.items()
+                if action == "allow"
+            },
+            READ_ONLY_GIT_COMMANDS,
+            "the established security-reviewer allowlist must remain unchanged",
+        )
+        for permission in ("edit", "task", "question"):
+            with self.subTest(permission=permission):
+                self.assertEqual(reviewer.get(permission), "deny")
+
+        def effective_action(command: str) -> str | None:
+            action = None
+            for pattern, candidate in reviewer_bash.items():
+                if fnmatchcase(command, pattern):
+                    action = candidate
+            return action
+
+        for command in IMMUTABLE_REVIEW_GIT_COMMANDS:
+            with self.subTest(command=command):
+                self.assertEqual(effective_action(command), "allow")
+
+        for command in (
+            "git diff",
+            "git diff --cached",
+            "git --no-pager diff --output=review.patch HEAD^ HEAD",
+            "git diff --output=components/agent-core/.opencode/agents/reviewer.md",
+            "git diff --no-ext-diff --no-textconv --output=review.patch HEAD^ HEAD",
+            "git --no-pager diff --no-ext-diff --no-textconv --output=review.patch HEAD^ HEAD",
+            "git show --output=components/agent-core/.opencode/agents/reviewer.md HEAD",
+            "git --no-pager show --no-ext-diff --no-textconv --output=review.patch HEAD",
+            "git rev-parse --verify HEAD^{commit} --output=review.txt",
+            "git add reviewer.md",
+            "git commit -m review",
+            "git reset --hard HEAD",
+            "git clean -fd",
+            "git push origin HEAD",
+            "git fetch origin",
+            "git pull --ff-only",
+            "git checkout -- reviewer.md",
+            "git switch main",
+            "git branch --delete topic",
+            "git remote add origin https://example.invalid/repo",
+            "git worktree add ../review HEAD",
+            "git worktree remove ../review",
+            "gh pr create --title review",
+            "gh pr edit 214 --title review",
+            "gh pr merge 214",
+            "just agent::commit review",
+            "sed -i s/a/b/ reviewer.md",
+            "python3 -c pass",
+            "echo review",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(effective_action(command), "deny")
 
     def test_leaf_prompts_require_parent_initialized_contract_and_bounded_objective(self) -> None:
         for leaf in TASK_ORCHESTRATOR_LEAVES:
