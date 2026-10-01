@@ -34,6 +34,7 @@ PUBLICATION_PATH = ROOT / "components" / "agent-core" / ".automation" / "bin" / 
 AGENT_CORE_PATH = ROOT / "components" / "agent-core" / ".automation" / "bin" / "agent_core.py"
 MAINTENANCE_PATH = ROOT / "components" / "agent-core" / ".automation" / "bin" / "maintenance_lifecycle.py"
 CANONICAL_MODULES = (
+    ("path_safety", "components/agent-core/.automation/bin/path_safety.py"),
     ("git_private_state", "components/agent-core/.automation/bin/git_private_state.py"),
     ("task_lifecycle", "components/agent-core/.automation/bin/task_lifecycle.py"),
     ("task_contract", "components/agent-core/.automation/bin/task_contract.py"),
@@ -393,6 +394,7 @@ def _verified_modules(root: Path, revision: str):
         try:
             for name, _, _ in blobs:
                 sys.modules.pop(name, None)
+            for name, _, _ in blobs:
                 spec = importlib.util.spec_from_file_location(name, private / f"{name}.py")
                 if spec is None or spec.loader is None:
                     raise BridgeError(f"cannot create specification for verified {name}")
@@ -464,6 +466,7 @@ def _verified_task_contract(root: Path, revision: str):
         sys.dont_write_bytecode = True
         try:
             sys.path.insert(0, str(directory_path))
+            sys.modules.pop("git_private_state", None)
             lifecycle_spec = importlib.util.spec_from_file_location(lifecycle_name, lifecycle_path)
             if lifecycle_spec is None or lifecycle_spec.loader is None:
                 raise BridgeError("cannot create specification for verified Task Contract dependency")
@@ -522,13 +525,20 @@ def _verified_engine(root: Path, revision: str):
     private_oid, private_mode = _tree_blob(
         root, revision, "components/agent-core/.automation/bin/git_private_state.py"
     )
+    classifier_oid, _ = _tree_blob(
+        root, revision, "components/agent-core/.automation/bin/path_safety.py"
+    )
     private_bytes = _blob(root, private_oid)
+    classifier_bytes = _blob(root, classifier_oid)
     _clean_root(root, revision)
     with tempfile.TemporaryDirectory(prefix="automation-bridge-") as directory:
         path = Path(directory) / "engine.py"
         private_path = Path(directory) / "git_private_state.py"
+        classifier_path = Path(directory) / "path_safety.py"
         private_path.write_bytes(private_bytes)
+        classifier_path.write_bytes(classifier_bytes)
         os.chmod(private_path, 0o600)
+        os.chmod(classifier_path, 0o600)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -546,12 +556,14 @@ def _verified_engine(root: Path, revision: str):
         name = f"_templates_verified_engine_{secrets.token_hex(16)}"
         previous = sys.dont_write_bytecode
         previous_private_state = sys.modules.get("git_private_state")
+        previous_classifier = sys.modules.get("path_safety")
         old_path = list(sys.path)
         sys.dont_write_bytecode = True
         spec = None
         try:
             sys.path.insert(0, directory)
             sys.modules.pop("git_private_state", None)
+            sys.modules.pop("path_safety", None)
             try:
                 spec = importlib.util.spec_from_file_location(name, path)
                 if spec is None or spec.loader is None:
@@ -573,6 +585,10 @@ def _verified_engine(root: Path, revision: str):
                 sys.modules.pop("git_private_state", None)
             else:
                 sys.modules["git_private_state"] = previous_private_state
+            if previous_classifier is None:
+                sys.modules.pop("path_safety", None)
+            else:
+                sys.modules["path_safety"] = previous_classifier
             sys.path[:] = old_path
             sys.dont_write_bytecode = previous
 

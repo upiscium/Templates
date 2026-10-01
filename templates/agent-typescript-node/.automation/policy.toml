@@ -7,12 +7,21 @@ automation_core = [
   ".automation/**",
   ".github/workflows/**",
 ]
+# `.env` blocks `.env` and `.env.<suffix>` except exact `.env.example`; `.envrc`
+# is allowed. `.pem` and `.key` are filename suffixes. Other entries match a
+# whole component token bounded by non-alphanumeric characters (including `_`),
+# case-insensitively. Exact OpenSSH `id_*.pub` public-key basenames are exempt.
+# Keep the baseline entries below; the classifier also enforces known SSH key
+# markers when reading an older compatible policy.
 secret_patterns = [
   ".env",
   "credentials",
   "secret",
   "id_rsa",
+  "id_dsa",
+  "id_ecdsa",
   "id_ed25519",
+  "id_xmss",
   ".pem",
   ".key",
 ]

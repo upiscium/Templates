@@ -97,6 +97,7 @@ class BootstrapUpgradeBridgeTest(unittest.TestCase):
             "components/agent-core/.automation/bin/task_lifecycle.py",
             "components/agent-core/.automation/bin/task_contract.py",
             "components/agent-core/.automation/bin/publication_metadata.py",
+            "components/agent-core/.automation/bin/path_safety.py",
             "components/agent-core/.automation/bin/agent_core.py",
             "components/agent-core/.automation/bin/maintenance_lifecycle.py",
             "components/agent-core/.automation/just/agent.just",

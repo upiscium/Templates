@@ -19,11 +19,7 @@ import task_lifecycle as lifecycle
 import publication_metadata as publication
 import task_contract
 import git_private_state as private_state
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover
-    tomllib = None
+from path_safety import load_policy, matches_secret_path
 
 TASK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
@@ -121,13 +117,10 @@ def ensure_task_branch(root: Path, task: str) -> str:
 
 
 def policy(root: Path) -> dict:
-    path = root / ".automation" / "policy.toml"
-    if tomllib is None:
-        raise AutomationError("Python 3.11+ is required to parse policy.toml")
     try:
-        return tomllib.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError as exc:
-        raise AutomationError(f"missing policy: {path}") from exc
+        return load_policy(root)
+    except ValueError as exc:
+        raise AutomationError(str(exc)) from exc
 
 
 def matches_protected(path: str, patterns: list[str]) -> bool:
@@ -158,12 +151,14 @@ def reject_unsafe_paths(root: Path, paths: list[str]) -> None:
     bad_core = [path for path in paths if matches_protected(path, protected)]
     if bad_core:
         raise AutomationError("ordinary Task modifies Automation Core: " + ", ".join(bad_core))
-    lowered = [(path, path.lower()) for path in paths]
-    bad_secret = [path for path, low in lowered if any(token.lower() in low for token in secret_names)]
-    if bad_secret:
-        raise AutomationError("potential secret file in Task changes: " + ", ".join(bad_secret))
     if any(path == ".task-state" or path.startswith(".task-state/") for path in paths):
         raise AutomationError(".task-state must never be committed")
+    try:
+        bad_secret = [path for path in paths if matches_secret_path(path, secret_names)]
+    except (TypeError, ValueError) as exc:
+        raise AutomationError(f"invalid secret path classifier configuration: {exc}") from exc
+    if bad_secret:
+        raise AutomationError("potential secret file in Task changes: " + ", ".join(bad_secret))
 
 
 def ensure_task_state_excluded(root: Path) -> None:
