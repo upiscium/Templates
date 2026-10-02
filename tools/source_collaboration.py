@@ -294,6 +294,8 @@ def push(issue: int, expected_head: str, cwd: Path | None = None) -> dict[str, A
             raise GuardError("remote branch diverged; push would not be fast-forward")
     out = git(ctx["root"], "push", REMOTE, f"{expected_head}:refs/heads/{ctx['branch']}", check=False)
     if out.returncode:
+        if remote_head(ctx["root"], ctx["branch"]) == expected_head:
+            return {"status": "PUSHED", "head": expected_head, "branch": ctx["branch"]}
         raise GuardError("source push failed:\n" + (out.stdout + out.stderr).strip())
     if remote_head(ctx["root"], ctx["branch"]) != expected_head:
         raise GuardError("remote push postcondition mismatch")
@@ -310,7 +312,9 @@ def pulls(root_: Path, branch_: str) -> list[dict[str, Any]]:
     return value
 
 
-def validate_pr(pr: dict[str, Any], branch_: str, expected_head: str) -> None:
+def validate_pr(
+    pr: dict[str, Any], branch_: str, expected_head: str, issue: int
+) -> None:
     h, b = pr.get("head") or {}, pr.get("base") or {}
     if str(pr.get("state", "")).lower() != "open":
         raise GuardError("PR is not open")
@@ -320,6 +324,11 @@ def validate_pr(pr: dict[str, Any], branch_: str, expected_head: str) -> None:
         raise GuardError("PR head repository mismatch")
     if b.get("ref") != DEFAULT or (b.get("repo") or {}).get("full_name") != REPO:
         raise GuardError("PR base identity mismatch")
+    body = str(pr.get("body") or "")
+    if not re.search(
+        rf"(?im)^\s*(?:closes|fixes|resolves)\s+#{issue}(?!\d)", body
+    ):
+        raise GuardError(f"PR is not bound to Issue #{issue}")
 
 
 def pr_create(issue: int, cwd: Path | None = None) -> dict[str, Any]:
@@ -345,7 +354,7 @@ def pr_create(issue: int, cwd: Path | None = None) -> dict[str, Any]:
     if len(found) != 1:
         raise GuardError("Draft PR postcondition is not unique")
     pr = found[0]
-    validate_pr(pr, ctx["branch"], ctx["head"])
+    validate_pr(pr, ctx["branch"], ctx["head"], issue)
     if not bool(pr.get("draft")):
         raise GuardError("exact source PR is not Draft")
     return {
@@ -364,7 +373,7 @@ def checkpoint(
     if not body.strip() or len(body.encode()) > 60_000:
         raise GuardError("checkpoint body is empty or too large")
     pr = gh_json(ctx["root"], "api", f"repos/{REPO}/pulls/{pr_number}")
-    validate_pr(pr, ctx["branch"], expected_head)
+    validate_pr(pr, ctx["branch"], expected_head, issue)
     marker = (
         f"<!-- source-checkpoint:{issue}:{expected_head}:"
         f"{hashlib.sha256(body.encode()).hexdigest()} -->"

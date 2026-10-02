@@ -100,6 +100,7 @@ class SourceCollaborationTest(unittest.TestCase):
         current = git(self.root, "rev-parse", "HEAD")
         pr = {
             "number": 7, "html_url": "https://example/pr/7", "state": "open", "draft": True,
+            "body": "Closes #215",
             "head": {"ref": "feat/215-source-collaboration", "sha": current,
                      "repo": {"full_name": source.REPO}},
             "base": {"ref": "main", "repo": {"full_name": source.REPO}},
@@ -111,6 +112,36 @@ class SourceCollaborationTest(unittest.TestCase):
         self.assertEqual("ADOPTED", result["status"])
         self.assertEqual(7, result["pr"])
 
+    def test_pr_adoption_rejects_wrong_issue_binding(self) -> None:
+        current = git(self.root, "rev-parse", "HEAD")
+        pr = {
+            "number": 7, "html_url": "https://example/pr/7", "state": "open", "draft": True,
+            "body": "Closes #999",
+            "head": {"ref": "feat/215-source-collaboration", "sha": current,
+                     "repo": {"full_name": source.REPO}},
+            "base": {"ref": "main", "repo": {"full_name": source.REPO}},
+        }
+        with mock.patch.object(source, "issue_meta", side_effect=self.issue), mock.patch.object(
+            source, "remote_head", return_value=current
+        ), mock.patch.object(source, "pulls", return_value=[pr]):
+            with self.assertRaisesRegex(source.GuardError, "not bound to Issue #215"):
+                source.pr_create(215, self.root)
+
+    def test_push_recovers_lost_acknowledgement(self) -> None:
+        current = git(self.root, "rev-parse", "HEAD")
+        ctx = {
+            "root": self.root, "issue": 215, "branch": "feat/215-source-collaboration",
+            "head": current, "title": "Source collaboration",
+        }
+        failed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="lost ack")
+        with mock.patch.object(source, "context", return_value=ctx), mock.patch.object(
+            source, "require_clean"
+        ), mock.patch.object(source, "remote_head", side_effect=[None, current]), mock.patch.object(
+            source, "git", return_value=failed
+        ):
+            result = source.push(215, current, self.root)
+        self.assertEqual("PUSHED", result["status"])
+
     def test_checkpoint_recovers_lost_acknowledgement(self) -> None:
         current = git(self.root, "rev-parse", "HEAD")
         ctx = {
@@ -118,7 +149,7 @@ class SourceCollaborationTest(unittest.TestCase):
             "head": current, "title": "Source collaboration",
         }
         pr = {
-            "number": 7, "state": "open", "draft": True,
+            "number": 7, "state": "open", "draft": True, "body": "Closes #215",
             "head": {"ref": ctx["branch"], "sha": current, "repo": {"full_name": source.REPO}},
             "base": {"ref": "main", "repo": {"full_name": source.REPO}},
         }
