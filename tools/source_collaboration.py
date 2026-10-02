@@ -304,7 +304,7 @@ def push(issue: int, expected_head: str, cwd: Path | None = None) -> dict[str, A
 
 def pulls(root_: Path, branch_: str) -> list[dict[str, Any]]:
     query = urllib.parse.urlencode({
-        "state": "open", "head": f"upiscium:{branch_}", "base": DEFAULT, "per_page": "100"
+        "state": "all", "head": f"upiscium:{branch_}", "per_page": "100"
     })
     value = gh_json(root_, "api", f"repos/{REPO}/pulls?{query}")
     if not isinstance(value, list):
@@ -338,7 +338,7 @@ def pr_create(issue: int, cwd: Path | None = None) -> dict[str, Any]:
         raise GuardError("push exact local HEAD before PR creation")
     found = pulls(ctx["root"], ctx["branch"])
     if len(found) > 1:
-        raise GuardError("multiple open PRs exist for source branch")
+        raise GuardError("multiple PR identities exist for source branch")
     created = False
     if not found:
         out = run(

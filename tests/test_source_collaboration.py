@@ -127,6 +127,21 @@ class SourceCollaborationTest(unittest.TestCase):
             with self.assertRaisesRegex(source.GuardError, "not bound to Issue #215"):
                 source.pr_create(215, self.root)
 
+    def test_pr_creation_refuses_human_closed_pr_identity(self) -> None:
+        current = git(self.root, "rev-parse", "HEAD")
+        pr = {
+            "number": 7, "html_url": "https://example/pr/7", "state": "closed", "draft": True,
+            "body": "Closes #215",
+            "head": {"ref": "feat/215-source-collaboration", "sha": current,
+                     "repo": {"full_name": source.REPO}},
+            "base": {"ref": "main", "repo": {"full_name": source.REPO}},
+        }
+        with mock.patch.object(source, "issue_meta", side_effect=self.issue), mock.patch.object(
+            source, "remote_head", return_value=current
+        ), mock.patch.object(source, "pulls", return_value=[pr]):
+            with self.assertRaisesRegex(source.GuardError, "PR is not open"):
+                source.pr_create(215, self.root)
+
     def test_push_recovers_lost_acknowledgement(self) -> None:
         current = git(self.root, "rev-parse", "HEAD")
         ctx = {
