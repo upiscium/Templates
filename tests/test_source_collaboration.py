@@ -111,6 +111,33 @@ class SourceCollaborationTest(unittest.TestCase):
         self.assertEqual("ADOPTED", result["status"])
         self.assertEqual(7, result["pr"])
 
+    def test_checkpoint_recovers_lost_acknowledgement(self) -> None:
+        current = git(self.root, "rev-parse", "HEAD")
+        ctx = {
+            "root": self.root, "issue": 215, "branch": "feat/215-source-collaboration",
+            "head": current, "title": "Source collaboration",
+        }
+        pr = {
+            "number": 7, "state": "open", "draft": True,
+            "head": {"ref": ctx["branch"], "sha": current, "repo": {"full_name": source.REPO}},
+            "base": {"ref": "main", "repo": {"full_name": source.REPO}},
+        }
+        body = "checkpoint"
+        marker = (
+            f"<!-- source-checkpoint:215:{current}:"
+            f"{source.hashlib.sha256(body.encode()).hexdigest()} -->"
+        )
+        api_values = iter([pr, [], [{"id": 88, "body": marker + "\ncheckpoint"}]])
+        failed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="lost ack")
+        with mock.patch.object(source, "context", return_value=ctx), mock.patch.object(
+            source, "require_clean"
+        ), mock.patch.object(source, "remote_head", return_value=current), mock.patch.object(
+            source, "gh_json", side_effect=lambda *args: next(api_values)
+        ), mock.patch.object(source, "run", return_value=failed):
+            result = source.checkpoint(215, 7, current, body, self.root)
+        self.assertEqual("POSTED", result["status"])
+        self.assertEqual(88, result["comment_id"])
+
 
 if __name__ == "__main__":
     unittest.main()
