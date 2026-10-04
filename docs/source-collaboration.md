@@ -53,6 +53,9 @@ and repositories are rejected. No shared `origin` configuration is rewritten.
 
 They require:
 
+- the supplied Task root and its Git administrative directory to be the same
+  registered Git worktree (a replaced `.git` pointer cannot impersonate another
+  Task's branch);
 - a named non-default branch;
 - the Issue number to be present as a numeric token in the branch name;
 - an open same-repository GitHub Issue;
@@ -83,17 +86,38 @@ The digest binds:
 - deletion state or file mode/size/content digest.
 
 Review the returned path inventory before committing. `templates-source commit` recomputes the
-manifest and refuses to stage anything if the digest changed.
+manifest and refuses to prepare a commit if the digest changed.
 
 The commit path also runs:
 
 ```sh
 git diff --check
 <installed parity checker> check --root <task-worktree>
-git diff --cached --check
+git diff --cached --check  # against a private index, not the shared Task index
 ```
 
-and stages only the paths bound by the manifest.
+The commit path hashes only reviewed bytes into a **private** index and creates a
+commit object with the exact reviewed tree and old HEAD as explicit parent. It
+never uses the real Task index as staging scratch: a concurrent same-path staged
+blob cannot be silently overwritten. Before updating the ref it acquires the
+worktree `index.lock` **then** `HEAD.lock`, checks that the shared index still
+equals the clean old HEAD tree, and rechecks the reviewed worktree scope.
+`HEAD.lock` alone is insufficient: real `git checkout` can mutate the index and
+worktree before failing its final HEAD update. The two-lock order fences Git's
+index changes first; any detected worktree change also fails closed. A Git
+old-OID compare-and-swap updates **only** the reviewed full Task branch ref.
+The ref update uses a detached temporary Git administrative directory sharing
+the same object/reference store; it cannot follow an ambient switched `HEAD`.
+Only after exact ref and unchanged-index/worktree re-observation does the
+prepared index replace the still-clean shared index. A post-CAS index or
+worktree conflict reports that the exact commit was applied but **requires
+reconciliation**; concurrent product work is retained. Do not reset or
+force-update to resolve a reported conflict. An exact committed ref is re-read
+even after a lost acknowledgement; an unrelated moved ref is never overwritten.
+`index.lock` is Git's cooperative lock: a process that directly rewrites Git's
+index file while ignoring its lock is outside the publication protocol. Detected
+such changes fail with reconciliation; no check-and-replace sequence can
+atomically protect against an uncooperative direct write in between.
 
 The protected bootstrap chain is `Justfile`, `just/source.just`,
 `tools/source_collaboration.py`, `tools/source_publication_launcher.sh`,
@@ -105,10 +129,12 @@ to the installed approved revision, fails closed. Moving that local ref cannot
 hide authority-changing commits: history is checked from the installed revision.
 Grafts and shallow history are rejected, and authority history is traversed
 through raw commit-parent records rather than Git's mutable revision walker.
-Staged blobs are rechecked against the reviewed scope
-digest before commit, not just staged path names. Staging hashes verified source
-bytes without Git filters and inserts exact blob IDs into the index; it does not
-run `git add` over candidate-controlled attributes or clean-filter configuration.
+Reviewed file blobs are rechecked against the reviewed scope digest, not just
+path names. Private preparation hashes verified source bytes without Git filters
+and inserts exact blob IDs only into the private index; it does not run `git add`
+over candidate-controlled attributes or clean-filter configuration. Real-index
+bytes staged by ordinary lock-respecting Git writers are preserved, not included
+or overwritten.
 The launcher ignores global/system Git config without modifying it, constrains
 local Git config, and disables hooks, fsmonitor and signing commands. Network
 Git operations use a private temporary bare repository with the candidate object
@@ -129,15 +155,26 @@ Git URL rewrite rules that would re-interpret this validated destination fail cl
 
 `templates-source pr-create` requires the remote branch to equal local HEAD. It creates a
 same-repository Draft PR against `main`, or adopts the one exact existing Draft PR for
-that branch. It does not mark the PR Ready or merge it.
+that branch. It scans **all** pages of repository PRs across open, closed and
+merged states, re-observes before creation and after a create attempt (including
+lost acknowledgements), and refuses an incompatible, Human-closed or ambiguous
+identity. It does not mark the PR Ready or merge it.
 
 ## Checkpoints
 
 `templates-source checkpoint` verifies the exact open PR, branch, repository, base, remote HEAD,
 and local HEAD before posting.
 
-The command adds a deterministic hidden marker to the comment. Retrying the same exact
-checkpoint is idempotent instead of duplicating the comment.
+The command adds a deterministic hidden marker to the comment. It scans all
+comment pages and accepts only an exact comment body bound to the verified PR,
+HEAD, repository, and the **numeric GitHub ID** of the currently authenticated
+publication principal (not just a copied marker or login string). A participant
+copying the marker cannot impersonate that principal. Equivalent concurrent
+posts by that principal use the lowest GitHub comment ID as the one canonical
+checkpoint; conflicting trusted bodies fail instead of being silently merged.
+After posting, including a lost acknowledgement, the principal, PR and full
+comment history are re-observed before reporting success. Retrying an exact
+checkpoint is idempotent instead of duplicating an authoritative comment.
 
 Checkpoint text is durable collaboration context, not private chain-of-thought or raw
 tool logs.
@@ -145,11 +182,12 @@ tool logs.
 ## Bootstrap
 
 The initial `source::*` landing was bootstrapped by Templates Issue #215. Issue #219
-changes that authority and likewise requires an explicit, independently reviewed
-maintainer/Admin bootstrap: the current live recipes must **not** publish this fix.
-Only after #219 lands and the approved revision is pinned outside Task worktrees
-should ordinary Templates source publication use the installed launcher instead
-of live recipes or raw `git add`, `git commit`, `git push`, or `gh pr create`.
+established the installed authority; #220 modifies that protected authority and
+likewise requires an independently reviewed maintainer/Admin bootstrap. Neither
+the live recipes nor the previously approved installed authority may publish
+its own #220 upgrade. Ordinary source Tasks use only the independently approved,
+pinned installed launcher instead of live recipes or raw `git add`, `git commit`,
+`git push`, or `gh pr create`.
 
 This bootstrap does not authorize publication or reuse of stale pre-v4 AgentCore
 implementation work.
