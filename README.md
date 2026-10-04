@@ -181,7 +181,10 @@ Main schedules Tasks. Each Task owns one branch, one repo-local worktree under `
 For downstream-sensitive Agent Core changes, use the documented release gate
 from Issue through exact-revision AKV dogfood and post-merge tree equality:
 [`docs/agent-core-release-gate.md`](docs/agent-core-release-gate.md). It is
-human-gated and does not automate merge or release publication.
+human-gated and does not automate merge or release publication. This existing
+versionless historical check is not the future v4 Agent Core SemVer release
+gate and does not make current Agent Core VERSION 3 a stable SemVer release;
+see [`docs/agent-core-versioning.md`](docs/agent-core-versioning.md).
 
 Typical flow:
 
@@ -382,7 +385,17 @@ Inspect them through:
 just automation::version
 ```
 
-`UPSTREAM` records the canonical Templates repository/ref/component. Breaking Agent Core changes require a VERSION change and migration notes; compatible implementation/documentation changes may remain within the current version.
+`UPSTREAM` records the canonical Templates repository/ref/component. The
+currently distributed Agent Core `.automation/VERSION` is integer `3`, not
+SemVer `3.0.0`, and current Agent Core is not claimed as a stable SemVer
+release. The planned first stable Agent Core version is `1.0.0`, initially
+alongside but independently versioned from Templates `4.0.0`; internal
+architecture v4 is not public SemVer major 4. See
+[`docs/agent-core-versioning.md`](docs/agent-core-versioning.md) for the
+planned MAJOR/MINOR/PATCH policy, legacy-marker boundary, and future release
+identity checks. `just agent-core::release-identity-check` is a read-only
+local check of an exact clean commit, not a release gate; the current planned
+v3 checkout intentionally cannot pass it.
 
 ## Read-only update check
 
