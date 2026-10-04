@@ -1,0 +1,12 @@
+{
+  "schema": "agent-core-release-identity",
+  "schemaVersion": 1,
+  "agentCore": {
+    "version": "1.0.0",
+    "architecture": "v4",
+    "status": "planned"
+  },
+  "templates": {
+    "version": "4.0.0"
+  }
+}

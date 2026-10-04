@@ -2,6 +2,7 @@ root := justfile_directory()
 tool := root / "tools/automation_recovery_bridge.py"
 release_gate := root / "tools/agent_core_release_gate.py"
 release_gate_launcher := root / "tools/run_agent_core_release_gate.sh"
+release_identity_check := root / "tools/check_agent_core_release_identity.py"
 set shell := ["/bin/sh", "-cu"]
 
 [working-directory: root]
@@ -31,6 +32,10 @@ dogfood-evidence-record pr operation task="" downstream_pr="":
 [working-directory: root]
 release-gate-check pr merge_commit dogfood_head dogfood_tree version="":
     /bin/sh {{quote(release_gate_launcher)}} {{quote(release_gate)}} release-gate-check {{quote(pr)}} {{quote(merge_commit)}} {{quote(dogfood_head)}} {{quote(dogfood_tree)}} --version {{quote(version)}}
+
+[working-directory: root]
+release-identity-check previous_release_source_revision="":
+    if [ -n {{quote(previous_release_source_revision)}} ]; then /bin/sh {{quote(release_gate_launcher)}} {{quote(release_identity_check)}} {{quote(previous_release_source_revision)}}; else /bin/sh {{quote(release_gate_launcher)}} {{quote(release_identity_check)}} --; fi
 
 [working-directory: root]
 recover-task-contract-from-issue target issue:

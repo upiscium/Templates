@@ -46,6 +46,28 @@ Issue -> Draft PR -> full CI/review/security
   `agent-core::maintenance-finalize` when an older consumer needs the
   source-side bridge; it is not a place to edit or commit the candidate.
 
+## Agent Core SemVer boundary
+
+This document describes the existing Templates PR, CI, dogfood, and
+post-merge tree-equality gate. It is a versionless historical check with
+respect to Agent Core SemVer: it is **not** the future v4 Agent Core release
+gate, does not make the currently distributed integer `VERSION` 3 a stable
+SemVer release, and does not establish that a v4 release is ready. The optional
+`[version]` in `release-gate-check` is only for its existing GitHub
+Release/tag-absence assertion; it is not an Agent Core SemVer identity check.
+
+The future policy and read-only local identity check are documented in
+[`agent-core-versioning.md`](agent-core-versioning.md). A future candidate
+must match its installed version marker and its exact
+`components/agent-core` payload/source revision identity; evidence must bind
+`agentCoreVersion`, `agentCorePayload`, and `templatesSourceRevision` to CI
+and dogfood of that exact candidate. A `planned` release identity is never
+release-ready. `just agent-core::release-identity-check` performs the local
+version/payload comparison, but it is not yet wired to this historical gate
+and does not establish the prior published-release identity on its own. Issue
+#141 owns the full future matrix and binding evidence; issue #142 owns the
+Admin cutover. This gate does not implement or assert those future checks.
+
 ## Intended Just surfaces
 
 These are the narrow operator surfaces for the release gate:
@@ -219,7 +241,8 @@ merge tree: 0eeaad174d2ff519a2db4b23ac80252c48d6bec7
 
 It is historical documentation, not a production input or a substitute for
 current CI, review, security, dogfood, or human merge evidence. Agent Core
-`VERSION` remains **3**.
+`VERSION` was integer **3** at the time of this fixture; this is not an Agent
+Core SemVer release identity.
 
 ## Issue #117 legacy compatibility binding
 
