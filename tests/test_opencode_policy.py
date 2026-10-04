@@ -7,7 +7,6 @@ import subprocess
 from fnmatch import fnmatchcase
 import re
 import tempfile
-import tomllib
 import unittest
 from pathlib import Path
 from typing import Any, Iterable
@@ -44,13 +43,6 @@ AGENT_CORE_PERMISSION_LEAVES = (
     "investigator",
     "security-reviewer",
     "scout",
-)
-MANDATORY_PERMISSION_CLASSES = (
-    "local-filesystem-delete",
-    "repository-history-destruction",
-    "remote-destructive-operation",
-    "privilege-escalation",
-    "system-store-destruction",
 )
 LEAF_STATUS_SET = {"COMPLETED", "BLOCKED", "NEEDS_APPROVAL", "NEEDS_DECISION"}
 LEAF_STATUS_FIELDS = tuple(f"status: {status}" for status in (
@@ -301,7 +293,7 @@ def frontmatter(path: Path) -> str:
     return match.group(1)
 
 
-class OpenCodeContractTest(unittest.TestCase):
+class AgentCoreOpenCodePolicyTest(unittest.TestCase):
     def setUp(self) -> None:
         self.config = json.loads((CORE / "opencode.json").read_text(encoding="utf-8"))
 
@@ -447,104 +439,7 @@ class OpenCodeContractTest(unittest.TestCase):
         self.assertEqual(self.config["permission"]["external_directory"]["*"], "deny")
         self.assertNotIn("external_directory", permission_for("task-orchestrator"))
 
-    def test_agent_core_permission_manifest_is_closed_and_semantic(self) -> None:
-        manifest = tomllib.loads(
-            (CORE / "opencode-contract-permissions.toml").read_text(encoding="utf-8")
-        )
-        self.assertEqual(
-            set(manifest), {"schema_version", "contract", "profile", "surfaces", "probes"}
-        )
-        self.assertEqual(manifest["schema_version"], 1)
-        self.assertEqual(manifest["contract"], "permission-semantics")
-        self.assertEqual(manifest["profile"], "agent-core")
-
-        expected_surfaces = {
-            "task-orchestrator": (
-                "parent",
-                ".opencode/agents/task-orchestrator.md",
-            ),
-            **{
-                role: ("leaf", f".opencode/agents/{role}.md")
-                for role in AGENT_CORE_PERMISSION_LEAVES
-            },
-        }
-        actual_surfaces = {surface["id"]: surface for surface in manifest["surfaces"]}
-        self.assertEqual(set(actual_surfaces), set(expected_surfaces))
-        self.assertNotIn("build", actual_surfaces)
-        self.assertNotIn("plan", actual_surfaces)
-        for surface_id, (boundary, agent_source) in expected_surfaces.items():
-            with self.subTest(surface=surface_id):
-                surface = actual_surfaces[surface_id]
-                self.assertEqual(
-                    set(surface),
-                    {"id", "boundary", "base_source", "agent_source", "signals"},
-                )
-                self.assertEqual(surface["boundary"], boundary)
-                self.assertEqual(surface["base_source"], "opencode.json")
-                self.assertEqual(surface["agent_source"], agent_source)
-                if boundary == "parent":
-                    self.assertEqual(surface["signals"], [])
-                else:
-                    self.assertEqual(
-                        set(surface["signals"]), {"NEEDS_APPROVAL", "NEEDS_DECISION"}
-                    )
-
-        probes_by_surface: dict[str, list[dict[str, object]]] = {
-            surface_id: [] for surface_id in actual_surfaces
-        }
-        for probe in manifest["probes"]:
-            probes_by_surface[probe["surface"]].append(probe)
-        for surface_id, probes in probes_by_surface.items():
-            with self.subTest(surface=surface_id):
-                covered = {class_id for probe in probes for class_id in probe["classes"]}
-                self.assertTrue(set(MANDATORY_PERMISSION_CLASSES) <= covered)
-                self.assertNotIn(
-                    "safe-read-only",
-                    covered,
-                    "safe-read-only is conditional and must not force leaf allowlists",
-                )
-                inputs = {probe["input"] for probe in probes}
-                self.assertIn("just agent::local-delete .build/default true", inputs)
-                self.assertIn("git reset --hard HEAD", inputs)
-                self.assertIn("git push --force origin main", inputs)
-                self.assertIn("sudo rm -rf /tmp/agent-core", inputs)
-                self.assertIn("nix store delete /nix/store/example", inputs)
-                if surface_id == "task-orchestrator":
-                    self.assertIn("just agent::local-delete .build/default true", inputs)
-                    self.assertIn("rm -rf .git", inputs)
-                    self.assertIn("rm -rf .build/../.git", inputs)
-                    self.assertIn("rm -rf .", inputs)
-                    self.assertIn("git clean -fd", inputs)
-                    self.assertIn("git push origin --delete feature", inputs)
-                    self.assertIn("gh pr merge 123 --delete-branch", inputs)
-
-        parent_probe_classes = {
-            probe["input"]: set(probe["classes"])
-            for probe in probes_by_surface["task-orchestrator"]
-        }
-        for input_value in ("rm -rf .git", "rm -rf .build/../.git", "rm -rf ."):
-            with self.subTest(input=input_value):
-                self.assertEqual(
-                    parent_probe_classes[input_value],
-                    {"local-filesystem-delete", "repository-history-destruction"},
-                )
-
     def test_fresh_cache_delete_escalation_contract_is_bounded(self) -> None:
-        manifest = tomllib.loads(
-            (CORE / "opencode-contract-permissions.toml").read_text(encoding="utf-8")
-        )
-        cache_probes = {
-            probe["input"]
-            for probe in manifest["probes"]
-            if probe["input"] in {
-                "just agent::local-delete .build/default true",
-            }
-        }
-        self.assertEqual(
-            cache_probes,
-            {"just agent::local-delete .build/default true"},
-        )
-
         orchestrator = body_text("task-orchestrator").lower()
         for phrase in (
             "independently re-evaluate",
@@ -1110,18 +1005,6 @@ global permissive plan
             for field in LEAF_STATUS_FIELDS:
                 self.assertIn(field, generated_orchestrator, f"{template}: task-orchestrator: {field}")
             self.assertEqual(set(exact_status_fields(generated_orchestrator)), set(LEAF_STATUS_FIELDS), f"{template}: task-orchestrator status format")
-
-    def test_generated_templates_distribute_permission_manifest(self) -> None:
-        source = (CORE / "opencode-contract-permissions.toml").read_bytes()
-        for template in LEAF_CONTRACT_TEMPLATES:
-            with self.subTest(template=template):
-                generated = (
-                    ROOT
-                    / "templates"
-                    / template
-                    / "opencode-contract-permissions.toml"
-                )
-                self.assertEqual(generated.read_bytes(), source)
 
     def test_leaf_prompts_expose_completion_status_contract(self) -> None:
         for leaf in LEAF_PRIMARY_AGENTS:

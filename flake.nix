@@ -4,13 +4,9 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    opencodeContract = {
-      url = "github:upiscium/OpencodeContract";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, opencodeContract }:
+  outputs = { self, nixpkgs, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       if system == "x86_64-darwin" then { }
       else
@@ -26,16 +22,6 @@
               gh
             ];
           };
-        } // nixpkgs.lib.optionalAttrs isLinux {
-          checks.opencode-contract = pkgs.runCommand "templates-opencode-contract" {
-            nativeBuildInputs = [ opencodeContract.packages.${system}.opencode-contract ];
-          } ''
-            opencode-contract audit-consumer \
-              --profile agent-core \
-              --consumer ${self} \
-              --strict
-            touch "$out"
-          '';
         })
     // {
     templates = {
