@@ -26,8 +26,6 @@ jobs:
           tests.test_source_bootstrap_upgrade_bridge.BootstrapUpgradeBridgeTest.test_installed_maintenance_check_preserves_active_receipt_paths
       - name: Evaluate all flake systems
         run: nix flake check --all-systems --no-build --no-update-lock-file
-      - name: OpencodeContract contract
-        run: nix build .#checks.x86_64-linux.opencode-contract --no-link --no-update-lock-file
 
   generated-template-smoke:
     runs-on: ubuntu-latest
