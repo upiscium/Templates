@@ -11,7 +11,9 @@
   };
 
   outputs = { self, nixpkgs, flake-utils, opencodeContract }:
-    flake-utils.lib.eachDefaultSystem (system:
+    let
+      trustedRevision = if self ? rev then self.rev else "0000000000000000000000000000000000000000";
+    in flake-utils.lib.eachDefaultSystem (system:
       if system == "x86_64-darwin" then { }
       else
         let
@@ -26,6 +28,24 @@
               gh
             ];
           };
+          packages.source-collaboration = pkgs.runCommand "templates-source-collaboration" {
+            meta.mainProgram = "templates-source";
+          } ''
+            mkdir -p "$out/bin" "$out/lib/templates-source"
+            substitute ${./tools/source_collaboration.py} "$out/lib/templates-source/source_collaboration.py" \
+              --replace-fail '@TRUSTED_SOURCE_BASE@' '${trustedRevision}' \
+              --replace-fail '@TRUSTED_GIT@' '${pkgs.git}/bin/git' \
+              --replace-fail '@TRUSTED_GH@' '${pkgs.gh}/bin/gh' \
+              --replace-fail '@TRUSTED_PATH@' '${nixpkgs.lib.makeBinPath [ pkgs.git pkgs.gh pkgs.openssh pkgs.python3 ]}' \
+              --replace-fail '#!/usr/bin/env python3' '#!${pkgs.python3}/bin/python3 -I'
+            cp ${./tools/render_templates.py} "$out/lib/templates-source/render_templates.py"
+            substitute ${./tools/source_publication_launcher.sh} "$out/bin/templates-source" \
+              --replace-fail '@PYTHON@' '${pkgs.python3}/bin/python3' \
+              --replace-fail '@PAYLOAD@' "$out/lib/templates-source/source_collaboration.py" \
+              --replace-fail '@PATH@' '${nixpkgs.lib.makeBinPath [ pkgs.git pkgs.gh pkgs.openssh pkgs.python3 ]}'
+            chmod 755 "$out/lib/templates-source/source_collaboration.py"
+            chmod 755 "$out/bin/templates-source"
+          '';
         } // nixpkgs.lib.optionalAttrs isLinux {
           checks.opencode-contract = pkgs.runCommand "templates-opencode-contract" {
             nativeBuildInputs = [ opencodeContract.packages.${system}.opencode-contract ];
