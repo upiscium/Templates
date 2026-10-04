@@ -1,23 +1,16 @@
-root := justfile_directory()
-tool := root / "tools/source_collaboration.py"
-set shell := ["/bin/sh", "-cu"]
-
-[working-directory: root]
+# Mutable Just recipes cannot authenticate themselves. Do not route publication
+# through this worktree: invoke the approved store-installed templates-source.
 publication-check issue:
-    python3 -I {{quote(tool)}} publication-check {{quote(issue)}}
+    @printf '%s\n' 'source::* is not a publication authority; use the approved installed templates-source' >&2; exit 2
 
-[working-directory: root]
 commit issue scope_digest message:
-    python3 -I {{quote(tool)}} commit {{quote(issue)}} {{quote(scope_digest)}} {{quote(message)}}
+    @printf '%s\n' 'source::* is not a publication authority; use the approved installed templates-source' >&2; exit 2
 
-[working-directory: root]
 push issue expected_head:
-    python3 -I {{quote(tool)}} push {{quote(issue)}} {{quote(expected_head)}}
+    @printf '%s\n' 'source::* is not a publication authority; use the approved installed templates-source' >&2; exit 2
 
-[working-directory: root]
 pr-create issue:
-    python3 -I {{quote(tool)}} pr-create {{quote(issue)}}
+    @printf '%s\n' 'source::* is not a publication authority; use the approved installed templates-source' >&2; exit 2
 
-[working-directory: root]
 checkpoint issue pr expected_head body:
-    python3 -I {{quote(tool)}} checkpoint {{quote(issue)}} {{quote(pr)}} {{quote(expected_head)}} {{quote(body)}}
+    @printf '%s\n' 'source::* is not a publication authority; use the approved installed templates-source' >&2; exit 2

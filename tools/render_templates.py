@@ -283,13 +283,14 @@ def build_parser() -> argparse.ArgumentParser:
     render = subparsers.add_parser("render", help="render one template")
     render.add_argument("template")
     subparsers.add_parser("render-all", help="render all registered templates")
-    subparsers.add_parser("check", help="check committed generated templates for drift")
+    check = subparsers.add_parser("check", help="check committed generated templates for drift")
+    check.add_argument("--root", type=Path, help="source worktree to check (trusted launcher only)")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    root = repository_root()
+    root = args.root.resolve() if args.command == "check" and args.root else repository_root()
     try:
         if args.command == "render":
             return command_render(root, args.template)
