@@ -507,6 +507,41 @@ class MetadataStore:
         except codec.MetadataCodecError as error:
             raise MetadataRefError("metadata object does not match the requested identity") from error
 
+    @_bounded_metadata_operation
+    def read_record(self, commit: str, task: str) -> tuple[str, dict[str, Any]] | None:
+        """Resolve a Task pointer in one exact reachable metadata commit.
+
+        Payload semantics and Contract links remain the responsibility of #191.
+        Absence is not a disposition or a claim about current product facts.
+        """
+        self._validate_git_oid(commit, "commit")
+        self._validate_task(task)
+        tip = self._observe_remote()
+        if tip is None:
+            raise MetadataRefError("metadata ref does not exist")
+        tip_snapshot = self._validate_full_history(tip)
+        snapshot = self._read_tree_snapshot(commit)
+        self._validate_compatible_advance(
+            commit, tip, snapshot, tip_snapshot, protected_tasks={},
+        )
+        object_id = snapshot.pointers.get(task)
+        if object_id is None:
+            return None
+        stored = snapshot.objects[codec.object_path("task-record", object_id)]
+        return object_id, codec.decode_object(
+            stored.data, expected_id=object_id, expected_repository=self.repository,
+            expected_task=task, expected_kind="task-record",
+        )
+
+    def validate_base_revision(self, revision: str) -> None:
+        """Validate an exact creation-base commit, without inspecting current HEAD.
+
+        This is a creation check, not a lasting branch ancestry requirement.
+        """
+        self._validate_git_oid(revision, "base revision")
+        if self._git(["cat-file", "-t", revision], max_stdout=32).strip() != b"commit":
+            raise MetadataRefError("base revision must identify a commit")
+
     def _prepare_objects(self, objects: Sequence[bytes]) -> dict[str, _StoredObject]:
         if not isinstance(objects, Sequence) or isinstance(objects, (bytes, bytearray, str)):
             raise MetadataRefError("objects must be a finite sequence of canonical envelope bytes")
