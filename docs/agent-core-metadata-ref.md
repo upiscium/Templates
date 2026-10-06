@@ -9,6 +9,10 @@ metadata module. It does not define the meaning of Task Records, Contracts,
 Evidence, Task Views, Git-derived identity, PRs, or checkpoints. Those semantics
 remain with the owning issues listed below.
 
+The staged #191 [Task Record and Issue contract capability](agent-core-task-record.md)
+now supplies closed payload schemas and a narrow semantic authorization boundary.
+It does not activate the v4 runtime or relax the transport/publication gates below.
+
 ## 1. Scope and ownership
 
 The metadata module stores its complete Git-visible history behind exactly one
