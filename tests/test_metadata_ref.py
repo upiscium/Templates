@@ -562,6 +562,94 @@ class MetadataRefTest(unittest.TestCase):
         with self.assertRaises(MetadataRefError):
             reader.confirm(commit, required_objects=(("evidence", evidence_id, "217", "b" * 40),))
 
+    def test_read_object_by_id_resolves_objects_across_tasks_and_subjects(self) -> None:
+        first_id, first_data = codec.encode_object(
+            "evidence", "acme/widgets", "101", "a" * 40,
+            {"supersedes": "prior-evidence"},
+        )
+        second_id, second_data = codec.encode_object(
+            "contract", "acme/widgets", "202", "b" * 40,
+            {"supersedes": "prior-contract"},
+        )
+        commit = self.store.publish([first_data, second_data])
+
+        for kind, object_id, task, subject in (
+            ("evidence", first_id, "101", "a" * 40),
+            ("contract", second_id, "202", "b" * 40),
+        ):
+            with self.subTest(kind=kind):
+                decoded = self.store.read_object_by_id(commit, kind, object_id)
+                self.assertEqual(task, decoded["task"])
+                self.assertEqual(subject, decoded["subject"])
+
+    def test_read_object_by_id_rejects_unknown_wrong_kind_and_invalid_identity(self) -> None:
+        object_id, data = self._object("evidence", "101", {"id": True})
+        commit = self.store.publish([data])
+
+        for kind, requested_id in (
+            ("evidence", "0" * 64),
+            ("contract", object_id),
+            ("evidence", "not-a-metadata-id"),
+            ("unknown", object_id),
+        ):
+            with self.subTest(kind=kind, object_id=requested_id):
+                with self.assertRaises(MetadataRefError):
+                    self.store.read_object_by_id(commit, kind, requested_id)
+
+    def test_read_object_by_id_rejects_unreachable_and_malformed_commits(self) -> None:
+        object_id, data = self._object("evidence", "101", {"reachable": True})
+        tip = self.store.publish([data])
+        unreachable = self._create_remote_child(tip)
+
+        with self.assertRaises(MetadataConflictError):
+            self.store.read_object_by_id(unreachable, "evidence", object_id)
+
+        malformed = git(
+            "hash-object", "--literally", "-t", "commit", "-w", "--stdin",
+            cwd=self.product, input_data=b"not a valid commit object\n",
+        ).decode("ascii").strip()
+        with self.assertRaisesRegex(MetadataRefError, "malformed commit"):
+            self.store.read_object_by_id(malformed, "evidence", object_id)
+
+    def test_read_object_by_id_rejects_corruption_and_another_repository(self) -> None:
+        object_id, data = self._object("evidence", "101", {"safe": True})
+        tip = self.store.publish([data])
+        corrupt = self._create_remote_child(
+            tip,
+            additions=((codec.object_path("evidence", object_id), b"tampered bytes", "100644"),),
+        )
+        self._set_remote_tip(corrupt, tip)
+        with self.assertRaises(MetadataRefError):
+            self.store.read_object_by_id(corrupt, "evidence", object_id)
+
+        self._set_remote_tip(tip, corrupt)
+        other_repository = MetadataStore(self.product, "acme/other")
+        with self.assertRaises(MetadataRefError):
+            other_repository.read_object_by_id(tip, "evidence", object_id)
+
+    def test_read_object_remains_bound_to_required_task_and_subject(self) -> None:
+        object_id, data = codec.encode_object(
+            "evidence", "acme/widgets", "101", "a" * 40, {"bound": True}
+        )
+        commit = self.store.publish([data])
+        self.assertEqual(
+            {"bound": True},
+            self.store.read_object(
+                commit, "evidence", object_id, task="101", subject="a" * 40
+            )["payload"],
+        )
+
+        with self.assertRaises(MetadataRefError):
+            self.store.read_object(
+                commit, "evidence", object_id, task="202", subject="a" * 40
+            )
+        with self.assertRaises(MetadataRefError):
+            self.store.read_object(
+                commit, "evidence", object_id, task="101", subject="b" * 40
+            )
+        with self.assertRaises(TypeError):
+            self.store.read_object(commit, "evidence", object_id)  # type: ignore[call-arg]
+
     def test_competing_disjoint_task_updates_reconstruct_on_winning_tip(self) -> None:
         competing_store = self._writer()
         first_id, first_data = self._object("task-record", "101", {"writer": "first"})
@@ -1057,6 +1145,44 @@ class MetadataRefTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(MetadataRefError, "validation time limit"):
                 self.store.read_object(first, "evidence", object_id, task="1", subject=subject)
+
+    def test_read_by_id_uses_bounded_ancestry_validation(self) -> None:
+        object_id, first_data = self._object("evidence", "1", {"first": True})
+        first = self.store.publish([first_data])
+        _next_id, next_data = self._object("evidence", "2", {"second": True})
+        tip = self.store.publish([next_data])
+        tip_snapshot = self.store._read_tree_snapshot(tip)
+        original_read_tree = self.store._read_tree_snapshot
+
+        def slow_ancestry_read(commit: str):
+            time.sleep(0.02)
+            return original_read_tree(commit)
+
+        with mock.patch.object(metadata_ref_module, "MAX_HISTORY_VALIDATION_SECONDS", 0.01), mock.patch.object(
+            self.store, "_observe_remote", return_value=tip
+        ), mock.patch.object(
+            self.store, "_validate_full_history", return_value=tip_snapshot
+        ), mock.patch.object(
+            self.store, "_read_tree_snapshot", side_effect=slow_ancestry_read
+        ):
+            with self.assertRaisesRegex(MetadataRefError, "validation time limit"):
+                self.store.read_object_by_id(first, "evidence", object_id)
+
+    def test_validation_scope_preserves_nested_deadline_and_restores_context(self) -> None:
+        self.assertIsNone(self.store._validation_deadline.get())
+        with self.store.validation_scope():
+            deadline = self.store._validation_deadline.get()
+            self.assertIsNotNone(deadline)
+            with self.store.validation_scope():
+                self.assertEqual(deadline, self.store._validation_deadline.get())
+            self.assertEqual(deadline, self.store._validation_deadline.get())
+        self.assertIsNone(self.store._validation_deadline.get())
+
+        with mock.patch.object(metadata_ref_module, "MAX_HISTORY_VALIDATION_SECONDS", 0.01):
+            with self.assertRaisesRegex(MetadataRefError, "validation time limit"):
+                with self.store.validation_scope():
+                    time.sleep(0.02)
+        self.assertIsNone(self.store._validation_deadline.get())
 
     def test_remote_failure_and_unreachable_push_never_return_a_checkpoint_oid(self) -> None:
         missing_remote = self.temp_root / "missing.git"

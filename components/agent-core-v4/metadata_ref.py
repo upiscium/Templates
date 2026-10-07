@@ -19,7 +19,8 @@ import stat
 import subprocess
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -460,6 +461,23 @@ class MetadataStore:
             result.append((kind, object_id, task, subject))
         return result
 
+    @contextmanager
+    def validation_scope(self) -> Iterator[None]:
+        """Share the existing Git/history deadline across a capability's reads.
+
+        Nested scopes cannot extend an inherited deadline. This is an ephemeral
+        resource bound, not Task authority or a persistence/publication API.
+        """
+        previous = self._validation_deadline.get()
+        deadline = previous if previous is not None else time.monotonic() + MAX_HISTORY_VALIDATION_SECONDS
+        token = self._validation_deadline.set(deadline)
+        try:
+            yield
+            if time.monotonic() > deadline:
+                raise MetadataRefError("metadata validation time limit exceeded")
+        finally:
+            self._validation_deadline.reset(token)
+
     @_bounded_metadata_operation
     def read_object(
         self,
@@ -471,13 +489,40 @@ class MetadataStore:
         subject: str,
     ) -> dict[str, Any]:
         """Read one object from an exact, remotely reachable metadata commit."""
+        return self._read_object(
+            commit,
+            kind,
+            object_id,
+            expected_identity=(task, subject),
+        )
+
+    @_bounded_metadata_operation
+    def read_object_by_id(
+        self, commit: str, kind: str, object_id: str
+    ) -> dict[str, Any]:
+        """Read an exact reachable object by immutable ID, without task bindings."""
+        return self._read_object(commit, kind, object_id, expected_identity=None)
+
+    def _read_object(
+        self,
+        commit: str,
+        kind: str,
+        object_id: str,
+        *,
+        expected_identity: tuple[str, str] | None,
+    ) -> dict[str, Any]:
+        """Share exact-commit reachability and content-addressed object checks."""
         self._validate_git_oid(commit, "commit")
         try:
             path = codec.object_path(kind, object_id)
         except (codec.MetadataCodecError, TypeError) as error:
             raise MetadataRefError("invalid metadata object identity") from error
-        self._validate_task(task)
-        self._validate_git_oid(subject, "subject")
+        expected_task: str | None = None
+        expected_subject: str | None = None
+        if expected_identity is not None:
+            expected_task, expected_subject = expected_identity
+            self._validate_task(expected_task)
+            self._validate_git_oid(expected_subject, "subject")
 
         tip = self._observe_remote()
         if tip is None:
@@ -500,8 +545,8 @@ class MetadataStore:
                 stored.data,
                 expected_id=object_id,
                 expected_repository=self.repository,
-                expected_task=task,
-                expected_subject=subject,
+                expected_task=expected_task,
+                expected_subject=expected_subject,
                 expected_kind=kind,
             )
         except codec.MetadataCodecError as error:
