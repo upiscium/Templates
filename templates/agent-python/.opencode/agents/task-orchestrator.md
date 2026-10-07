@@ -2,8 +2,8 @@
 description: Owns one Task, its Work Units, verification, commit, and PR preparation
 mode: subagent
 hidden: true
-model: openai/gpt-6-luna
-reasoningEffort: max
+model: openai/gpt-6.1-sol
+reasoningEffort: high
 permission:
   question: allow
   task:

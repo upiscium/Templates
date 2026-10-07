@@ -2,7 +2,7 @@
 description: Executes project-standard verification without modifying source
 mode: subagent
 model: openai/gpt-6-luna
-reasoningEffort: max
+reasoningEffort: medium
 permission:
   edit: deny
   task: deny

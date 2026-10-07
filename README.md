@@ -174,7 +174,7 @@ Adoption/migration never commits, pushes, merges, stashes, or resets the target 
 
 ## Planning Agent
 
-Generated Agent-ready repositories include a repository-local `plan` agent for read-only planning. It is primary, uses `openai/gpt-6-luna`, denies `edit` and `bash`, allows `question` for consequential requirement clarification, and may delegate only to read-only inspection leaves: `explore`, `architect`, `reviewer`, and `security-reviewer`.
+Generated Agent-ready repositories include a repository-local `plan` agent for read-only planning. It is primary, uses `openai/gpt-6.1-sol` at high effort, denies `edit` and `bash`, allows `question` for consequential requirement clarification, and may delegate only to read-only inspection leaves: `explore`, `architect`, `reviewer`, and `security-reviewer`.
 
 `plan` never starts the Task lifecycle, edits Task State, runs executable doctor/check commands, or reports unexecuted verification as PASS. It reads `AGENTS.md`, `.automation/INIT.md`, adapter initialization guidance, and optional Task State, then returns confirmed facts, assumptions, open decisions, a bounded implementation plan, `execution_prerequisites`, and `verification_handoff` entries for an execution-capable workflow.
 
@@ -346,7 +346,7 @@ receive this exception. A private cleanup receipt and expected-OID ref deletion
 make the worktree-removal/branch-removal tail retryable. The operation remains
 Main-owned, human-approved, and Agent Core VERSION 3.
 
-Each role uses one fixed GPT-5.6 model. Agent Core does not substitute models or retry an objective under another model. If the configured provider/model is unavailable, preserve Task and Work Unit evidence, report the exact failure, and return `BLOCKED`.
+Each role has one configured model and effort as documented in [model availability](docs/model-availability.md). Agent Core does not substitute models or retry an objective under another model. If the configured provider/model is unavailable, preserve Task and Work Unit evidence, report the exact failure, and return `BLOCKED`.
 
 Task Orchestrators autonomously drive the persisted Work Unit loop through the
 guarded `work-unit-next`, `work-unit-create`, and `work-unit-dispatch-check`
@@ -766,4 +766,4 @@ just template::distribution-verify
 
 ## OpenCode hierarchy
 
-The default Main agent orchestrates Tasks; Task Orchestrators own one Task; leaf agents perform bounded work and cannot re-delegate. Configured role models are fixed and fail closed when unavailable. Depth-2 Ask behavior has a separate reproducible manual smoke procedure under `docs/opencode-depth2-ask-smoke.md` and is not represented as PASS until executed.
+The default Main agent orchestrates Tasks; Task Orchestrators own one Task; leaf agents perform bounded work and cannot re-delegate. Configured role model and effort assignments are fixed and fail closed when unavailable. Depth-2 Ask behavior has a separate reproducible manual smoke procedure under `docs/opencode-depth2-ask-smoke.md` and is not represented as PASS until executed.
