@@ -131,6 +131,11 @@ in [`docs/agent-core-operation-prerequisites.md`](docs/agent-core-operation-prer
 It diagnoses only the requested operation and creates no global Task status,
 canonical next action, execution authority, or runtime activation.
 
+The staged Task-start Git/GitHub collaboration capability is documented in
+[`docs/agent-core-task-collaboration.md`](docs/agent-core-task-collaboration.md).
+It establishes the durable Draft PR/checkpoint surface early, without legacy
+publication phases, merge/Ready authority, or runtime activation.
+
 ## Initialization
 
 Bootstrap, GitHub repository policy setup, and session initialization are intentionally separate. Concrete language/toolchain adapters use the bootstrap step; `agent-base` skips it because it has no bootstrap-owned project state:
