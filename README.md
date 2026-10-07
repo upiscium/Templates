@@ -126,6 +126,11 @@ Snapshots are documented in
 [`docs/agent-core-task-view.md`](docs/agent-core-task-view.md). They use the
 metadata plane only and do not activate v4 or own readiness/evaluation policy.
 
+The staged requested-operation prerequisite diagnosis substrate is documented
+in [`docs/agent-core-operation-prerequisites.md`](docs/agent-core-operation-prerequisites.md).
+It diagnoses only the requested operation and creates no global Task status,
+canonical next action, execution authority, or runtime activation.
+
 ## Initialization
 
 Bootstrap, GitHub repository policy setup, and session initialization are intentionally separate. Concrete language/toolchain adapters use the bootstrap step; `agent-base` skips it because it has no bootstrap-owned project state:
