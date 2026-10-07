@@ -121,6 +121,11 @@ The staged Agent Core 1.0.0 metadata-reference protocol (not active in the
 VERSION 3 runtime) is documented in
 [`docs/agent-core-metadata-ref.md`](docs/agent-core-metadata-ref.md).
 
+The staged deterministic factual Task View and immutable exact-subject handoff
+Snapshots are documented in
+[`docs/agent-core-task-view.md`](docs/agent-core-task-view.md). They use the
+metadata plane only and do not activate v4 or own readiness/evaluation policy.
+
 ## Initialization
 
 Bootstrap, GitHub repository policy setup, and session initialization are intentionally separate. Concrete language/toolchain adapters use the bootstrap step; `agent-base` skips it because it has no bootstrap-owned project state:
