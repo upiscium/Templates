@@ -136,6 +136,11 @@ The staged Task-start Git/GitHub collaboration capability is documented in
 It establishes the durable Draft PR/checkpoint surface early, without legacy
 publication phases, merge/Ready authority, or runtime activation.
 
+The staged exact-subject Human-approved integration boundary is documented in
+[`docs/agent-core-human-approved-integration.md`](docs/agent-core-human-approved-integration.md).
+It separates READY eligibility from explicit Human merge authority and permits
+only confirmed-merge, bounded clean-default reconciliation afterward.
+
 ## Initialization
 
 Bootstrap, GitHub repository policy setup, and session initialization are intentionally separate. Concrete language/toolchain adapters use the bootstrap step; `agent-base` skips it because it has no bootstrap-owned project state:
