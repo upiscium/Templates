@@ -141,6 +141,12 @@ The staged exact-subject Human-approved integration boundary is documented in
 It separates READY eligibility from explicit Human merge authority and permits
 only confirmed-merge, bounded clean-default reconciliation afterward.
 
+The staged bounded autonomous cleanup proof facade (#198) is documented in
+[`docs/agent-core-autonomous-safe-cleanup.md`](docs/agent-core-autonomous-safe-cleanup.md).
+It separates read-only inventory and Task-bound proofs from host-qualified,
+operation-specific deletion; it does not activate v4 or provide a production
+deletion backend.
+
 ## Initialization
 
 Bootstrap, GitHub repository policy setup, and session initialization are intentionally separate. Concrete language/toolchain adapters use the bootstrap step; `agent-base` skips it because it has no bootstrap-owned project state:
