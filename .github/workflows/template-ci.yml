@@ -9,14 +9,40 @@ permissions:
   contents: read
 
 jobs:
-  contracts:
+  python-contracts:
+    name: Python contracts (shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - name: Verify complete contract inventory
+        run: python3 tools/ci_contract_runner.py verify
       - name: Python contract tests
-        run: python3 -m unittest discover -s tests -v
+        run: >-
+          python3 tools/ci_contract_runner.py run
+          --shard ${{ matrix.shard }}
+          --report "$RUNNER_TEMP/contract-shard-${{ matrix.shard }}.json"
+      - name: Upload contract evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-contracts-${{ matrix.shard }}
+          path: ${{ runner.temp }}/contract-shard-${{ matrix.shard }}.json
+          if-no-files-found: error
+
+  contract-support:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
       - name: Generated template drift
         run: python3 tools/render_templates.py check
       - uses: cachix/install-nix-action@v31
@@ -28,6 +54,35 @@ jobs:
         run: nix flake check --all-systems --no-build --no-update-lock-file
       - name: OpencodeContract contract
         run: nix build .#checks.x86_64-linux.opencode-contract --no-link --no-update-lock-file
+
+  contracts:
+    name: contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [python-contracts, contract-support, generated-template-smoke]
+    if: ${{ always() }}
+    steps:
+      - name: Require every original gate to pass
+        env:
+          PYTHON_RESULT: ${{ needs.python-contracts.result }}
+          SUPPORT_RESULT: ${{ needs.contract-support.result }}
+          SMOKE_RESULT: ${{ needs['generated-template-smoke'].result }}
+        run: |
+          set -euo pipefail
+          test "$PYTHON_RESULT" = success
+          test "$SUPPORT_RESULT" = success
+          test "$SMOKE_RESULT" = success
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: python-contracts-*
+          path: ${{ runner.temp }}/contract-evidence
+      - name: Reconcile exact contract coverage across all shards
+        run: >-
+          python3 tools/ci_contract_runner.py reconcile
+          --reports "${{ runner.temp }}/contract-evidence"
 
   generated-template-smoke:
     runs-on: ubuntu-latest
