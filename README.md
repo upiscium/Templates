@@ -147,6 +147,12 @@ It separates read-only inventory and Task-bound proofs from host-qualified,
 operation-specific deletion; it does not activate v4 or provide a production
 deletion backend.
 
+The staged v4-native Turn-local orchestration capability (#196) is documented in
+[`docs/agent-core-turn-orchestration.md`](docs/agent-core-turn-orchestration.md).
+Its disposable Work Units coordinate bounded leaves without becoming Task or
+Evidence authority. Its dormant policy and typed host seams do not install a
+dispatcher, activate v4, or migrate the legacy v3 Work Unit store.
+
 ## Initialization
 
 Bootstrap, GitHub repository policy setup, and session initialization are intentionally separate. Concrete language/toolchain adapters use the bootstrap step; `agent-base` skips it because it has no bootstrap-owned project state:
