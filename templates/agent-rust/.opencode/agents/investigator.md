@@ -2,7 +2,7 @@
 description: Read-only root-cause investigator for reproducible failures
 mode: subagent
 model: openai/gpt-6-luna
-reasoningEffort: max
+reasoningEffort: high
 permission:
   edit: deny
   task: deny

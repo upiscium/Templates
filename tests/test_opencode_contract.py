@@ -707,46 +707,23 @@ class OpenCodeContractTest(unittest.TestCase):
 
     def test_model_assignment_is_exact(self) -> None:
         expected = {
-            "build.md": "openai/gpt-6-sol",
-            "plan.md": "openai/gpt-6-luna",
-            "task-orchestrator.md": "openai/gpt-6-luna",
-            "maintenance-orchestrator.md": "openai/gpt-6-sol",
+            "build.md": "openai/gpt-6.1-sol",
+            "plan.md": "openai/gpt-6.1-sol",
+            "task-orchestrator.md": "openai/gpt-6.1-sol",
+            "maintenance-orchestrator.md": "openai/gpt-6.1-sol",
             "general.md": "openai/gpt-6-luna",
             "explore.md": "openai/gpt-6-luna",
             "verifier.md": "openai/gpt-6-luna",
             "reviewer.md": "openai/gpt-6-luna",
             "investigator.md": "openai/gpt-6-luna",
-            "security-reviewer.md": "openai/gpt-5.6-terra",
+            "security-reviewer.md": "openai/gpt-6.1-sol",
             "scout.md": "openai/gpt-6-luna",
-            "architect.md": "openai/gpt-6-sol",
+            "architect.md": "openai/gpt-6.1-sol",
         }
         for filename, model in expected.items():
             self.assertIn(f"model: {model}", frontmatter(AGENTS / filename), filename)
 
-    def test_fixed_model_groups_are_exact(self) -> None:
-        sol_agents = {
-            path.name
-            for path in AGENTS.glob("*.md")
-            if "model: openai/gpt-6-sol" in frontmatter(path)
-        }
-        luna_agents = {
-            path.name for path in AGENTS.glob("*.md")
-            if "model: openai/gpt-6-luna" in frontmatter(path)
-        }
-        terra_agents = {
-            path.name for path in AGENTS.glob("*.md")
-            if "model: openai/gpt-5.6-terra" in frontmatter(path)
-        }
-        self.assertEqual(
-            sol_agents,
-            {
-                "build.md",
-                "maintenance-orchestrator.md",
-                "architect.md",
-            },
-        )
-        self.assertEqual(luna_agents, {"plan.md", "task-orchestrator.md", "general.md", "explore.md", "verifier.md", "reviewer.md", "investigator.md", "scout.md"})
-        self.assertEqual(terra_agents, {"security-reviewer.md"})
+    def test_no_model_fallback_agents(self) -> None:
         self.assertFalse(list(AGENTS.glob("*-fallback.md")))
 
     def test_maintenance_authority_matrix_is_explicit(self) -> None:
@@ -843,7 +820,7 @@ class OpenCodeContractTest(unittest.TestCase):
         permission = permission_for("plan")
 
         self.assertIn("mode: primary", front)
-        self.assertIn("model: openai/gpt-6-luna", front)
+        self.assertIn("model: openai/gpt-6.1-sol", front)
         self.assertEqual(permission.get("edit"), "deny")
         self.assertEqual(permission.get("question"), "allow")
         self.assertEqual(permission.get("skill"), "allow")
@@ -985,7 +962,7 @@ global permissive plan
 
         self.assertEqual(data["description"], "Repository-local read-only planning agent")
         self.assertEqual(data["mode"], "primary")
-        self.assertEqual(data["model"], {"providerID": "openai", "modelID": "gpt-6-luna"})
+        self.assertEqual(data["model"], {"providerID": "openai", "modelID": "gpt-6.1-sol"})
         self.assertEqual(last_action("edit"), "deny")
         self.assertEqual(last_action("question"), "allow")
         self.assertEqual(last_action("bash"), "deny")

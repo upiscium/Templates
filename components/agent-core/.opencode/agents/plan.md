@@ -1,8 +1,8 @@
 ---
 description: Repository-local read-only planning agent
 mode: primary
-model: openai/gpt-6-luna
-reasoningEffort: max
+model: openai/gpt-6.1-sol
+reasoningEffort: high
 permission:
   edit: deny
   question: allow

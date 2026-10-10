@@ -261,7 +261,7 @@ Agent Core owns a repository-local `plan` primary agent so Agent-ready repositor
 
 ```text
 plan
-├── primary = openai/gpt-6-luna
+├── primary = openai/gpt-6.1-sol (high effort)
 ├── edit = deny
 ├── question = allow
 ├── bash = deny
@@ -959,19 +959,24 @@ Local commands are never automatically exposed to agents.
 
 ## 21. Model allocation contract
 
-The intended initial model allocation is:
+The intended initial role model and effort assignments are:
 
-| Role | Model family | Responsibility |
+| Role | Configured model | Effort |
 | --- | --- | --- |
-| Main Orchestrator / architecture | GPT-6 Sol | repository-wide orchestration, integration, consequential architecture decisions |
-| Task Orchestrator / plan | GPT-6 Luna (max) | high-frequency Task coordination and read-only planning |
-| general / explore | GPT-6 Luna (max) | bounded implementation and discovery |
-| verifier / scout | GPT-6 Luna (max) | deterministic verification and lightweight external research |
-| reviewer / investigator | GPT-6 Luna (max) | correctness review and root-cause investigation |
-| security-reviewer | GPT-5.6 Terra | security-boundary and attack-path review |
+| `build` | `openai/gpt-6.1-sol` | `high` |
+| `plan` | `openai/gpt-6.1-sol` | `high` |
+| `task-orchestrator` | `openai/gpt-6.1-sol` | `high` |
+| `maintenance-orchestrator` | `openai/gpt-6.1-sol` | `high` |
+| `architect` | `openai/gpt-6.1-sol` | `high` |
+| `security-reviewer` | `openai/gpt-6.1-sol` | `high` |
+| `reviewer` | `openai/gpt-6-luna` | `high` |
+| `investigator` | `openai/gpt-6-luna` | `high` |
+| `general` | `openai/gpt-6-luna` | `medium` |
+| `explore` | `openai/gpt-6-luna` | `medium` |
+| `scout` | `openai/gpt-6-luna` | `medium` |
+| `verifier` | `openai/gpt-6-luna` | `medium` |
 
-This split keeps Sol on repository-wide orchestration and consequential architecture, uses Luna Max for high-frequency Task coordination plus bounded planning/implementation/reconnaissance/verification/research/review/investigation, and keeps Terra on security review. Each role has one fixed model; unavailable execution returns `BLOCKED` without model substitution.
-High-quality analysis roles remain as configured (reviewer/investigator/security-reviewer on Terra).
+The design assigns Sol High to orchestration, planning, architecture, and security-critical review; Luna High to correctness and investigation; and Luna Medium to bounded implementation, exploration, research, and verification. This policy does not introduce `max` or `xhigh` effort settings. `verifier` remains at `medium`; `low` is a future evaluation option only, not a current assignment. Each role has one fixed model and effort; unavailable execution returns `BLOCKED` without model substitution.
 
 Exact provider model IDs are validated at implementation time. Missing model IDs must not be silently substituted with similar names.
 
