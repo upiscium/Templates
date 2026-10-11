@@ -15,7 +15,8 @@ nix build --no-link --print-out-paths \
 ```
 
 Pin the resulting store path and reviewed revision in maintainer-controlled
-configuration **outside** the Task worktree. Codex must invoke that exact absolute
+configuration **outside** the Task worktree. A change to pinned code is an
+activation/deployment step, distinct from normal source development. Codex must invoke that exact absolute
 `/nix/store/<approved-output>/bin/templates-source` path, with the Task worktree
 passed only as data. It must not resolve the authority from the Task branch, a
 moving tag, the live `flake.nix`, or an environment variable set by the Task.
@@ -62,8 +63,11 @@ They require:
 - the canonical `origin`;
 - no pre-staged index before scope capture/commit;
 - no secret-like, symlink, or non-regular changed path;
-- no changes to the source collaboration authority, pending or already committed
-  on the branch since the installed launcher’s approved base revision;
+- the installed authority revision is a common historical ancestor of the
+  tracked `origin/main` and the candidate Task HEAD; new candidate changes
+  to the next source Guard version are **data**, never executable policy;
+- source authority files touched in the pending change are reported in
+  `review_sensitive_paths` for the ordinary independent review process;
 - no candidate-controlled Git configuration capable of executing commands;
 - no force push;
 - exact local/remote/PR identity checks.
@@ -119,16 +123,26 @@ index file while ignoring its lock is outside the publication protocol. Detected
 such changes fail with reconciliation; no check-and-replace sequence can
 atomically protect against an uncooperative direct write in between.
 
-The protected bootstrap chain is `Justfile`, `just/source.just`,
-`tools/source_collaboration.py`, `tools/source_publication_launcher.sh`,
-`just/template.just`, `tools/render_templates.py`, and `flake.nix`.
+The review-sensitive next-version source paths are `Justfile`,
+`just/source.just`, `tools/source_collaboration.py`,
+`tools/source_publication_launcher.sh`, `just/template.just`,
+`tools/render_templates.py`, and `flake.nix`.
+These are **not** a publication deny-list: the installed executor can commit
+and push their reviewed bytes through the normal guarded Task branch path.
+`publication-check` reports affected entries as `review_sensitive_paths`.
+A review policy may require extra code/security review for such changes, but
+the Guard does not substitute per-file Ask or signatures for that workflow.
 The installed parity checker is packaged beside the installed authority and
-reads the candidate worktree as data; it never executes that worktree's Just
-recipes or Python files. A missing `origin/main` tracking ref, or one unrelated
-to the installed approved revision, fails closed. Moving that local ref cannot
-hide authority-changing commits: history is checked from the installed revision.
-Grafts and shallow history are rejected, and authority history is traversed
-through raw commit-parent records rather than Git's mutable revision walker.
+reads the candidate worktree as data; it never executes candidate Just recipes,
+Python modules, Nix derivations, hooks or Git filters.
+A missing `origin/main` tracking ref, or a tip not descended from the
+installed authority revision, fails closed. Grafts and shallow history are
+rejected, and authority ancestry is checked through raw commit-parent records
+rather than a mutable Git revision walker. For a merge commit, one actual raw
+parent path reaching the installed revision establishes Git ancestry; an older
+or unrelated alternative parent does not invalidate it. The merged result is
+still subject to the complete source-scope and review checks. Candidate
+changes do not activate the next version of the executor.
 Reviewed file blobs are rechecked against the reviewed scope digest, not just
 path names. Private preparation hashes verified source bytes without Git filters
 and inserts exact blob IDs only into the private index; it does not run `git add`
@@ -141,9 +155,13 @@ Git operations use a private temporary bare repository with the candidate object
 database as an alternate, not the candidate's mutable Git configuration. The Nix
 store artifact and its approved revision—not a same-user writable test install—
 are the production trust anchor.
-Changing these bootstrap inputs requires a separately reviewed maintainer/Admin
-bootstrap; the installed ordinary authority must not publish its own upgrade,
-including this repair.
+**Publishing source is not activating a new authority.** A stable installed
+executor can publish the next version of its own source files, while a separate
+versioned, reviewed activation selects a new fixed executable after tests.
+Activation must not load a mutable Task checkout as trusted code.
+The one-time transition from a previously installed version that rejects all
+source-authority path changes is documented below; it is not a new permanent
+approval ceremony and does not authorize direct/default-branch publication.
 
 ## Push and Draft PR
 
@@ -181,13 +199,23 @@ tool logs.
 
 ## Bootstrap
 
-The initial `source::*` landing was bootstrapped by Templates Issue #215. Issue #219
-established the installed authority; #220 modifies that protected authority and
-likewise requires an independently reviewed maintainer/Admin bootstrap. Neither
-the live recipes nor the previously approved installed authority may publish
-its own #220 upgrade. Ordinary source Tasks use only the independently approved,
-pinned installed launcher instead of live recipes or raw `git add`, `git commit`,
-`git push`, or `gh pr create`.
+The initial `source::*` landing was bootstrapped by Templates Issue #215.
+Issue #219 installed the fixed source executor; #220 introduced the earlier
+permanent seven-path deny-list. [ADR-0003](adr/0003-self-hosted-development-and-recovery.md)
+and Issue #257 replace that restriction with a **stable-executor + self-hostable
+source development** model. The previously installed launcher still rejects
+its own seven protected source paths, so migration to the revised code requires
+**one explicitly bounded, reviewed bootstrap publication**. Do not bypass that
+existing installed authority before migration is reviewed and authorized.
+Thereafter, ordinary source Tasks, including Guard source updates, use the
+installed launcher without new per-Issue exceptions.
+
+Activation of a newer launcher remains distinct from publishing its source:
+select an exact built and reviewed revision, verify operational readiness,
+and retain the previously working launcher as a recovery option. Neither a new
+Task branch nor its `flake.nix` chooses the trusted installed executable.
+`just source::*` continues to be inert. Ordinary source Tasks use the
+installed launcher rather than mutable recipes or unguarded raw Git writes.
 
 This bootstrap does not authorize publication or reuse of stale pre-v4 AgentCore
 implementation work.
