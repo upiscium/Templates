@@ -47,10 +47,11 @@ python3 /path/to/KUMIKI/tools/kagari_bootstrap.py repair \
   --source /path/to/KUMIKI/components/agent-core
 
 python3 /path/to/KUMIKI/tools/kagari_bootstrap.py uninstall \
-  --target /path/to/existing-project
+  --target /path/to/existing-project \
+  --source /path/to/KUMIKI/components/agent-core
 ```
 
-The source path is **external to the target's installed KAGARI runtime**. The bootstrap does not invoke candidate/target Just recipes, Nix expressions or OpenCode. An invalid Project Flake is not a blocker for the byte-level payload operations. Repository modifications remain uncommitted until an independently authorized ordinary guarded Task publication.
+The source path is **external to the target's installed KAGARI runtime**. The bootstrap does not invoke candidate/target Just recipes, Nix expressions or OpenCode. An invalid Project Flake is not a blocker for the byte-level payload operations. For a Git-backed KAGARI source, only its **tracked component files** are included; ignored OpenCode npm downloads, Python caches and unrelated local artifacts are not copied. An extracted release source without Git uses a bounded directory scan that excludes known generated caches. Repository modifications remain uncommitted until an independently authorized ordinary guarded Task publication.
 
 ## Operation outcomes
 
@@ -59,11 +60,11 @@ The source path is **external to the target's installed KAGARI runtime**. The bo
 | `plan` / `doctor` | ABSENT, HEALTHY, REPAIRABLE, CONFLICT | Read-only inspection; conflict reports exact missing, altered and unknown paths |
 | `install` | INSTALLED, UNCHANGED, REPAIRED, BLOCKED | Create complete KAGARI area only when absent; otherwise reconcile missing owned files |
 | `repair` | INSTALLED, UNCHANGED, REPAIRED, BLOCKED | Same bounded reconciliation engine; no forced overwrite |
-| `uninstall` | UNINSTALLED, ALREADY_ABSENT, BLOCKED | Remove only inventoried unchanged KAGARI files and owned directories |
+| `uninstall` | UNINSTALLED, ALREADY_ABSENT, BLOCKED | Require an explicit matching KAGARI source and remove only its inventoried unchanged managed files |
 
-Malformed/missing installation receipt, symlink or special file in owned scope, unrecognized extra file/directory, user-modified installed KAGARI file, source-version change, or unknown ownership makes a mutating operation **BLOCKED**, preserving Project data. This is intentional: a changed file cannot automatically be classified as damage rather than a user edit. A future explicit replace/upgrade flow must bind that choice to a reviewed plan and the actual file preimage; current `repair` automatically restores only **missing** known files.
+Malformed/missing installation receipt, symlink or special file in owned scope, unrecognized extra file/directory, user-modified installed KAGARI file, source-version change, or unknown ownership makes a mutating operation **BLOCKED**, preserving Project data. **Uninstall requires a caller-supplied external source with the exact same file inventory as the receipt**; a plausible receipt alone is not enough to claim ownership and delete files. This is intentional: a changed file cannot automatically be classified as damage rather than a user edit. A future explicit replace/upgrade flow must bind that choice to a reviewed plan and the actual file preimage; current `repair` automatically restores only **missing** known files.
 
-A fresh install is built under a Project-local temporary directory and renamed into the absent `.kagari` path. The installer removes its own staging directory on ordinary failures, but a hard process/host interruption can leave an untracked `.kagari-stage-*` directory. Such interrupted operations must be diagnosed; the current Phase 1 bootstrap does not claim a full crash-atomicity or orphan-stage recovery contract.
+A fresh install is built under the private Git administrative directory (required to be on the same filesystem) and renamed into the absent `.kagari` path. Missing-file repair similarly stages complete file bytes privately and links only into absent managed slots. The installer removes its own temporary state on ordinary failures; an abrupt process/host interruption can leave a Git-private `kagari-stage-*` or `kagari-repair-*` residue. This does **not** introduce untracked files at Project root, but private residue reclamation and complete crash recovery remain later work.
 
 ## Verification limits / next gates
 

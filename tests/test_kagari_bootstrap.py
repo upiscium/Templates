@@ -95,11 +95,11 @@ class KagariBootstrapTest(unittest.TestCase):
         self.assertEqual("UNCHANGED", self.invoke("install")[1]["status"])
         self.assert_project_preserved()
 
-        self.assertEqual("UNINSTALLED", self.invoke("uninstall", source=None)[1]["status"])
+        self.assertEqual("UNINSTALLED", self.invoke("uninstall")[1]["status"])
         self.assertFalse((self.root / ".kagari").exists())
         self.assertEqual("", call_git(self.root, "status", "--porcelain"))
         self.assert_project_preserved()
-        self.assertEqual("ALREADY_ABSENT", self.invoke("uninstall", source=None)[1]["status"])
+        self.assertEqual("ALREADY_ABSENT", self.invoke("uninstall")[1]["status"])
         self.assertEqual("INSTALLED", self.invoke("install")[1]["status"])
         self.assert_project_preserved()
 
@@ -122,7 +122,7 @@ class KagariBootstrapTest(unittest.TestCase):
         missing_leaf = container / ".automation" / "VERSION"
         missing_leaf.unlink()
         self.assertEqual("REPAIRABLE", self.invoke("doctor", source=None)[1]["status"])
-        self.assertEqual("UNINSTALLED", self.invoke("uninstall", source=None)[1]["status"])
+        self.assertEqual("UNINSTALLED", self.invoke("uninstall")[1]["status"])
         self.assertEqual("", call_git(self.root, "status", "--porcelain"))
         self.assert_project_preserved()
         self.assertEqual("INSTALLED", self.invoke("install")[1]["status"])
@@ -136,7 +136,7 @@ class KagariBootstrapTest(unittest.TestCase):
         diagnosis = self.invoke("doctor", source=None)[1]
         self.assertEqual("CONFLICT", diagnosis["status"])
         self.assertIn("runtime/my-private-dir/", diagnosis["unknown"])
-        code, state = self.invoke("uninstall", source=None)
+        code, state = self.invoke("uninstall")
         self.assertEqual((2, "BLOCKED"), (code, state["status"]))
         self.assertTrue(extra.is_dir())
         self.assertEqual(expected_bytes, sentinel.read_bytes())
@@ -149,7 +149,7 @@ class KagariBootstrapTest(unittest.TestCase):
         managed.write_bytes(edited)
         self.assertEqual("CONFLICT", self.invoke("doctor", source=None)[1]["status"])
         for command in ("install", "repair", "uninstall"):
-            rc, result = self.invoke(command, source=PAYLOAD if command != "uninstall" else None)
+            rc, result = self.invoke(command, source=PAYLOAD)
             self.assertEqual((2, "BLOCKED"), (rc, result["status"]))
             self.assertEqual(edited, managed.read_bytes())
             self.assert_project_preserved()
@@ -163,7 +163,7 @@ class KagariBootstrapTest(unittest.TestCase):
         self.assertIn("runtime/custom-code.txt", state["unknown"])
         self.assertEqual((2, "BLOCKED"), (
             lambda x: (x[0], x[1]["status"])
-        )(self.invoke("uninstall", source=None)))
+        )(self.invoke("uninstall")))
         self.assertTrue(unknown.exists())
         self.assert_project_preserved()
 
@@ -199,7 +199,7 @@ class KagariBootstrapTest(unittest.TestCase):
 
         self.assertEqual("INSTALLED", self.invoke("install")[1]["status"])
         self.assertEqual("UNCHANGED", self.invoke("install")[1]["status"])
-        self.assertEqual("UNINSTALLED", self.invoke("uninstall", source=None)[1]["status"])
+        self.assertEqual("UNINSTALLED", self.invoke("uninstall")[1]["status"])
         self.assertEqual(before_head, call_git(self.root, "rev-parse", "HEAD"))
         self.assertEqual(before_index, call_git(self.root, "diff", "--cached", "--binary"))
         self.assertEqual("# changed product work\\n", dirty.read_text())
@@ -231,6 +231,66 @@ class KagariBootstrapTest(unittest.TestCase):
         code, result = self.invoke("repair")
         self.assertEqual((2, "BLOCKED"), (code, result["status"]))
         self.assertEqual(0o755, file.stat().st_mode & 0o777)
+        self.assert_project_preserved()
+
+    def test_unreadable_managed_directory_blocks_uninstall_before_unlink(self) -> None:
+        self.assertEqual("INSTALLED", self.invoke("install")[1]["status"])
+        critical = self.root / ".kagari" / "runtime" / "Justfile"
+        original = critical.read_bytes()
+        hidden = self.root / ".kagari" / "runtime" / ".automation"
+        extra = hidden / "unrecorded-notes.txt"
+        extra.write_text("important data")
+        hidden.chmod(0o300)
+        try:
+            rc, response = self.invoke("uninstall")
+            self.assertEqual((2, "BLOCKED"), (rc, response["status"]))
+            self.assertEqual(original, critical.read_bytes())
+        finally:
+            hidden.chmod(0o755)
+        self.assertEqual("important data", extra.read_text())
+        self.assert_project_preserved()
+
+    def test_foreign_canonical_receipt_requires_external_source_match(self) -> None:
+        container = self.root / ".kagari"
+        (container / "runtime").mkdir(parents=True)
+        personal = container / "runtime" / "my-data.txt"
+        personal.write_bytes(b"Project-owned content")
+        import hashlib
+        record = {"schema": 1, "component": "KAGARI", "version": "3",
+                  "files": [{"path": "my-data.txt", "mode": 0o644, "size": 21,
+                             "sha256": hashlib.sha256(personal.read_bytes()).hexdigest()}]}
+        (container / "install.json").write_text(
+            json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+        rc, result = self.invoke("uninstall")
+        self.assertEqual((2, "BLOCKED"), (rc, result["status"]))
+        self.assertEqual(b"Project-owned content", personal.read_bytes())
+        self.assert_project_preserved()
+
+    def test_uninstall_does_not_run_without_external_matching_source(self) -> None:
+        self.assertEqual("INSTALLED", self.invoke("install")[1]["status"])
+        rc, result = self.invoke("uninstall", source=None)
+        self.assertEqual((2, "BLOCKED"), (rc, result["status"]))
+        self.assertEqual("HEALTHY", self.invoke("doctor", source=None)[1]["status"])
+        self.assert_project_preserved()
+
+    def test_repair_failure_does_not_publish_partial_installed_file(self) -> None:
+        self.assertEqual("INSTALLED", self.invoke("install")[1]["status"])
+        managed = self.root / ".kagari" / "runtime" / "Justfile"
+        managed.unlink()
+        import importlib.util
+        from unittest import mock
+        spec = importlib.util.spec_from_file_location("kagari_bootstrap_under_test", CLI)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        bootstrap = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bootstrap)
+        with mock.patch.object(bootstrap.os, "link", side_effect=OSError("simulated IO failure")):
+            with self.assertRaisesRegex(OSError, "simulated IO failure"):
+                bootstrap.operate(self.root, PAYLOAD, "repair")
+        self.assertFalse(managed.exists())
+        self.assertEqual("REPAIRABLE", self.invoke("doctor", source=None)[1]["status"])
+        self.assertEqual("REPAIRED", self.invoke("repair")[1]["status"])
         self.assert_project_preserved()
 
     def test_non_git_target_is_rejected_without_changes(self) -> None:

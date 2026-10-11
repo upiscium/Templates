@@ -60,6 +60,10 @@ def regular_file(path: Path, *, label: str) -> bytes:
     return data
 
 
+def walk_error(error: OSError) -> None:
+    raise BootstrapError(f"cannot fully enumerate KAGARI managed/source directory: {error}") from error
+
+
 def valid_relpath(value: object) -> str:
     require(isinstance(value, str) and value and len(value.encode()) <= 240,
             "invalid inventory file path")
@@ -71,27 +75,56 @@ def valid_relpath(value: object) -> str:
     return value
 
 
+def source_files(source: Path) -> list[Path]:
+    # A source checkout may contain ignored OpenCode npm downloads and Python
+    # caches. Select only Git-managed KAGARI payload files when Git is present.
+    # Extracted, non-Git release payloads use a bounded directory scan instead.
+    command = ["git", "-C", str(source), "-c", "core.fsmonitor=false",
+               "-c", "core.hooksPath=/dev/null", "ls-files", "-z", "--", "."]
+    result = subprocess.run(command, capture_output=True, check=False)
+    if result.returncode == 0:
+        relative_paths = [valid_relpath(name.decode("utf-8", "strict"))
+                          for name in result.stdout.split(b"\0") if name]
+        require(relative_paths, "Git KAGARI source has no tracked files")
+        return [source / rel for rel in relative_paths]
+
+    generated_dirs = {"node_modules", "__pycache__", ".pytest_cache",
+                      ".mypy_cache", ".ruff_cache", ".git"}
+    paths: list[Path] = []
+    for current, directories, names in os.walk(source, followlinks=False,
+                                                onerror=walk_error):
+        current_path = Path(current)
+        directories[:] = sorted(d for d in directories if d not in generated_dirs)
+        for directory in directories:
+            path = current_path / directory
+            require(path.is_dir() and not path.is_symlink(),
+                    f"source directory is not regular: {path}")
+        for name in names:
+            path = current_path / name
+            if name.endswith((".pyc", ".pyo")) or name == ".DS_Store":
+                continue
+            if current_path == source / ".opencode" and name in (
+                "package.json", "package-lock.json"
+            ):
+                continue
+            paths.append(path)
+    return sorted(paths)
+
+
 def source_payload(source: Path) -> tuple[dict, dict[str, bytes]]:
     require(source.is_dir() and not source.is_symlink(),
             "KAGARI source must be a regular directory")
     files: dict[str, bytes] = {}
     modes: dict[str, int] = {}
     total = 0
-    for current, directories, names in os.walk(source, followlinks=False):
-        current_path = Path(current)
-        for directory in directories:
-            path = current_path / directory
-            require(not path.is_symlink() and path.is_dir(),
-                    f"source directory is not regular: {path}")
-        for name in names:
-            path = current_path / name
-            relative = valid_relpath(path.relative_to(source).as_posix())
-            contents = regular_file(path, label=f"source {relative}")
-            total += len(contents)
-            require(len(files) < MAX_FILES and total <= MAX_TOTAL_BYTES,
-                    "source exceeds inventory limits")
-            files[relative] = contents
-            modes[relative] = 0o755 if path.stat().st_mode & 0o111 else 0o644
+    for path in source_files(source):
+        relative = valid_relpath(path.relative_to(source).as_posix())
+        contents = regular_file(path, label=f"source {relative}")
+        total += len(contents)
+        require(len(files) < MAX_FILES and total <= MAX_TOTAL_BYTES,
+                "source exceeds inventory limits")
+        files[relative] = contents
+        modes[relative] = 0o755 if path.stat().st_mode & 0o111 else 0o644
     require(files, "KAGARI source is empty")
     version = files.get(".automation/VERSION")
     require(version is not None and
@@ -192,7 +225,7 @@ def inventory_state(root: Path, expected: dict | None) -> dict:
             parent = parent.parent
     observed: set[str] = set()
     unknown_directories: set[str] = set()
-    for current, dirs, names in os.walk(container, followlinks=False):
+    for current, dirs, names in os.walk(container, followlinks=False, onerror=walk_error):
         for name in dirs + names:
             p = Path(current) / name
             require(not p.is_symlink(), f"symlink in KAGARI managed scope: {p}")
@@ -237,9 +270,11 @@ def writer_lock(git_dir: Path) -> Iterator[None]:
 
 def prepare_install(root: Path, git_dir: Path, receipt: dict,
                     files: dict[str, bytes]) -> None:
-    # Stage the complete payload under the same Project filesystem, then rename
-    # only into an absent KAGARI-owned path. No root toolchain file is changed.
-    stage = Path(tempfile.mkdtemp(prefix=".kagari-stage-", dir=root))
+    # Stage privately in Git administration; even hard interruption cannot
+    # leave a new untracked root-level .kagari-stage-* directory.
+    require(git_dir.stat().st_dev == root.stat().st_dev,
+            "Git administration and Project must share a filesystem for atomic install")
+    stage = Path(tempfile.mkdtemp(prefix="kagari-stage-", dir=git_dir))
     try:
         runtime = stage / RUNTIME
         runtime.mkdir()
@@ -258,26 +293,69 @@ def prepare_install(root: Path, git_dir: Path, receipt: dict,
             shutil.rmtree(stage)
 
 
-def repair_missing(root: Path, receipt: dict, files: dict[str, bytes],
-                   missing: list[str]) -> None:
-    container = root / CONTAINER / RUNTIME
+@contextmanager
+def owned_parent_fd(root: Path, relative: str, *, create: bool) -> Iterator[tuple[int, str]]:
+    """Open each KAGARI directory with NOFOLLOW; never follow Project symlinks."""
+    parts = (RUNTIME, *PurePosixPath(valid_relpath(relative)).parts)
+    fd = os.open(root / CONTAINER, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for component in parts[:-1]:
+            if create:
+                try:
+                    os.mkdir(component, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY |
+                              os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        yield fd, parts[-1]
+    finally:
+        os.close(fd)
+
+
+def repair_missing(root: Path, git_dir: Path, receipt: dict,
+                   files: dict[str, bytes], missing: list[str]) -> None:
     lookup = {item["path"]: item for item in receipt["files"]}
+    require(git_dir.stat().st_dev == root.stat().st_dev,
+            "Git administration and Project must share a filesystem for atomic repair")
     for relative in missing:
-        target = container / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # No overwrite, including if a cooperative writer created the path.
-        with target.open("xb") as out:
-            out.write(files[relative])
-        target.chmod(lookup[relative]["mode"])
+        # Prepare complete bytes and mode privately, then link into the empty
+        # owned slot. A partial write never becomes an installed KAGARI file.
+        temp_fd, temp_name = tempfile.mkstemp(prefix="kagari-repair-", dir=git_dir)
+        try:
+            with os.fdopen(temp_fd, "wb") as out:
+                out.write(files[relative])
+                out.flush()
+                os.fsync(out.fileno())
+            os.chmod(temp_name, lookup[relative]["mode"])
+            with owned_parent_fd(root, relative, create=True) as (parent_fd, name):
+                os.link(temp_name, name, dst_dir_fd=parent_fd, follow_symlinks=False)
+        finally:
+            os.unlink(temp_name)
 
 
 def remove_owned(root: Path, receipt: dict) -> None:
     container = root / CONTAINER
     runtime = container / RUNTIME
     for item in receipt["files"]:
-        path = runtime / item["path"]
-        if path.exists() or path.is_symlink():
-            path.unlink()
+        relative = item["path"]
+        path = runtime / relative
+        if not path.exists() and not path.is_symlink():
+            continue
+        with owned_parent_fd(root, relative, create=False) as (parent_fd, name):
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+            with os.fdopen(fd, "rb") as source:
+                info = os.fstat(source.fileno())
+                data = source.read(MAX_FILE_BYTES + 1)
+            require(stat.S_ISREG(info.st_mode) and
+                    hash_bytes(data) == item["sha256"] and
+                    (0o755 if info.st_mode & 0o111 else 0o644) == item["mode"],
+                    f"owned file changed during uninstall: {relative}")
+            latest = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            require(latest.st_ino == info.st_ino and latest.st_dev == info.st_dev,
+                    f"owned file changed during uninstall: {relative}")
+            os.unlink(name, dir_fd=parent_fd)
     dirs = {runtime}
     for item in receipt["files"]:
         p = (runtime / item["path"]).parent
@@ -285,8 +363,9 @@ def remove_owned(root: Path, receipt: dict) -> None:
             dirs.add(p)
             p = p.parent
     for path in sorted(dirs, key=lambda p: len(p.parts), reverse=True):
-        if path.is_dir():
+        if path.is_dir() and not path.is_symlink():
             path.rmdir()
+    assert_normal_directories(root)
     (container / RECEIPT).unlink()
     container.rmdir()
 
@@ -299,9 +378,9 @@ def operate(target: Path, source: Path | None, action: str) -> dict:
         receipt, files = source_payload(source)
     require(action in ("plan", "install", "repair", "doctor", "uninstall"),
             "unknown KAGARI bootstrap action")
-    if action in ("install", "repair"):
+    if action in ("install", "repair", "uninstall"):
         require(receipt is not None and files is not None,
-                "install/repair requires an explicit KAGARI source")
+                "install/repair/uninstall requires an explicit KAGARI source")
     if action in ("plan", "doctor"):
         state = inventory_state(target, receipt)
         return {"operation": action, "status": state["state"],
@@ -309,7 +388,7 @@ def operate(target: Path, source: Path | None, action: str) -> dict:
                 "unknown": state["unknown"], "target": str(target),
                 "version": state.get("receipt", receipt or {}).get("version")}
     with writer_lock(git_dir):
-        state = inventory_state(target, receipt if action != "uninstall" else None)
+        state = inventory_state(target, receipt)
         require(state["state"] not in ("CONFLICT",),
                 "KAGARI scope contains unknown/modified files; preserve and request review")
         if action == "uninstall":
@@ -326,7 +405,7 @@ def operate(target: Path, source: Path | None, action: str) -> dict:
             outcome = "UNCHANGED"
         else:
             assert receipt is not None and files is not None
-            repair_missing(target, receipt, files, state["missing"])
+            repair_missing(target, git_dir, receipt, files, state["missing"])
             outcome = "REPAIRED"
         after = inventory_state(target, receipt if action != "uninstall" else None)
         require(after["state"] == ("ABSENT" if action == "uninstall" else "HEALTHY"),
