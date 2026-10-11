@@ -80,13 +80,23 @@ def source_files(source: Path) -> list[Path]:
     # caches. Select only Git-managed KAGARI payload files when Git is present.
     # Extracted, non-Git release payloads use a bounded directory scan instead.
     command = ["git", "-C", str(source), "-c", "core.fsmonitor=false",
-               "-c", "core.hooksPath=/dev/null", "ls-files", "-z", "--", "."]
-    result = subprocess.run(command, capture_output=True, check=False)
-    if result.returncode == 0:
+               "-c", "core.hooksPath=/dev/null"]
+    probe = subprocess.run([*command, "rev-parse", "--is-inside-work-tree"],
+                           capture_output=True, check=False)
+    if probe.returncode == 0 and probe.stdout.strip() == b"true":
+        result = subprocess.run([*command, "ls-files", "-z", "--", "."],
+                                capture_output=True, check=False)
+        require(result.returncode == 0,
+                "Git-managed KAGARI source inventory is unreadable")
         relative_paths = [valid_relpath(name.decode("utf-8", "strict"))
                           for name in result.stdout.split(b"\0") if name]
         require(relative_paths, "Git KAGARI source has no tracked files")
         return [source / rel for rel in relative_paths]
+    # An extraction without Git metadata can be scanned; a damaged/unreadable
+    # Git worktree must never silently switch to including untracked files.
+    require(not any((parent / ".git").exists() or (parent / ".git").is_symlink()
+                    for parent in (source, *source.parents)),
+            "Git-managed KAGARI source is inaccessible; cannot use archive scan")
 
     generated_dirs = {"node_modules", "__pycache__", ".pytest_cache",
                       ".mypy_cache", ".ruff_cache", ".git"}
@@ -248,7 +258,7 @@ def inventory_state(root: Path, expected: dict | None) -> dict:
             changed.append(relative)
         else:
             data = regular_file(file, label=f"installed {relative}")
-            mode = 0o755 if file.stat().st_mode & 0o111 else 0o644
+            mode = stat.S_IMODE(file.stat().st_mode)
             if hash_bytes(data) != item["sha256"] or mode != item["mode"]:
                 changed.append(relative)
     return {"state": ("CONFLICT" if unknown or changed else
@@ -350,7 +360,7 @@ def remove_owned(root: Path, receipt: dict) -> None:
                 data = source.read(MAX_FILE_BYTES + 1)
             require(stat.S_ISREG(info.st_mode) and
                     hash_bytes(data) == item["sha256"] and
-                    (0o755 if info.st_mode & 0o111 else 0o644) == item["mode"],
+                    stat.S_IMODE(info.st_mode) == item["mode"],
                     f"owned file changed during uninstall: {relative}")
             latest = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
             require(latest.st_ino == info.st_ino and latest.st_dev == info.st_dev,

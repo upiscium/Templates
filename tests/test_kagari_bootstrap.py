@@ -223,6 +223,60 @@ class KagariBootstrapTest(unittest.TestCase):
         self.assertEqual("HEALTHY", self.invoke("doctor", source=None)[1]["status"])
         self.assert_project_preserved()
 
+    def test_nonexecutable_mode_drift_blocks_uninstall(self) -> None:
+        self.assertEqual("INSTALLED", self.invoke("install")[1]["status"])
+        file = self.root / ".kagari" / "runtime" / "AGENTS.md"
+        old_bytes = file.read_bytes()
+        file.chmod(0o600)
+        diagnosis = self.invoke("doctor", source=None)[1]
+        self.assertEqual("CONFLICT", diagnosis["status"])
+        self.assertIn("AGENTS.md", diagnosis["changed"])
+        rc, result = self.invoke("uninstall")
+        self.assertEqual((2, "BLOCKED"), (rc, result["status"]))
+        self.assertEqual(0o600, file.stat().st_mode & 0o777)
+        self.assertEqual(old_bytes, file.read_bytes())
+        self.assert_project_preserved()
+
+    def test_git_backed_source_ls_files_failure_does_not_scan_untracked_files(self) -> None:
+        import importlib.util
+        from unittest import mock
+        spec = importlib.util.spec_from_file_location("kagari_git_scan_test", CLI)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        bootstrap = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bootstrap)
+        actual_run = bootstrap.subprocess.run
+
+        def failed_inventory(cmd, *args, **kwargs):
+            if "ls-files" in cmd:
+                return subprocess.CompletedProcess(cmd, 128, stdout=b"",
+                                                   stderr=b"simulated index error")
+            return actual_run(cmd, *args, **kwargs)
+
+        with mock.patch.object(bootstrap.subprocess, "run", side_effect=failed_inventory):
+            with self.assertRaisesRegex(bootstrap.BootstrapError, "inventory is unreadable"):
+                bootstrap.source_payload(PAYLOAD)
+        self.assert_project_preserved()
+
+    def test_extracted_nongit_source_uses_archive_inventory(self) -> None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("kagari_archive_source", CLI)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        bootstrap = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bootstrap)
+        archive = Path(self.temp.name) / "archive"
+        shutil.copytree(
+            PAYLOAD, archive,
+            ignore=shutil.ignore_patterns("node_modules", "__pycache__",
+                                          ".git", ".pytest_cache", "*.pyc")
+        )
+        receipt, files = bootstrap.source_payload(archive)
+        self.assertEqual("3", receipt["version"])
+        self.assertIn(".automation/VERSION", files)
+        self.assertNotIn(".opencode/package.json", files)
+        self.assert_project_preserved()
+
     def test_file_mode_drift_does_not_overwrite_user_edits(self) -> None:
         self.assertEqual("INSTALLED", self.invoke("install")[1]["status"])
         file = self.root / ".kagari" / "runtime" / "AGENTS.md"

@@ -51,7 +51,7 @@ python3 /path/to/KUMIKI/tools/kagari_bootstrap.py uninstall \
   --source /path/to/KUMIKI/components/agent-core
 ```
 
-The source path is **external to the target's installed KAGARI runtime**. The bootstrap does not invoke candidate/target Just recipes, Nix expressions or OpenCode. An invalid Project Flake is not a blocker for the byte-level payload operations. For a Git-backed KAGARI source, only its **tracked component files** are included; ignored OpenCode npm downloads, Python caches and unrelated local artifacts are not copied. An extracted release source without Git uses a bounded directory scan that excludes known generated caches. Repository modifications remain uncommitted until an independently authorized ordinary guarded Task publication.
+The source path is **external to the target's installed KAGARI runtime**. The bootstrap does not invoke candidate/target Just recipes, Nix expressions or OpenCode. An invalid Project Flake is not a blocker for the byte-level payload operations. For a Git-backed KAGARI source, only its **tracked component files** are included; ignored OpenCode npm downloads, Python caches and unrelated local artifacts are not copied. If Git inventory fails for a source inside a Git worktree, the bootstrap **fails closed** instead of falling back to an untracked file scan. An extracted release source without Git metadata uses a bounded directory scan that excludes known generated caches. Repository modifications remain uncommitted until an independently authorized ordinary guarded Task publication.
 
 ## Operation outcomes
 
