@@ -4,6 +4,8 @@ Nix flake templates for reproducible, Agent-ready development environments.
 
 ## Develop Templates
 
+Architecture decisions for KUMIKI / KAGARI are indexed in [docs/adr/README.md](docs/adr/README.md). The ADRs distinguish accepted design goals from the currently deployed Agent Core v3 and staged v4 implementation.
+
 The repository root `flake.nix` is the development-environment source of truth. Its default devShell provides the repository tools required for normal Templates work, including `just`, `python3`, `git`, and `gh`.
 
 With `direnv` and `nix-direnv` installed on the host, approve the repository once:
