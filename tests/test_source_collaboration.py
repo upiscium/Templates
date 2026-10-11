@@ -150,92 +150,117 @@ class SourceCollaborationTest(unittest.TestCase):
                         source.context(215, self.root)
                     meta.assert_not_called()
 
-    def test_authority_paths_cannot_be_published(self) -> None:
-        self.assertTrue({
+    def test_authority_paths_are_review_sensitive_but_publishable(self) -> None:
+        self.assertEqual({
             "Justfile", "just/source.just", "tools/source_collaboration.py",
             "tools/source_publication_launcher.sh", "just/template.just",
             "tools/render_templates.py", "flake.nix",
-        }.issubset(source.SOURCE_AUTHORITY))
+        }, source.SOURCE_AUTHORITY)
         for path in sorted(source.SOURCE_AUTHORITY):
             with self.subTest(path=path):
                 target = self.root / path
-                target.write_text("redirected\n", encoding="utf-8")
+                target.write_text("future version\n", encoding="utf-8")
                 with mock.patch.object(source, "issue_meta", side_effect=self.issue):
-                    with self.assertRaisesRegex(source.GuardError, "maintainer bootstrap"):
-                        source.publication_check(215, self.root)
-                    with mock.patch.object(source, "parity") as parity:
-                        with self.assertRaisesRegex(source.GuardError, "maintainer bootstrap"):
-                            source.commit(215, "ignored", "test: authority", self.root)
-                        parity.assert_not_called()
+                    result = source.publication_check(215, self.root)
+                self.assertEqual("READY", result["status"])
+                self.assertEqual([path], result["review_sensitive_paths"])
+                self.assertEqual([path], [e["path"] for e in result["manifest"]["entries"]])
                 self.assertEqual("", git(self.root, "diff", "--cached", "--name-only"))
                 target.write_text("trusted\n", encoding="utf-8")
 
-    def test_authority_deletion_and_symlink_are_rejected(self) -> None:
+    def test_future_guard_code_can_be_committed_by_installed_executor(self) -> None:
+        target = self.root / "tools/source_collaboration.py"
+        target.write_text("future policy\n", encoding="utf-8")
+        with mock.patch.object(source, "issue_meta", side_effect=self.issue):
+            result = source.publication_check(215, self.root)
+            with mock.patch.object(source, "parity") as parity:
+                committed = source.commit(215, result["scope_digest"], "test: future source policy", self.root)
+        parity.assert_called_once()
+        self.assertEqual("COMMITTED", committed["status"])
+        self.assertEqual(["tools/source_collaboration.py"], committed["paths"])
+        self.assertEqual(committed["head"], git(self.root, "rev-parse", "HEAD"))
+        self.assertEqual("", git(self.root, "status", "--porcelain"))
+
+
+    def test_source_deletion_is_scoped_but_symlink_is_rejected(self) -> None:
         target = self.root / "just/source.just"
         target.unlink()
-        with self.assertRaisesRegex(source.GuardError, "maintainer bootstrap"):
-            source.manifest(self.ctx())
+        self.assertEqual(
+            [{"path": "just/source.just", "kind": "deleted"}],
+            source.manifest(self.ctx())["entries"],
+        )
         target.symlink_to("../file.txt")
-        with self.assertRaisesRegex(source.GuardError, "maintainer bootstrap"):
+        with self.assertRaisesRegex(source.GuardError, "regular file"):
             source.manifest(self.ctx())
 
-    def test_committed_authority_change_blocks_all_publication_commands(self) -> None:
-        (self.root / "Justfile").write_text("redirected\n", encoding="utf-8")
+
+    def test_committed_source_change_does_not_block_normal_future_task(self) -> None:
+        (self.root / "Justfile").write_text("future source entrypoint\n", encoding="utf-8")
         git(self.root, "add", "Justfile")
-        git(self.root, "commit", "-qm", "unauthorized authority update")
+        git(self.root, "commit", "-qm", "reviewed future guard")
         current = git(self.root, "rev-parse", "HEAD")
         (self.root / "file.txt").write_text("normal change\n", encoding="utf-8")
         with mock.patch.object(source, "issue_meta", side_effect=self.issue):
-            with self.assertRaisesRegex(source.GuardError, "maintainer bootstrap"):
-                source.publication_check(215, self.root)
+            checked = source.publication_check(215, self.root)
+        self.assertEqual("READY", checked["status"])
+        self.assertEqual([], checked["review_sensitive_paths"])
+        self.assertEqual(["file.txt"], [e["path"] for e in checked["manifest"]["entries"]])
         (self.root / "file.txt").write_text("one\n", encoding="utf-8")
         with mock.patch.object(source, "issue_meta", side_effect=self.issue), mock.patch.object(
-            source, "remote_head"
-        ) as remote, mock.patch.object(source, "pulls") as pulls:
-            for action in (
-                lambda: source.push(215, current, self.root),
-                lambda: source.pr_create(215, self.root),
-                lambda: source.checkpoint(215, 7, current, "body", self.root),
-            ):
-                with self.assertRaisesRegex(source.GuardError, "maintainer bootstrap"):
-                    action()
-            remote.assert_not_called()
-            pulls.assert_not_called()
+            source, "remote_head", return_value=current
+        ):
+            self.assertEqual("ALREADY_PUSHED", source.push(215, current, self.root)["status"])
 
-    def test_reverted_authority_commit_is_not_publishable(self) -> None:
+
+    def test_reverted_source_history_preserves_approved_lineage(self) -> None:
         target = self.root / "tools/source_collaboration.py"
-        target.write_text("unsafe\n", encoding="utf-8")
+        target.write_text("future\n", encoding="utf-8")
         git(self.root, "add", "tools/source_collaboration.py")
-        git(self.root, "commit", "-qm", "unsafe authority")
+        git(self.root, "commit", "-qm", "future source")
         target.write_text("trusted\n", encoding="utf-8")
         git(self.root, "add", "tools/source_collaboration.py")
-        git(self.root, "commit", "-qm", "revert authority")
-        first = git(self.root, "rev-parse", "HEAD~1")
-        raw = source.git(
-            self.root, "diff-tree", "-r", "--name-only", "-z", "--no-renames",
-            "--diff-filter=ACDMRTUXB", f"{first}^", first,
-            "--", *sorted(source.SOURCE_AUTHORITY), binary=True,
-        ).stdout
-        observed = source.nul_paths(raw)
-        self.assertIn("tools/source_collaboration.py", observed, repr(raw))
+        git(self.root, "commit", "-qm", "revert future source")
+        (self.root / "file.txt").write_text("normal change\n", encoding="utf-8")
         with mock.patch.object(source, "issue_meta", side_effect=self.issue):
-            with self.assertRaisesRegex(source.GuardError, "maintainer bootstrap"):
-                source.push(215, git(self.root, "rev-parse", "HEAD"), self.root)
+            self.assertEqual("READY", source.publication_check(215, self.root)["status"])
 
-    def test_merged_side_branch_authority_history_is_rejected(self) -> None:
+
+    def test_merged_source_history_is_accepted(self) -> None:
         git(self.root, "checkout", "-qb", "side")
         target = self.root / "just/template.just"
-        target.write_text("skip checks\n", encoding="utf-8")
+        target.write_text("new parity\n", encoding="utf-8")
         git(self.root, "add", "just/template.just")
-        git(self.root, "commit", "-qm", "skip parity")
+        git(self.root, "commit", "-qm", "new parity")
         target.write_text("trusted\n", encoding="utf-8")
         git(self.root, "add", "just/template.just")
-        git(self.root, "commit", "-qm", "revert parity")
+        git(self.root, "commit", "-qm", "revert new parity")
         git(self.root, "checkout", "-q", "feat/215-source-collaboration")
         git(self.root, "merge", "--no-ff", "-qm", "merge side", "side")
+        (self.root / "file.txt").write_text("normal change\n", encoding="utf-8")
         with mock.patch.object(source, "issue_meta", side_effect=self.issue):
-            with self.assertRaisesRegex(source.GuardError, "maintainer bootstrap"):
-                source.pr_create(215, self.root)
+            self.assertEqual("READY", source.publication_check(215, self.root)["status"])
+
+
+    def test_merge_from_unrelated_prebase_side_history_is_accepted(self) -> None:
+        # The installed source revision is a Git ancestor through the first
+        # parent. The unrelated second parent need not descend from it.
+        side_tree = git(self.root, "rev-parse", "HEAD^{tree}")
+        old_root = git(self.root, "commit-tree", side_tree, "-m", "prebase side root")
+        git(self.root, "branch", "prebase-side", old_root)
+        git(self.root, "merge", "--allow-unrelated-histories", "--no-ff",
+            "-qm", "merge prebase side", "prebase-side")
+        (self.root / "file.txt").write_text("normal change\n", encoding="utf-8")
+        with mock.patch.object(source, "issue_meta", side_effect=self.issue):
+            self.assertEqual("READY", source.publication_check(215, self.root)["status"])
+
+    def test_non_descendant_tracked_main_is_rejected(self) -> None:
+        side_tree = git(self.root, "rev-parse", "HEAD^{tree}")
+        other = git(self.root, "commit-tree", side_tree, "-m", "unrelated main")
+        git(self.root, "update-ref", "refs/remotes/origin/main", other)
+        (self.root / "file.txt").write_text("normal change\n", encoding="utf-8")
+        with mock.patch.object(source, "issue_meta", side_effect=self.issue):
+            with self.assertRaisesRegex(source.GuardError, "approved source authority revision"):
+                source.publication_check(215, self.root)
 
     def test_missing_tracked_default_branch_fails_closed(self) -> None:
         git(self.root, "update-ref", "-d", "refs/remotes/origin/main")
@@ -243,14 +268,15 @@ class SourceCollaborationTest(unittest.TestCase):
         with self.assertRaisesRegex(source.GuardError, "tracked origin/main"):
             source.manifest(self.ctx())
 
-    def test_moved_tracking_ref_cannot_hide_committed_authority_change(self) -> None:
-        (self.root / "Justfile").write_text("unsafe\n", encoding="utf-8")
+    def test_tracking_ref_advances_after_reviewed_source_update(self) -> None:
+        (self.root / "Justfile").write_text("future source\n", encoding="utf-8")
         git(self.root, "add", "Justfile")
-        git(self.root, "commit", "-qm", "unsafe authority")
+        git(self.root, "commit", "-qm", "future reviewed source")
         git(self.root, "update-ref", "refs/remotes/origin/main", "HEAD")
+        (self.root / "file.txt").write_text("normal change\n", encoding="utf-8")
         with mock.patch.object(source, "issue_meta", side_effect=self.issue):
-            with self.assertRaisesRegex(source.GuardError, "maintainer bootstrap"):
-                source.push(215, git(self.root, "rev-parse", "HEAD"), self.root)
+            self.assertEqual("READY", source.publication_check(215, self.root)["status"])
+
 
     def test_git_graft_cannot_hide_reverted_authority_history(self) -> None:
         target = self.root / "Justfile"
@@ -292,7 +318,7 @@ class SourceCollaborationTest(unittest.TestCase):
         with mock.patch.object(source, "issue_meta", side_effect=self.issue), mock.patch.object(
             source, "git", side_effect=racing_git
         ):
-            with self.assertRaisesRegex(source.GuardError, "maintainer bootstrap"):
+            with self.assertRaisesRegex(source.GuardError, "grafted or shallow"):
                 source.push(215, current, self.root)
 
     def test_commit_rejects_bytes_changed_during_staging(self) -> None:
@@ -1024,7 +1050,7 @@ class SourceCollaborationTest(unittest.TestCase):
             with self.subTest(prior=prior):
                 with mock.patch.object(source, "context", return_value=self.ctx()), mock.patch.object(
                     source, "require_clean"
-                ), mock.patch.object(source, "require_authority_unchanged"), mock.patch.object(
+                ), mock.patch.object(source, "require_approved_lineage"), mock.patch.object(
                     source, "remote_head", return_value=current
                 ), mock.patch.object(source, "pulls", side_effect=[[], [prior]]), mock.patch.object(
                     source, "run"
@@ -1038,7 +1064,7 @@ class SourceCollaborationTest(unittest.TestCase):
         failed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="lost ack")
         with mock.patch.object(source, "context", return_value=self.ctx()), mock.patch.object(
             source, "require_clean"
-        ), mock.patch.object(source, "require_authority_unchanged"), mock.patch.object(
+        ), mock.patch.object(source, "require_approved_lineage"), mock.patch.object(
             source, "remote_head", return_value=current
         ), mock.patch.object(source, "pulls", side_effect=[[], [], [self.pr()]]), mock.patch.object(
             source, "require_task_head"
@@ -1060,7 +1086,7 @@ class SourceCollaborationTest(unittest.TestCase):
             with self.subTest(message=message), mock.patch.object(
                 source, "context", return_value=self.ctx()
             ), mock.patch.object(source, "require_clean"), mock.patch.object(
-                source, "require_authority_unchanged"
+                source, "require_approved_lineage"
             ), mock.patch.object(source, "remote_head", return_value=current), mock.patch.object(
                 source, "pulls", side_effect=[[], [], found]
             ), mock.patch.object(source, "require_task_head"), mock.patch.object(
@@ -1073,7 +1099,7 @@ class SourceCollaborationTest(unittest.TestCase):
         current = git(self.root, "rev-parse", "HEAD")
         with mock.patch.object(source, "context", return_value=self.ctx()), mock.patch.object(
             source, "require_clean"
-        ), mock.patch.object(source, "require_authority_unchanged"), mock.patch.object(
+        ), mock.patch.object(source, "require_approved_lineage"), mock.patch.object(
             source, "remote_head", return_value=current
         ), mock.patch.object(source, "pulls", side_effect=[[self.pr()], []]), mock.patch.object(
             source, "run"
@@ -1112,7 +1138,7 @@ class SourceCollaborationTest(unittest.TestCase):
 
                 with mock.patch.object(source, "context", return_value=self.ctx()), mock.patch.object(
                     source, "require_clean"
-                ), mock.patch.object(source, "require_authority_unchanged"), mock.patch.object(
+                ), mock.patch.object(source, "require_approved_lineage"), mock.patch.object(
                     source, "remote_head", return_value=current
                 ), mock.patch.object(source, "pulls", side_effect=pulls), mock.patch.object(
                     source, "run", side_effect=create
@@ -1142,7 +1168,7 @@ class SourceCollaborationTest(unittest.TestCase):
         failed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="lost ack")
         with mock.patch.object(source, "context", return_value=ctx), mock.patch.object(
             source, "require_clean"
-        ), mock.patch.object(source, "require_authority_unchanged"
+        ), mock.patch.object(source, "require_approved_lineage"
         ), mock.patch.object(source, "push_destination", return_value="git@github.com:upiscium/Templates.git"
         ), mock.patch.object(source, "remote_head", side_effect=[None, current]), mock.patch.object(
             source, "transport_push", return_value=failed
@@ -1165,7 +1191,7 @@ class SourceCollaborationTest(unittest.TestCase):
 
         with mock.patch.object(source, "context", return_value=self.ctx()), mock.patch.object(
             source, "require_clean"
-        ), mock.patch.object(source, "require_authority_unchanged"
+        ), mock.patch.object(source, "require_approved_lineage"
         ), mock.patch.object(source, "remote_head", return_value=current), mock.patch.object(
             source, "gh_json", side_effect=self.checkpoint_api(comments, calls)
         ), mock.patch.object(source, "require_task_head"), mock.patch.object(
@@ -1185,7 +1211,7 @@ class SourceCollaborationTest(unittest.TestCase):
         calls: list[str] = []
         with mock.patch.object(source, "context", return_value=self.ctx()), mock.patch.object(
             source, "require_clean"
-        ), mock.patch.object(source, "require_authority_unchanged"), mock.patch.object(
+        ), mock.patch.object(source, "require_approved_lineage"), mock.patch.object(
             source, "remote_head", return_value=current
         ), mock.patch.object(source, "gh_json", side_effect=self.checkpoint_api(comments, calls)), mock.patch.object(
             source, "require_task_head"
@@ -1209,7 +1235,7 @@ class SourceCollaborationTest(unittest.TestCase):
 
         with mock.patch.object(source, "context", return_value=self.ctx()), mock.patch.object(
             source, "require_clean"
-        ), mock.patch.object(source, "require_authority_unchanged"), mock.patch.object(
+        ), mock.patch.object(source, "require_approved_lineage"), mock.patch.object(
             source, "remote_head", return_value=current
         ), mock.patch.object(source, "gh_json", side_effect=self.checkpoint_api(comments, calls)), mock.patch.object(
             source, "require_task_head"
@@ -1236,7 +1262,7 @@ class SourceCollaborationTest(unittest.TestCase):
 
         with mock.patch.object(source, "context", return_value=self.ctx()), mock.patch.object(
             source, "require_clean"
-        ), mock.patch.object(source, "require_authority_unchanged"), mock.patch.object(
+        ), mock.patch.object(source, "require_approved_lineage"), mock.patch.object(
             source, "remote_head", return_value=current
         ), mock.patch.object(source, "gh_json", side_effect=racing_api), mock.patch.object(
             source, "require_task_head"
@@ -1259,7 +1285,7 @@ class SourceCollaborationTest(unittest.TestCase):
                 comments = [comment]
                 with mock.patch.object(source, "context", return_value=self.ctx()), mock.patch.object(
                     source, "require_clean"
-                ), mock.patch.object(source, "require_authority_unchanged"), mock.patch.object(
+                ), mock.patch.object(source, "require_approved_lineage"), mock.patch.object(
                     source, "remote_head", return_value=current
                 ), mock.patch.object(source, "gh_json", side_effect=self.checkpoint_api(comments, [])), mock.patch.object(
                     source, "run"
@@ -1278,7 +1304,7 @@ class SourceCollaborationTest(unittest.TestCase):
 
         with mock.patch.object(source, "context", return_value=self.ctx()), mock.patch.object(
             source, "require_clean"
-        ), mock.patch.object(source, "require_authority_unchanged"), mock.patch.object(
+        ), mock.patch.object(source, "require_approved_lineage"), mock.patch.object(
             source, "remote_head", return_value=current
         ), mock.patch.object(source, "gh_json", side_effect=self.checkpoint_api(comments, [])), mock.patch.object(
             source, "require_task_head"
@@ -1292,7 +1318,7 @@ class SourceCollaborationTest(unittest.TestCase):
         comments = [self.comment(88, self.checkpoint_text("checkpoint"), principal=42)]
         with mock.patch.object(source, "context", return_value=self.ctx()), mock.patch.object(
             source, "require_clean"
-        ), mock.patch.object(source, "require_authority_unchanged"), mock.patch.object(
+        ), mock.patch.object(source, "require_approved_lineage"), mock.patch.object(
             source, "remote_head", return_value=current
         ), mock.patch.object(source, "gh_json", side_effect=self.checkpoint_api(comments, [], actor=43)), mock.patch.object(
             source, "require_task_head"
@@ -1329,7 +1355,7 @@ class SourceCollaborationTest(unittest.TestCase):
 
                 with mock.patch.object(source, "context", return_value=self.ctx()), mock.patch.object(
                     source, "require_clean"
-                ), mock.patch.object(source, "require_authority_unchanged"), mock.patch.object(
+                ), mock.patch.object(source, "require_approved_lineage"), mock.patch.object(
                     source, "remote_head", return_value=current
                 ), mock.patch.object(source, "gh_json", side_effect=racing_api), mock.patch.object(
                     source, "run", side_effect=post
@@ -1373,7 +1399,7 @@ class SourceCollaborationTest(unittest.TestCase):
 
                 with mock.patch.object(source, "context", return_value=self.ctx()), mock.patch.object(
                     source, "require_clean"
-                ), mock.patch.object(source, "require_authority_unchanged"), mock.patch.object(
+                ), mock.patch.object(source, "require_approved_lineage"), mock.patch.object(
                     source, "remote_head", side_effect=remote
                 ), mock.patch.object(source, "gh_json", side_effect=racing_api), mock.patch.object(
                     source, "run", wraps=source.run

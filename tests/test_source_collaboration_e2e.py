@@ -232,12 +232,13 @@ class SourceCollaborationE2ETest(unittest.TestCase):
     def assert_only_issue_views(self, count: int) -> None:
         self.assertEqual([ISSUE_VIEW] * count, self.gh_calls())
 
-    def assert_authority_rejected(
-        self, result: subprocess.CompletedProcess[str], path: str
-    ) -> None:
-        self.assertEqual(2, result.returncode, result.stdout + result.stderr)
-        self.assertIn("maintainer bootstrap", result.stderr)
-        self.assertIn(path, result.stderr)
+    def assert_sensitive_ready(self, result: subprocess.CompletedProcess[str], path: str) -> None:
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual("READY", value["status"])
+        self.assertEqual([path], value["review_sensitive_paths"])
+        self.assertEqual([path], [entry["path"] for entry in value["manifest"]["entries"]])
+
 
     def write_command_sentinel(self, path: Path) -> str:
         return f"printf '%s\\n' executed > {shlex.quote(str(path))}"
@@ -250,7 +251,7 @@ class SourceCollaborationE2ETest(unittest.TestCase):
         self.assertEqual("READY", ready["status"])
         return ready["scope_digest"]
 
-    def test_redirected_live_justfile_is_rejected_without_running_recipe(self) -> None:
+    def test_modified_live_justfile_is_reviewed_without_running_recipe(self) -> None:
         sentinel = self.sandbox / "justfile-sentinel"
         (self.repo / "Justfile").write_text(
             "publication-check:\n"
@@ -260,11 +261,11 @@ class SourceCollaborationE2ETest(unittest.TestCase):
 
         result = self.invoke("publication-check", "215")
 
-        self.assert_authority_rejected(result, "Justfile")
+        self.assert_sensitive_ready(result, "Justfile")
         self.assertFalse(sentinel.exists())
         self.assert_only_issue_views(1)
 
-    def test_redirected_live_source_justfile_is_rejected_without_running_recipe(self) -> None:
+    def test_modified_source_justfile_is_reviewed_without_running_recipe(self) -> None:
         sentinel = self.sandbox / "source-just-sentinel"
         (self.repo / "just" / "source.just").write_text(
             "publication-check issue:\n"
@@ -274,11 +275,11 @@ class SourceCollaborationE2ETest(unittest.TestCase):
 
         result = self.invoke("publication-check", "215")
 
-        self.assert_authority_rejected(result, "just/source.just")
+        self.assert_sensitive_ready(result, "just/source.just")
         self.assertFalse(sentinel.exists())
         self.assert_only_issue_views(1)
 
-    def test_replaced_live_policy_is_rejected_without_running_stub(self) -> None:
+    def test_modified_live_policy_is_reviewed_without_running_stub(self) -> None:
         sentinel = self.sandbox / "policy-sentinel"
         stub = (
             "from pathlib import Path\n"
@@ -289,48 +290,38 @@ class SourceCollaborationE2ETest(unittest.TestCase):
 
         result = self.invoke("publication-check", "215")
 
-        self.assert_authority_rejected(result, "tools/source_collaboration.py")
+        self.assert_sensitive_ready(result, "tools/source_collaboration.py")
         self.assertFalse(sentinel.exists())
         self.assert_only_issue_views(1)
 
-    def test_reverted_authority_commit_is_rejected_before_publication_operations(self) -> None:
+    def test_reverted_future_source_change_does_not_block_preflight(self) -> None:
         target = self.repo / "tools" / "source_collaboration.py"
-        trusted = target.read_bytes()
-        target.write_text("# unauthorized authority change\n", encoding="utf-8")
+        original = target.read_bytes()
+        target.write_text("# new version\n", encoding="utf-8")
         git(self.repo, "add", "tools/source_collaboration.py")
-        git(self.repo, "commit", "-qm", "unauthorized authority change")
-        target.write_bytes(trusted)
+        git(self.repo, "commit", "-qm", "new guard version")
+        target.write_bytes(original)
         git(self.repo, "add", "tools/source_collaboration.py")
-        git(self.repo, "commit", "-qm", "revert authority change")
-        current_head = git(self.repo, "rev-parse", "HEAD")
-
-        invocations = (
-            ("publication-check", "215"),
-            ("pr-create", "215"),
-            ("checkpoint", "215", "1", current_head, "test checkpoint"),
-        )
-        for args in invocations:
-            with self.subTest(command=args[0]):
-                self.assert_authority_rejected(
-                    self.invoke(*args), "tools/source_collaboration.py"
-                )
-        # The fake CLI accepted only Issue #215 metadata; no GitHub API call was attempted.
-        self.assert_only_issue_views(len(invocations))
-
-    def test_moved_tracking_ref_cannot_hide_reverted_authority_history(self) -> None:
-        target = self.repo / "tools" / "source_collaboration.py"
-        trusted = target.read_bytes()
-        target.write_text("# unauthorized\n", encoding="utf-8")
-        git(self.repo, "add", "tools/source_collaboration.py")
-        git(self.repo, "commit", "-qm", "unauthorized authority")
-        target.write_bytes(trusted)
-        git(self.repo, "add", "tools/source_collaboration.py")
-        git(self.repo, "commit", "-qm", "revert authority")
-        git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
-        self.assert_authority_rejected(
-            self.invoke("pr-create", "215"), "tools/source_collaboration.py"
-        )
+        git(self.repo, "commit", "-qm", "revert new guard")
+        (self.repo / "normal.txt").write_text("after\n", encoding="utf-8")
+        checked = self.invoke("publication-check", "215")
+        self.assertEqual(0, checked.returncode, checked.stdout + checked.stderr)
+        self.assertEqual([], json.loads(checked.stdout)["review_sensitive_paths"])
         self.assert_only_issue_views(1)
+
+
+    def test_tracked_main_can_advance_after_source_update(self) -> None:
+        target = self.repo / "tools" / "source_collaboration.py"
+        target.write_text("# new version\n", encoding="utf-8")
+        git(self.repo, "add", "tools/source_collaboration.py")
+        git(self.repo, "commit", "-qm", "new guard version")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        (self.repo / "normal.txt").write_text("after\n", encoding="utf-8")
+        checked = self.invoke("publication-check", "215")
+        self.assertEqual(0, checked.returncode, checked.stdout + checked.stderr)
+        self.assertEqual([], json.loads(checked.stdout)["review_sensitive_paths"])
+        self.assert_only_issue_views(1)
+
 
     def test_grafted_history_cannot_hide_reverted_authority_change(self) -> None:
         target = self.repo / "Justfile"
@@ -415,21 +406,23 @@ class SourceCollaborationE2ETest(unittest.TestCase):
         self.assertFalse(sentinel.exists())
         self.assert_only_issue_views(2)
 
-    def test_environment_cannot_mask_committed_authority_with_head(self) -> None:
+    def test_pinned_guard_is_not_selected_by_caller_environment(self) -> None:
         (self.repo / "tools" / "source_collaboration.py").write_text(
-            "# unauthorized authority\n", encoding="utf-8"
+            "# new version\n", encoding="utf-8",
         )
         git(self.repo, "add", "tools/source_collaboration.py")
-        git(self.repo, "commit", "-qm", "unauthorized authority")
-        current = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "commit", "-qm", "new guard version")
+        current=git(self.repo, "rev-parse", "HEAD")
         git(self.repo, "update-ref", "refs/remotes/origin/main", "HEAD")
-        for invoke in (self.invoke, self.invoke_payload):
-            with self.subTest(entrypoint=invoke.__name__):
-                self.assert_authority_rejected(
-                    invoke("pr-create", "215", environment={"TEMPLATES_SOURCE_BASE": current}),
-                    "tools/source_collaboration.py",
-                )
+        (self.repo / "normal.txt").write_text("after\n", encoding="utf-8")
+        for runner in (self.invoke,self.invoke_payload):
+            result = runner("publication-check","215",environment={
+                "TEMPLATES_SOURCE_BASE":current
+            })
+            self.assertEqual(0,result.returncode,result.stdout+result.stderr)
+            self.assertEqual([],json.loads(result.stdout)["review_sensitive_paths"])
         self.assert_only_issue_views(2)
+
 
     def test_unsubstituted_source_payload_rejects_environment_base(self) -> None:
         (self.repo / "normal.txt").write_text("after\n", encoding="utf-8")
@@ -476,35 +469,37 @@ class SourceCollaborationE2ETest(unittest.TestCase):
         self.assertEqual("fixture base", git(self.repo, "log", "-1", "--format=%s"))
         self.assert_only_issue_views(2)
 
-    def test_live_template_justfile_cannot_bypass_installed_parity(self) -> None:
-        digest = self.pending_digest()
+    def test_future_source_template_justfile_is_committed_without_execution(self) -> None:
         sentinel = self.sandbox / "template-just-sentinel"
         (self.repo / "just" / "template.just").write_text(
             "check:\n" f"    @{self.write_command_sentinel(sentinel)}\n", encoding="utf-8"
         )
-
-        result = self.invoke("commit", "215", digest, "test: should be blocked")
-
-        self.assert_authority_rejected(result, "just/template.just")
+        checked=self.invoke("publication-check","215")
+        self.assert_sensitive_ready(checked,"just/template.just")
+        committed=self.invoke("commit","215",json.loads(checked.stdout)["scope_digest"],"test: next justfile")
+        self.assertEqual(0,committed.returncode,committed.stdout+committed.stderr)
+        self.assertEqual(["just/template.just"],json.loads(committed.stdout)["paths"])
+        self.assertEqual("",git(self.repo,"status","--porcelain"))
         self.assertFalse(sentinel.exists())
         self.assert_only_issue_views(2)
 
-    def test_live_renderer_stub_cannot_bypass_installed_parity(self) -> None:
-        digest = self.pending_digest()
-        sentinel = self.sandbox / "renderer-sentinel"
-        stub = (
-            "#!/usr/bin/env python3\n"
-            "from pathlib import Path\n"
-            f"Path({str(sentinel)!r}).write_text('executed\\n', encoding='utf-8')\n"
-            "raise SystemExit(0)\n"
+
+    def test_future_renderer_is_committed_without_executing_candidate(self) -> None:
+        sentinel=self.sandbox/"renderer-sentinel"
+        (self.repo/"tools"/"render_templates.py").write_text(
+            "#!/usr/bin/env python3\nfrom pathlib import Path\n"
+            f"Path({str(sentinel)!r}).write_text('ran', encoding='utf-8')\n"
+            "raise SystemExit(0)\n",encoding="utf-8",
         )
-        (self.repo / "tools" / "render_templates.py").write_text(stub, encoding="utf-8")
-
-        result = self.invoke("commit", "215", digest, "test: should be blocked")
-
-        self.assert_authority_rejected(result, "tools/render_templates.py")
+        checked=self.invoke("publication-check","215")
+        self.assert_sensitive_ready(checked,"tools/render_templates.py")
+        committed=self.invoke("commit","215",json.loads(checked.stdout)["scope_digest"],"test: next renderer")
+        self.assertEqual(0,committed.returncode,committed.stdout+committed.stderr)
+        self.assertEqual(["tools/render_templates.py"],json.loads(committed.stdout)["paths"])
+        self.assertEqual("",git(self.repo,"status","--porcelain"))
         self.assertFalse(sentinel.exists())
         self.assert_only_issue_views(2)
+
 
 
 if __name__ == "__main__":

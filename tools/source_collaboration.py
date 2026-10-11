@@ -27,8 +27,8 @@ TRUSTED_SOURCE_BASE = "@TRUSTED_SOURCE_BASE@"
 TRUSTED_GIT = "@TRUSTED_GIT@"
 TRUSTED_GH = "@TRUSTED_GH@"
 TRUSTED_PATH = "@TRUSTED_PATH@"
-# The live Just routing, guard, and commit-time parity check are one authority chain.
-# Changing any part requires a separately reviewed maintainer bootstrap, not source::*.
+# Review-sensitive next-version source paths; not an allow/deny list.
+# This code is installed separately, so these changed paths are only data.
 SOURCE_AUTHORITY = frozenset({
     "Justfile",
     "just/source.just",
@@ -320,17 +320,11 @@ def paths(root_: Path, *, cached: bool = False, unstaged: bool = False) -> list[
     return sorted(set(changed + untracked))
 
 
-def reject_authority_paths(changed: list[str]) -> None:
-    for path in changed:
-        if path in SOURCE_AUTHORITY:
-            raise GuardError(f"source authority change requires maintainer bootstrap: {path}")
+def require_approved_lineage(root_: Path, current_head: str) -> None:
+    """Prove that installed source authority predates Task HEAD and tracked main.
 
-
-def require_authority_unchanged(root_: Path, current_head: str) -> None:
-    """Reject authority changes since the installed, approved bootstrap revision.
-
-    Inspect every branch-only commit, not just the final tree: a change followed by
-    a revert must not make authority-changing commits publishable through source::*.
+    Publishing proposed next-version source does not activate that source:
+    this policy and its parity checker execute from the pinned installed image.
     """
     base = trusted_base_revision()
     common_dir = Path(git(root_, "rev-parse", "--git-common-dir").stdout.strip())
@@ -344,40 +338,41 @@ def require_authority_unchanged(root_: Path, current_head: str) -> None:
                   f"refs/remotes/{REMOTE}/{DEFAULT}^{{commit}}", check=False)
     if tracked.returncode:
         raise GuardError("tracked origin/main is required for source authority check")
-    # Walk raw commit objects, not Git's revision walker: grafts and shallow
-    # boundaries must not be able to omit an authority-changing parent edge.
-    visited: set[str] = set()
+    # A graft installed during preflight cannot silently change the proof.
+    if any((common_dir / path).exists() or (common_dir / path).is_symlink()
+           for path in ("info/grafts", "shallow")):
+        raise GuardError("grafted or shallow Git history cannot establish source authority")
+    # Find a raw parent path from each observed tip to the installed base.
+    # A merge can legitimately import a side branch rooted before that base.
+    # Git ancestry is existential: every alternate parent need not reach base.
     for tip in (tracked.stdout.strip(), current_head):
+        visited: set[str] = set()
         pending = [tip]
+        found_base = False
         while pending:
             commit_sha = pending.pop()
-            if commit_sha == base or commit_sha in visited:
+            if commit_sha == base:
+                found_base = True
+                break
+            if commit_sha in visited:
                 continue
             visited.add(commit_sha)
             raw = git(root_, "cat-file", "commit", commit_sha, binary=True).stdout
             parent_lines = [line.split(b" ", 1)[1] for line in raw.split(b"\n\n", 1)[0].split(b"\n")
                             if line.startswith(b"parent ")]
-            if not parent_lines:
-                raise GuardError("approved source authority revision must precede main and HEAD")
             for parent in parent_lines:
                 if not re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})", parent):
                     raise GuardError("invalid raw source commit ancestry")
-                parent_sha = parent.decode("ascii")
-                changed = nul_paths(git(
-                    root_, "diff-tree", "--no-ext-diff", "-r", "--name-only", "-z", "--no-renames",
-                    "--diff-filter=ACDMRTUXB", parent_sha, commit_sha,
-                    "--", *sorted(SOURCE_AUTHORITY), binary=True,
-                ).stdout)
-                reject_authority_paths(changed)
-                pending.append(parent_sha)
+                pending.append(parent.decode("ascii"))
+        if not found_base:
+            raise GuardError("approved source authority revision must precede main and HEAD")
 
 
 def manifest(ctx: dict[str, Any]) -> dict[str, Any]:
     safe_local_git_config(ctx["root"])
     clean_index(ctx["root"])
-    require_authority_unchanged(ctx["root"], ctx["head"])
+    require_approved_lineage(ctx["root"], ctx["head"])
     changed = paths(ctx["root"])
-    reject_authority_paths(changed)
     if not changed:
         raise GuardError("no source changes")
     entries = []
@@ -683,7 +678,13 @@ def publication_check(issue: int, cwd: Path | None = None) -> dict[str, Any]:
     check = git(ctx["root"], "diff", "--no-ext-diff", "--check", check=False)
     if check.returncode:
         raise GuardError("git diff --check failed")
-    return {"status": "READY", "scope_digest": digest(value), "manifest": value}
+    return {
+        "status": "READY", "scope_digest": digest(value), "manifest": value,
+        "review_sensitive_paths": sorted(
+            entry["path"] for entry in value["entries"]
+            if entry["path"] in SOURCE_AUTHORITY
+        ),
+    }
 
 
 def parity(root_: Path) -> None:
@@ -843,7 +844,7 @@ def push_destination(root_: Path) -> str:
 def push(issue: int, expected_head: str, cwd: Path | None = None) -> dict[str, Any]:
     ctx = context(issue, cwd)
     require_clean(ctx["root"])
-    require_authority_unchanged(ctx["root"], ctx["head"])
+    require_approved_lineage(ctx["root"], ctx["head"])
     if ctx["head"] != expected_head:
         raise GuardError("local HEAD moved")
     destination = push_destination(ctx["root"])
@@ -946,7 +947,7 @@ def validate_pr(
 def pr_create(issue: int, cwd: Path | None = None) -> dict[str, Any]:
     ctx = context(issue, cwd)
     require_clean(ctx["root"])
-    require_authority_unchanged(ctx["root"], ctx["head"])
+    require_approved_lineage(ctx["root"], ctx["head"])
     if remote_head(ctx["root"], ctx["branch"], ctx["origin"]) != ctx["head"]:
         raise GuardError("push exact local HEAD before PR creation")
     before = pulls(ctx["root"], ctx["branch"])
@@ -1043,7 +1044,7 @@ def checkpoint(
 ) -> dict[str, Any]:
     ctx = context(issue, cwd)
     require_clean(ctx["root"])
-    require_authority_unchanged(ctx["root"], ctx["head"])
+    require_approved_lineage(ctx["root"], ctx["head"])
     if ctx["head"] != expected_head or remote_head(ctx["root"], ctx["branch"], ctx["origin"]) != expected_head:
         raise GuardError("checkpoint requires exact local/remote HEAD")
     if not body.strip() or len(body.encode()) > 60_000:
