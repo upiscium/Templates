@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import copy
+import io
 import ast
 import sys
+import time
 import unittest
+from contextlib import contextmanager
 from dataclasses import FrozenInstanceError, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -29,6 +32,29 @@ _BRANCH = "refs/heads/issue-194"
 _DEFAULT = "refs/heads/main"
 _SUBJECT = "a" * 40
 _TREE = "d" * 40
+
+
+def _ci260_exception_category(error: Exception) -> str:
+    """Classify known internal exceptions without invoking error.__str__."""
+    reason = error.args[0] if error.args and type(error.args[0]) is str else None
+    if reason == "Git metadata operation exceeded its runtime limit":
+        return "git_runtime_limit"
+    if reason in (
+        "metadata validation time limit exceeded",
+        "metadata history exceeds the validation time limit",
+    ):
+        return "history_deadline"
+    return "other"
+
+
+def _flush_ci260_events(events: list[str]) -> None:
+    """Best-effort diagnostic emission only after the E2E body completes."""
+    for event in events:
+        try:
+            print(event, file=sys.stderr, flush=True)
+        except Exception:
+            # Logging must never change a test result or authority outcome.
+            return
 
 
 @dataclass(frozen=True)
@@ -348,6 +374,114 @@ class TaskCollaborationV4Test(unittest.TestCase):
         )
         self.git = actual_git
         self.facade = self._facade()
+
+        # Test-only diagnostics: retain original exceptions and fail-closed
+        # behavior. Emit only fixed provenance stages, exception type, bounded
+        # known reason category, and remaining scoped wall-time budget.
+        # Never log Git arguments, stdout/stderr, object contents, or secrets.
+        # Defer stderr I/O until unittest cleanups, outside validation scopes.
+        ci260_events: list[str] = []
+        self.addCleanup(_flush_ci260_events, ci260_events)
+
+        def report_error(stage: str, error: Exception) -> None:
+            remaining_at = self.store._validation_deadline.get()
+            remaining = (
+                "none" if remaining_at is None
+                else str(round(remaining_at - time.monotonic(), 3))
+            )
+            category = _ci260_exception_category(error)
+            if len(ci260_events) < 64:
+                ci260_events.append(
+                    f"CI_TASKVIEW_260 stage={stage} "
+                    f"error_type={type(error).__name__} "
+                    f"category={category} remaining_seconds={remaining}"
+                )
+
+        original_history = self.store._validate_full_history
+
+        def report_history_error(tip):
+            try:
+                return original_history(tip)
+            except Exception as error:
+                report_error("validate_full_history", error)
+                raise
+
+        history_patch = mock.patch.object(
+            self.store, "_validate_full_history", side_effect=report_history_error
+        )
+        history_patch.start()
+        self.addCleanup(history_patch.stop)
+
+        original_fetch_tip = self.store.fetch_tip
+
+        def report_fetch_tip():
+            try:
+                return original_fetch_tip()
+            except Exception as error:
+                report_error("fetch_tip", error)
+                raise
+
+        tip_patch = mock.patch.object(
+            self.store, "fetch_tip", side_effect=report_fetch_tip
+        )
+        tip_patch.start()
+        self.addCleanup(tip_patch.stop)
+
+        original_read_authority = task_view._read_authority
+
+        def report_read_authority(*args, **kwargs):
+            try:
+                return original_read_authority(*args, **kwargs)
+            except Exception as error:
+                report_error("read_authority", error)
+                raise
+
+        authority_patch = mock.patch.object(
+            task_view, "_read_authority", side_effect=report_read_authority
+        )
+        authority_patch.start()
+        self.addCleanup(authority_patch.stop)
+
+        original_scope = self.store.validation_scope
+
+        @contextmanager
+        def report_scope_error():
+            try:
+                with original_scope():
+                    yield
+            except Exception as error:
+                report_error("validation_scope", error)
+                raise
+
+        scope_patch = mock.patch.object(
+            self.store, "validation_scope", side_effect=report_scope_error
+        )
+        scope_patch.start()
+        self.addCleanup(scope_patch.stop)
+
+        original_reader = task_view._call_github_reader
+
+        def report_external_projection(*args, **kwargs):
+            projection = original_reader(*args, **kwargs)
+            if projection[0].get("state") == "unavailable":
+                error_code = projection[0].get("error_code", "unavailable")
+                # Only pre-declared projection status codes are safe to print.
+                if error_code not in {
+                    "callback_failed", "invalid_facts",
+                    "invalid_checkpoint_binding",
+                }:
+                    error_code = "other"
+                if len(ci260_events) < 64:
+                    ci260_events.append(
+                        f"CI_TASKVIEW_260 external_projection={error_code}"
+                    )
+            return projection
+
+        reader_patch = mock.patch.object(
+            task_view, "_call_github_reader", side_effect=report_external_projection
+        )
+        reader_patch.start()
+        self.addCleanup(reader_patch.stop)
         self.observe_patch.stop()
         self.snapshot_patch.stop()
         self.confirm_patch.stop()
@@ -1339,6 +1473,48 @@ class TaskCollaborationV4Test(unittest.TestCase):
         self.assertEqual("execution_authorization_failed", failed.exception.code)
         self.assertNotIn("secret", str(failed.exception))
         self.assertEqual([], self.github.write_calls)
+
+
+class Ci260DiagnosticOutputTest(unittest.TestCase):
+    def test_exception_classification_never_formats_exception(self) -> None:
+        class BrokenString(RuntimeError):
+            def __str__(self) -> str:
+                raise AssertionError("unsafe diagnostic stringification")
+
+        self.assertEqual(
+            "git_runtime_limit",
+            _ci260_exception_category(
+                BrokenString("Git metadata operation exceeded its runtime limit")
+            ),
+        )
+        self.assertEqual(
+            "history_deadline",
+            _ci260_exception_category(
+                BrokenString("metadata history exceeds the validation time limit")
+            ),
+        )
+        self.assertEqual(
+            "other",
+            _ci260_exception_category(BrokenString("token=private-data")),
+        )
+
+    def test_write_failure_does_not_change_test_outcome(self) -> None:
+        class BrokenStderr:
+            def write(self, _value: str) -> None:
+                raise OSError("output stream unavailable")
+
+            def flush(self) -> None:
+                raise OSError("output stream unavailable")
+
+        with mock.patch.object(sys, "stderr", BrokenStderr()):
+            _flush_ci260_events(["CI_TASKVIEW_260 stage=fetch_tip category=other"])
+        capture = io.StringIO()
+        with mock.patch.object(sys, "stderr", capture):
+            _flush_ci260_events(["CI_TASKVIEW_260 stage=fetch_tip category=other"])
+        self.assertEqual(
+            "CI_TASKVIEW_260 stage=fetch_tip category=other\n",
+            capture.getvalue(),
+        )
 
 
 if __name__ == "__main__":
